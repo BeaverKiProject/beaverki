@@ -1,0 +1,41 @@
+name: Feature
+description: Propose a new feature or capability
+title: "[Feature]: "
+labels: ["type:feature"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What problem are we trying to solve?
+      placeholder: Describe the user or developer pain clearly.
+    validations:
+      required: true
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Desired Outcome
+      description: What should the system do after this is implemented?
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance Criteria
+      description: List clear, testable acceptance criteria.
+      placeholder: |
+        - [ ] Criterion 1
+        - [ ] Criterion 2
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: Out Of Scope
+      description: What should not be included in this issue?
+  - type: textarea
+    id: notes
+    attributes:
+      label: Notes
+      description: Architecture, safety, migration, or implementation notes.
+
