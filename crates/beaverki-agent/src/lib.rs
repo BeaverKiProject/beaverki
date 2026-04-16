@@ -184,7 +184,7 @@ impl PrimaryAgentRunner {
                     .await?;
                 let completed = self
                     .db
-                    .fetch_task(&task.task_id)
+                    .fetch_task_for_owner(&request.owner_user_id, &task.task_id)
                     .await?
                     .ok_or_else(|| anyhow!("task disappeared after completion"))?;
                 return Ok(AgentResult { task: completed });
@@ -285,7 +285,7 @@ impl PrimaryAgentRunner {
             .await?;
         let failed = self
             .db
-            .fetch_task(&task.task_id)
+            .fetch_task_for_owner(&request.owner_user_id, &task.task_id)
             .await?
             .ok_or_else(|| anyhow!("task disappeared after failure"))?;
         Ok(AgentResult { task: failed })

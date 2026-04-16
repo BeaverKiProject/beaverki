@@ -69,7 +69,7 @@ Exit criteria:
 
 Goal:
 
-Extend the core runtime to support multiple users, RBAC, private plus household memory, approvals, and bounded sub-agent execution without introducing connectors yet.
+Extend the core runtime to support multiple users, RBAC, private plus household memory, approvals, and bounded sub-agent execution on the existing CLI-driven execution model.
 
 Stories:
 
@@ -90,11 +90,35 @@ Exit criteria:
 - approvals work through CLI
 - sub-agents operate on explicit bounded context only
 
-## 3.3 M2 Integrations
+## 3.3 M1.5 Runtime Daemon
 
 Goal:
 
-Add the first external control surface and remote execution environment support.
+Introduce the always-running local runtime process that later connector and automation work will build on.
+
+Stories:
+
+- `M1.5-001` Add a long-lived daemon mode for BeaverKI with clean startup and shutdown.
+- `M1.5-002` Add local runtime management commands to the CLI.
+- `M1.5-003` Add a local IPC surface such as a Unix socket or named pipe for task submission and status inspection.
+- `M1.5-004` Move task execution behind the daemon while preserving the current CLI workflow.
+- `M1.5-005` Add a background worker loop for queued tasks.
+- `M1.5-006` Add persistent runtime status, health, and audit events for daemon lifecycle.
+- `M1.5-007` Add a minimal heartbeat loop scaffold without autonomous planning enabled by default.
+- `M1.5-008` Add tests for daemon startup, shutdown, IPC submission, and persistence across restart.
+
+Exit criteria:
+
+- BeaverKI can run as a long-lived local process
+- CLI task submission can target the daemon instead of running inline
+- the runtime survives restart without losing persisted tasks and state
+- the foundation exists for connectors, scheduling, and background work
+
+## 3.4 M2 Integrations
+
+Goal:
+
+Add the first external control surface and remote execution environment support on top of the daemonized runtime.
 
 Stories:
 
@@ -112,7 +136,7 @@ Exit criteria:
 - approvals can be handled through Discord where policy allows
 - browser automation works in desktop and VPS headless modes
 
-## 3.4 M3 Automation
+## 3.5 M3 Automation
 
 Goal:
 
@@ -135,7 +159,7 @@ Exit criteria:
 - shell review path is functioning for risky commands
 - automation behavior is auditable end to end
 
-## 3.5 Post-V1
+## 3.6 Post-V1
 
 Candidate follow-up work:
 
@@ -150,11 +174,13 @@ Candidate follow-up work:
 
 These are the first stories to execute before moving backlog management fully into GitHub:
 
-1. `M0-001` Create the Rust workspace and crate skeleton matching the technical spec.
-2. `M0-002` Add a local developer command surface such as `Makefile` or `justfile`.
-3. `M0-003` Add a minimal CI workflow for formatting, linting, and tests.
-4. `M0-004` Implement config loading for `runtime.yaml` and `providers.yaml`.
-5. `M0-006` Add SQLite migrations and database initialization.
+1. `M1-001` Add users, roles, and connector identity abstractions to the data model.
+2. `M1-002` Implement built-in roles: `owner`, `adult`, `child`, `guest`, `service`.
+3. `M1-003` Implement per-user primary agents.
+4. `M1-004` Implement private and household memory scopes.
+5. `M1-005` Enforce retrieval-time scope filtering for all prompt assembly paths.
+6. `M1-009` Add integration tests for cross-user isolation and denial cases.
+7. `M1.5-001` Add a long-lived daemon mode for BeaverKI with clean startup and shutdown.
 
 ## 5. Migration To GitHub Issues
 

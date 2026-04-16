@@ -137,7 +137,7 @@ impl Database {
         .await
         .context("failed to insert task")?;
 
-        self.fetch_task(&task_id)
+        self.fetch_task_for_owner(owner_user_id, &task_id)
             .await?
             .context("task missing after insert")
     }
@@ -358,12 +358,17 @@ impl Database {
         Ok(audit_id)
     }
 
-    pub async fn fetch_task(&self, task_id: &str) -> Result<Option<TaskRow>> {
+    pub async fn fetch_task_for_owner(
+        &self,
+        owner_user_id: &str,
+        task_id: &str,
+    ) -> Result<Option<TaskRow>> {
         let row = sqlx::query_as::<_, TaskRow>(
             "SELECT task_id, owner_user_id, initiating_identity_id, primary_agent_id, assigned_agent_id, parent_task_id, kind, state, objective, context_summary, result_text, scope, wake_at, created_at, updated_at, completed_at
              FROM tasks
-             WHERE task_id = ?",
+             WHERE owner_user_id = ? AND task_id = ?",
         )
+        .bind(owner_user_id)
         .bind(task_id)
         .fetch_optional(&self.pool)
         .await
@@ -371,28 +376,46 @@ impl Database {
         Ok(row)
     }
 
-    pub async fn fetch_task_events(&self, task_id: &str) -> Result<Vec<TaskEventRow>> {
+    pub async fn fetch_task_events_for_owner(
+        &self,
+        owner_user_id: &str,
+        task_id: &str,
+    ) -> Result<Vec<TaskEventRow>> {
         let events = sqlx::query_as::<_, TaskEventRow>(
             "SELECT event_id, task_id, event_type, actor_type, actor_id, payload_json, created_at
              FROM task_events
-             WHERE task_id = ?
+             WHERE task_id = ? AND EXISTS (
+               SELECT 1 FROM tasks
+               WHERE tasks.task_id = task_events.task_id
+                 AND tasks.owner_user_id = ?
+             )
              ORDER BY created_at ASC",
         )
         .bind(task_id)
+        .bind(owner_user_id)
         .fetch_all(&self.pool)
         .await
         .context("failed to fetch task events")?;
         Ok(events)
     }
 
-    pub async fn fetch_tool_invocations(&self, task_id: &str) -> Result<Vec<ToolInvocationRow>> {
+    pub async fn fetch_tool_invocations_for_owner(
+        &self,
+        owner_user_id: &str,
+        task_id: &str,
+    ) -> Result<Vec<ToolInvocationRow>> {
         let invocations = sqlx::query_as::<_, ToolInvocationRow>(
             "SELECT invocation_id, task_id, agent_id, tool_name, request_json, response_json, status, started_at, finished_at
              FROM tool_invocations
-             WHERE task_id = ?
+             WHERE task_id = ? AND EXISTS (
+               SELECT 1 FROM tasks
+               WHERE tasks.task_id = tool_invocations.task_id
+                 AND tasks.owner_user_id = ?
+             )
              ORDER BY started_at ASC",
         )
         .bind(task_id)
+        .bind(owner_user_id)
         .fetch_all(&self.pool)
         .await
         .context("failed to fetch tool invocations")?;
@@ -553,5 +576,94 @@ mod tests {
 
         assert_eq!(household_only.len(), 1);
         assert_eq!(household_only[0].content_text, "household memory");
+    }
+
+    #[tokio::test]
+    async fn task_queries_enforce_owner_scope() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("test.db");
+        let db = Database::connect(&db_path).await.expect("connect");
+        db.bootstrap_single_user("Alex").await.expect("bootstrap");
+
+        let timestamp = now_rfc3339();
+        sqlx::query(
+            "INSERT INTO users (user_id, display_name, status, primary_agent_id, created_at, updated_at)
+             VALUES (?, ?, 'enabled', ?, ?, ?)",
+        )
+        .bind("user_casey")
+        .bind("Casey")
+        .bind("agent_casey")
+        .bind(&timestamp)
+        .bind(&timestamp)
+        .execute(db.pool())
+        .await
+        .expect("insert second user");
+        sqlx::query(
+            "INSERT INTO agents
+             (agent_id, kind, owner_user_id, parent_agent_id, status, persona, memory_scope, permission_profile, created_at, updated_at)
+             VALUES (?, 'primary', ?, NULL, 'active', ?, 'private', 'm0_single_user', ?, ?)",
+        )
+        .bind("agent_casey")
+        .bind("user_casey")
+        .bind("Primary agent for Casey")
+        .bind(&timestamp)
+        .bind(&timestamp)
+        .execute(db.pool())
+        .await
+        .expect("insert second agent");
+
+        let alex_task = db
+            .create_task(
+                "user_alex",
+                "agent_alex",
+                "Summarize Alex task",
+                MemoryScope::Private,
+            )
+            .await
+            .expect("create task");
+        db.append_task_event(
+            &alex_task.task_id,
+            "task_started",
+            "agent",
+            "agent_alex",
+            Value::String("started".to_owned()),
+        )
+        .await
+        .expect("append event");
+        let invocation_id = db
+            .start_tool_invocation(
+                &alex_task.task_id,
+                "agent_alex",
+                "filesystem_read_text",
+                Value::Object(Default::default()),
+            )
+            .await
+            .expect("start invocation");
+        db.finish_tool_invocation(
+            &invocation_id,
+            ToolInvocationStatus::Completed,
+            Value::Object(Default::default()),
+        )
+        .await
+        .expect("finish invocation");
+
+        assert!(
+            db.fetch_task_for_owner("user_casey", &alex_task.task_id)
+                .await
+                .expect("fetch task")
+                .is_none()
+        );
+        assert!(
+            db.fetch_task_events_for_owner("user_casey", &alex_task.task_id)
+                .await
+                .expect("fetch events")
+                .is_empty()
+        );
+        assert!(
+            db.fetch_tool_invocations_for_owner("user_casey", &alex_task.task_id)
+                .await
+                .expect("fetch invocations")
+                .is_empty()
+        );
     }
 }

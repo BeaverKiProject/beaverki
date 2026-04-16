@@ -271,12 +271,19 @@ async fn task_show(args: TaskShowArgs) -> Result<()> {
     let config_dir = resolve_config_dir(args.config_dir)?;
     let config = LoadedConfig::load_from_dir(&config_dir)?;
     let db = Database::connect(&config.runtime.database_path).await?;
+    let default_user = db.default_user().await?.ok_or_else(|| {
+        anyhow::anyhow!("runtime database has no bootstrap user; run setup first")
+    })?;
     let task = db
-        .fetch_task(&args.task_id)
+        .fetch_task_for_owner(&default_user.user_id, &args.task_id)
         .await?
         .with_context(|| format!("task '{}' not found", args.task_id))?;
-    let events = db.fetch_task_events(&args.task_id).await?;
-    let invocations = db.fetch_tool_invocations(&args.task_id).await?;
+    let events = db
+        .fetch_task_events_for_owner(&default_user.user_id, &args.task_id)
+        .await?;
+    let invocations = db
+        .fetch_tool_invocations_for_owner(&default_user.user_id, &args.task_id)
+        .await?;
 
     println!("Task: {}", task.task_id);
     println!("State: {}", task.state);

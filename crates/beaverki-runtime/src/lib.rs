@@ -73,11 +73,17 @@ impl Runtime {
     pub async fn inspect_task(&self, task_id: &str) -> Result<TaskInspection> {
         let task = self
             .db
-            .fetch_task(task_id)
+            .fetch_task_for_owner(&self.default_user.user_id, task_id)
             .await?
             .ok_or_else(|| anyhow!("task '{task_id}' not found"))?;
-        let events = self.db.fetch_task_events(task_id).await?;
-        let tool_invocations = self.db.fetch_tool_invocations(task_id).await?;
+        let events = self
+            .db
+            .fetch_task_events_for_owner(&self.default_user.user_id, task_id)
+            .await?;
+        let tool_invocations = self
+            .db
+            .fetch_tool_invocations_for_owner(&self.default_user.user_id, task_id)
+            .await?;
 
         Ok(TaskInspection {
             task,

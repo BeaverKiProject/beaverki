@@ -97,6 +97,7 @@ Every material change should start from an issue with clear acceptance criteria.
 - add multi-user identity and RBAC
 - enforce private versus household memory separation end to end
 - add approval flows and sub-agent task slicing
+- add the always-running daemon/runtime as the next platform milestone before connectors
 
 ## Quick Start
 
