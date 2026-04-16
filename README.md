@@ -23,7 +23,10 @@ Planned capabilities include:
 
 ## Current Status
 
-The repository now includes the `M0 Foundation` milestone implementation.
+The repository now includes:
+
+- `M0 Foundation`
+- `M1 Core Multi-User`
 
 Implemented so far:
 
@@ -34,19 +37,24 @@ Implemented so far:
 - Rust workspace and crate boundaries for the core runtime
 - encrypted local OpenAI credential storage
 - SQLite-backed task, memory, tool-invocation, and audit persistence
-- single-user CLI setup and task execution flow
+- multi-user CLI setup and task execution flow
+- built-in roles: `owner`, `adult`, `child`, `guest`, `service`
+- per-user primary agents
+- private versus household memory visibility at retrieval time
+- CLI approval flow for risky shell commands
+- bounded sub-agent spawning with explicit task slices
 - shell and filesystem tools for the primary agent
 - CI for formatting, linting, and tests
 
-Still intentionally out of scope for `M0`:
+Still intentionally out of scope:
 
-- multi-user support
+- always-running daemon/runtime
 - Discord
 - browser automation
 - Lua runtime
 - safety-agent review flows
 
-Implementation will be staged. The first shippable milestone is intentionally smaller than the full V1 target.
+Implementation remains staged. The next platform milestone is `M1.5 Runtime Daemon`.
 
 ## Project Direction
 
@@ -93,18 +101,18 @@ Every material change should start from an issue with clear acceptance criteria.
 
 ## Near-Term Next Steps
 
-- turn `M1 Core Multi-User` stories into GitHub issues
-- add multi-user identity and RBAC
-- enforce private versus household memory separation end to end
-- add approval flows and sub-agent task slicing
-- add the always-running daemon/runtime as the next platform milestone before connectors
+- add the always-running daemon/runtime milestone (`M1.5`)
+- move CLI task execution behind a long-lived local process
+- add queued/background execution and heartbeat scaffolding
+- add Discord and browser integrations on top of the daemon
 
 ## Quick Start
 
 1. Run `make setup`.
 2. Enter an OpenAI API key and a local master passphrase when prompted.
-3. Run `make run-task OBJECTIVE="Summarize the current README and list the docs folder."`
-4. Inspect the recorded task with `make show-task TASK_ID=<task-id>`.
+3. Run `make user-list`.
+4. Run `make run-task OBJECTIVE="Summarize the current README and list the docs folder."`
+5. Inspect the recorded task with `make show-task TASK_ID=<task-id>`.
 
 Default storage locations are now platform-standard:
 
@@ -119,8 +127,14 @@ cargo run -p beaverki-cli -- setup verify-openai
 cargo run -p beaverki-cli -- setup init
 cargo run -p beaverki-cli -- setup show-models
 cargo run -p beaverki-cli -- setup set-models --planner-model gpt-5.4 --executor-model gpt-5.4-mini --summarizer-model gpt-5.4-mini
+cargo run -p beaverki-cli -- role list
+cargo run -p beaverki-cli -- user list
+cargo run -p beaverki-cli -- user add --display-name Casey --role adult
 cargo run -p beaverki-cli -- task run --objective "Inspect the repository and summarize it."
+cargo run -p beaverki-cli -- task run --user user_casey --objective "Inspect the repository and summarize it."
 cargo run -p beaverki-cli -- task show --task-id <task-id>
+cargo run -p beaverki-cli -- approval list
+cargo run -p beaverki-cli -- approval approve --approval-id <approval-id>
 ```
 
 Use `--config-dir` if you want a non-default location.
@@ -134,6 +148,13 @@ The initial defaults are:
 - summarizer: `gpt-5.4-mini`
 
 After setup, use `setup show-models` and `setup set-models` to inspect or change them without editing YAML manually.
+
+Multi-user notes:
+
+- each user gets one persistent primary agent
+- `task run --user <user-id>` executes as that user
+- task inspection is owner-scoped
+- `approval list`, `approval approve`, and `approval deny` operate on the selected user's pending approvals
 
 ## Repository
 

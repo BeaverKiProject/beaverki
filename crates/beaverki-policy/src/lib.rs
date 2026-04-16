@@ -1,4 +1,75 @@
-use beaverki_core::ShellRisk;
+use beaverki_core::{MemoryScope, ShellRisk};
+
+pub const BUILTIN_ROLES: &[(&str, &str)] = &[
+    (
+        "owner",
+        "Full administrative control over the runtime and approvals.",
+    ),
+    (
+        "adult",
+        "Trusted household user with approval and household access.",
+    ),
+    (
+        "child",
+        "Restricted household user with private-only access by default.",
+    ),
+    (
+        "guest",
+        "Temporary restricted user with private-only access.",
+    ),
+    (
+        "service",
+        "Non-human service identity for scoped automation tasks.",
+    ),
+];
+
+const HOUSEHOLD_VISIBLE_ROLES: &[&str] = &["owner", "adult", "service"];
+const APPROVER_ROLES: &[&str] = &["owner", "adult"];
+const SUBAGENT_ROLES: &[&str] = &["owner", "adult", "service"];
+const APPROVAL_ELIGIBLE_ROLES: &[&str] = &["owner", "adult"];
+
+pub fn is_builtin_role(role_id: &str) -> bool {
+    BUILTIN_ROLES.iter().any(|(builtin, _)| *builtin == role_id)
+}
+
+pub fn built_in_roles() -> Vec<(&'static str, &'static str)> {
+    BUILTIN_ROLES.to_vec()
+}
+
+pub fn can_view_household_memory(role_ids: &[String]) -> bool {
+    role_ids
+        .iter()
+        .any(|role| HOUSEHOLD_VISIBLE_ROLES.contains(&role.as_str()))
+}
+
+pub fn can_grant_approvals(role_ids: &[String]) -> bool {
+    role_ids
+        .iter()
+        .any(|role| APPROVER_ROLES.contains(&role.as_str()))
+}
+
+pub fn can_spawn_subagents(role_ids: &[String]) -> bool {
+    role_ids
+        .iter()
+        .any(|role| SUBAGENT_ROLES.contains(&role.as_str()))
+}
+
+pub fn can_request_shell_approval(role_ids: &[String], risk: ShellRisk) -> bool {
+    matches!(
+        risk,
+        ShellRisk::Medium | ShellRisk::High | ShellRisk::Critical
+    ) && role_ids
+        .iter()
+        .any(|role| APPROVAL_ELIGIBLE_ROLES.contains(&role.as_str()))
+}
+
+pub fn visible_memory_scopes(role_ids: &[String]) -> Vec<MemoryScope> {
+    let mut scopes = vec![MemoryScope::Private];
+    if can_view_household_memory(role_ids) {
+        scopes.push(MemoryScope::Household);
+    }
+    scopes
+}
 
 const SAFE_READ_ONLY_PREFIXES: &[&str] = &[
     "pwd",
@@ -100,6 +171,10 @@ pub fn generated_shell_execution_allowed(risk: ShellRisk) -> bool {
 mod tests {
     use super::*;
 
+    fn roles(ids: &[&str]) -> Vec<String> {
+        ids.iter().map(|value| (*value).to_owned()).collect()
+    }
+
     #[test]
     fn classifies_safe_read_only_commands_as_low() {
         assert_eq!(classify_shell_command("rg TODO ."), ShellRisk::Low);
@@ -120,5 +195,25 @@ mod tests {
             classify_shell_command("cat Cargo.toml | head"),
             ShellRisk::High
         );
+    }
+
+    #[test]
+    fn owner_sees_household_and_can_approve() {
+        let roles = roles(&["owner"]);
+        assert!(can_view_household_memory(&roles));
+        assert!(can_grant_approvals(&roles));
+        assert_eq!(
+            visible_memory_scopes(&roles),
+            vec![MemoryScope::Private, MemoryScope::Household]
+        );
+    }
+
+    #[test]
+    fn child_is_private_only_and_cannot_approve() {
+        let roles = roles(&["child"]);
+        assert!(!can_view_household_memory(&roles));
+        assert!(!can_grant_approvals(&roles));
+        assert_eq!(visible_memory_scopes(&roles), vec![MemoryScope::Private]);
+        assert!(!can_request_shell_approval(&roles, ShellRisk::High));
     }
 }

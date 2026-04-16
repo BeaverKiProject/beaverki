@@ -1,12 +1,14 @@
 use std::path::PathBuf;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use beaverki_config::{
     LoadedConfig, SetupAnswers, default_app_paths, prompt_passphrase_from_env,
     write_providers_config, write_setup_files,
 };
-use beaverki_db::Database;
+use beaverki_core::MemoryScope;
+use beaverki_db::{Database, UserRow};
 use beaverki_models::OpenAiProvider;
+use beaverki_policy::is_builtin_role;
 use beaverki_runtime::Runtime;
 use clap::{Args, Parser, Subcommand};
 use dialoguer::{Input, Password};
@@ -14,7 +16,7 @@ use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
 #[command(name = "beaverki")]
-#[command(about = "BeaverKI M0 CLI runtime")]
+#[command(about = "BeaverKI M1 CLI runtime")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -30,6 +32,18 @@ enum Commands {
         #[command(subcommand)]
         command: Box<TaskCommand>,
     },
+    User {
+        #[command(subcommand)]
+        command: Box<UserCommand>,
+    },
+    Approval {
+        #[command(subcommand)]
+        command: Box<ApprovalCommand>,
+    },
+    Role {
+        #[command(subcommand)]
+        command: Box<RoleCommand>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -44,6 +58,24 @@ enum SetupCommand {
 enum TaskCommand {
     Run(TaskRunArgs),
     Show(TaskShowArgs),
+}
+
+#[derive(Subcommand)]
+enum UserCommand {
+    Add(UserAddArgs),
+    List(ConfigDirArgs),
+}
+
+#[derive(Subcommand)]
+enum ApprovalCommand {
+    List(ApprovalListArgs),
+    Approve(ApprovalResolveArgs),
+    Deny(ApprovalResolveArgs),
+}
+
+#[derive(Subcommand)]
+enum RoleCommand {
+    List(ConfigDirArgs),
 }
 
 #[derive(Args, Clone)]
@@ -83,7 +115,11 @@ struct TaskRunArgs {
     #[arg(long)]
     config_dir: Option<PathBuf>,
     #[arg(long)]
+    user: Option<String>,
+    #[arg(long)]
     objective: String,
+    #[arg(long, default_value = "private")]
+    scope: String,
     #[arg(long, default_value = "BEAVERKI_MASTER_PASSPHRASE")]
     passphrase_env: String,
 }
@@ -93,7 +129,41 @@ struct TaskShowArgs {
     #[arg(long)]
     config_dir: Option<PathBuf>,
     #[arg(long)]
+    user: Option<String>,
+    #[arg(long)]
     task_id: String,
+}
+
+#[derive(Args, Clone)]
+struct UserAddArgs {
+    #[arg(long)]
+    config_dir: Option<PathBuf>,
+    #[arg(long)]
+    display_name: String,
+    #[arg(long = "role", required = true)]
+    roles: Vec<String>,
+}
+
+#[derive(Args, Clone)]
+struct ApprovalListArgs {
+    #[arg(long)]
+    config_dir: Option<PathBuf>,
+    #[arg(long)]
+    user: Option<String>,
+    #[arg(long)]
+    status: Option<String>,
+}
+
+#[derive(Args, Clone)]
+struct ApprovalResolveArgs {
+    #[arg(long)]
+    config_dir: Option<PathBuf>,
+    #[arg(long)]
+    user: Option<String>,
+    #[arg(long)]
+    approval_id: String,
+    #[arg(long, default_value = "BEAVERKI_MASTER_PASSPHRASE")]
+    passphrase_env: String,
 }
 
 #[derive(Args, Clone)]
@@ -145,6 +215,18 @@ async fn main() -> Result<()> {
         Commands::Task { command } => match *command {
             TaskCommand::Run(args) => task_run(args).await,
             TaskCommand::Show(args) => task_show(args).await,
+        },
+        Commands::User { command } => match *command {
+            UserCommand::Add(args) => user_add(args).await,
+            UserCommand::List(args) => user_list(args).await,
+        },
+        Commands::Approval { command } => match *command {
+            ApprovalCommand::List(args) => approval_list(args).await,
+            ApprovalCommand::Approve(args) => approval_resolve(args, true).await,
+            ApprovalCommand::Deny(args) => approval_resolve(args, false).await,
+        },
+        Commands::Role { command } => match *command {
+            RoleCommand::List(args) => role_list(args).await,
         },
     }
 }
@@ -243,6 +325,7 @@ async fn setup_init(args: SetupInitArgs) -> Result<()> {
     println!("Secret dir: {}", secret_dir.display());
     println!("User ID: {}", bootstrap.user_id);
     println!("Primary agent ID: {}", bootstrap.primary_agent_id);
+    println!("Assigned role: owner");
 
     Ok(())
 }
@@ -256,7 +339,13 @@ async fn task_run(args: TaskRunArgs) -> Result<()> {
             .expect("failed to read master passphrase")
     });
     let runtime = Runtime::load(&config_dir, &passphrase).await?;
-    let result = runtime.run_objective(&args.objective).await?;
+    let result = runtime
+        .run_objective(
+            args.user.as_deref(),
+            &args.objective,
+            parse_scope(&args.scope)?,
+        )
+        .await?;
 
     println!("Task ID: {}", result.task.task_id);
     println!("State: {}", result.task.state);
@@ -269,24 +358,23 @@ async fn task_run(args: TaskRunArgs) -> Result<()> {
 
 async fn task_show(args: TaskShowArgs) -> Result<()> {
     let config_dir = resolve_config_dir(args.config_dir)?;
-    let config = LoadedConfig::load_from_dir(&config_dir)?;
-    let db = Database::connect(&config.runtime.database_path).await?;
-    let default_user = db.default_user().await?.ok_or_else(|| {
-        anyhow::anyhow!("runtime database has no bootstrap user; run setup first")
-    })?;
+    let (_, db) = load_db(&config_dir).await?;
+    let user = resolve_user_for_db(&db, args.user.as_deref()).await?;
     let task = db
-        .fetch_task_for_owner(&default_user.user_id, &args.task_id)
+        .fetch_task_for_owner(&user.user_id, &args.task_id)
         .await?
         .with_context(|| format!("task '{}' not found", args.task_id))?;
     let events = db
-        .fetch_task_events_for_owner(&default_user.user_id, &args.task_id)
+        .fetch_task_events_for_owner(&user.user_id, &args.task_id)
         .await?;
     let invocations = db
-        .fetch_tool_invocations_for_owner(&default_user.user_id, &args.task_id)
+        .fetch_tool_invocations_for_owner(&user.user_id, &args.task_id)
         .await?;
 
     println!("Task: {}", task.task_id);
+    println!("Owner: {}", task.owner_user_id);
     println!("State: {}", task.state);
+    println!("Kind: {}", task.kind);
     println!("Objective: {}", task.objective);
     if let Some(result_text) = task.result_text {
         println!("Result: {result_text}");
@@ -311,6 +399,107 @@ async fn task_show(args: TaskShowArgs) -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+async fn user_add(args: UserAddArgs) -> Result<()> {
+    let config_dir = resolve_config_dir(args.config_dir)?;
+    let (_, db) = load_db(&config_dir).await?;
+    let roles = args.roles;
+    for role in &roles {
+        if !is_builtin_role(role) {
+            bail!("unsupported role '{role}'");
+        }
+    }
+
+    let bootstrap = db.create_user(&args.display_name, &roles).await?;
+    println!("User created.");
+    println!("User ID: {}", bootstrap.user_id);
+    println!("Primary agent ID: {}", bootstrap.primary_agent_id);
+    println!("Roles: {}", roles.join(", "));
+    Ok(())
+}
+
+async fn user_list(args: ConfigDirArgs) -> Result<()> {
+    let config_dir = resolve_config_dir(args.config_dir)?;
+    let (_, db) = load_db(&config_dir).await?;
+    let users = db.list_users().await?;
+
+    for user in users {
+        let roles = db
+            .list_user_roles(&user.user_id)
+            .await?
+            .into_iter()
+            .map(|row| row.role_id)
+            .collect::<Vec<_>>();
+        println!(
+            "- {} ({}) roles=[{}] primary_agent={}",
+            user.user_id,
+            user.display_name,
+            roles.join(", "),
+            user.primary_agent_id.unwrap_or_else(|| "<none>".to_owned())
+        );
+    }
+
+    Ok(())
+}
+
+async fn approval_list(args: ApprovalListArgs) -> Result<()> {
+    let config_dir = resolve_config_dir(args.config_dir)?;
+    let (_, db) = load_db(&config_dir).await?;
+    let user = resolve_user_for_db(&db, args.user.as_deref()).await?;
+    let approvals = db
+        .list_approvals_for_user(&user.user_id, args.status.as_deref())
+        .await?;
+
+    for approval in approvals {
+        println!(
+            "- {} task={} status={} action={} target={}",
+            approval.approval_id,
+            approval.task_id,
+            approval.status,
+            approval.action_type,
+            approval.target_ref.unwrap_or_else(|| "<none>".to_owned())
+        );
+    }
+
+    Ok(())
+}
+
+async fn approval_resolve(args: ApprovalResolveArgs, approve: bool) -> Result<()> {
+    let config_dir = resolve_config_dir(args.config_dir)?;
+    let passphrase = prompt_passphrase_from_env(&args.passphrase_env).unwrap_or_else(|| {
+        Password::new()
+            .with_prompt("Master passphrase")
+            .interact()
+            .expect("failed to read master passphrase")
+    });
+    let runtime = Runtime::load(&config_dir, &passphrase).await?;
+    let task = runtime
+        .resolve_approval(args.user.as_deref(), &args.approval_id, approve)
+        .await?;
+
+    println!(
+        "Approval {} {}. Task {} is now {}.",
+        args.approval_id,
+        if approve { "approved" } else { "denied" },
+        task.task_id,
+        task.state
+    );
+    if let Some(result_text) = task.result_text {
+        println!("\n{result_text}");
+    }
+
+    Ok(())
+}
+
+async fn role_list(args: ConfigDirArgs) -> Result<()> {
+    let config_dir = resolve_config_dir(args.config_dir)?;
+    let (_, db) = load_db(&config_dir).await?;
+    let roles = db.list_roles().await?;
+    for role in roles {
+        println!("- {}: {}", role.role_id, role.description);
+    }
     Ok(())
 }
 
@@ -410,6 +599,31 @@ async fn verify_openai_api_token(
         api_token.to_owned(),
     )?;
     provider.verify_credentials().await
+}
+
+async fn load_db(config_dir: &PathBuf) -> Result<(LoadedConfig, Database)> {
+    let config = LoadedConfig::load_from_dir(config_dir)?;
+    let db = Database::connect(&config.runtime.database_path).await?;
+    Ok((config, db))
+}
+
+async fn resolve_user_for_db(db: &Database, user_id: Option<&str>) -> Result<UserRow> {
+    match user_id {
+        Some(user_id) => db
+            .fetch_user(user_id)
+            .await?
+            .ok_or_else(|| anyhow!("user '{user_id}' not found")),
+        None => db
+            .default_user()
+            .await?
+            .ok_or_else(|| anyhow!("runtime database has no bootstrap user; run setup first")),
+    }
+}
+
+fn parse_scope(value: &str) -> Result<MemoryScope> {
+    value
+        .parse::<MemoryScope>()
+        .map_err(|_| anyhow!("unsupported scope '{value}', expected private or household"))
 }
 
 fn resolve_config_dir(config_dir: Option<PathBuf>) -> Result<PathBuf> {

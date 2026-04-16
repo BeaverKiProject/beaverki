@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use beaverki_core::{MemoryScope, TaskState, ToolInvocationStatus, new_prefixed_id, now_rfc3339};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -61,32 +61,39 @@ impl Database {
         let agent_id = format!("agent_{slug}");
         let timestamp = now_rfc3339();
 
-        sqlx::query(
-            "INSERT INTO users (user_id, display_name, status, primary_agent_id, created_at, updated_at)
-             VALUES (?, ?, 'enabled', ?, ?, ?)",
-        )
-        .bind(&user_id)
-        .bind(display_name)
-        .bind(&agent_id)
-        .bind(&timestamp)
-        .bind(&timestamp)
-        .execute(&self.pool)
-        .await
-        .context("failed to insert default user")?;
+        self.insert_user_row(&user_id, display_name, &agent_id, &timestamp)
+            .await
+            .context("failed to insert default user")?;
+        self.insert_primary_agent_row(&agent_id, &user_id, display_name, &timestamp)
+            .await
+            .context("failed to insert primary agent")?;
+        self.assign_role(&user_id, "owner").await?;
 
-        sqlx::query(
-            "INSERT INTO agents
-             (agent_id, kind, owner_user_id, parent_agent_id, status, persona, memory_scope, permission_profile, created_at, updated_at)
-             VALUES (?, 'primary', ?, NULL, 'active', ?, 'private', 'm0_single_user', ?, ?)",
-        )
-        .bind(&agent_id)
-        .bind(&user_id)
-        .bind(format!("Primary agent for {display_name}"))
-        .bind(&timestamp)
-        .bind(&timestamp)
-        .execute(&self.pool)
-        .await
-        .context("failed to insert primary agent")?;
+        Ok(BootstrapState {
+            user_id,
+            primary_agent_id: agent_id,
+        })
+    }
+
+    pub async fn create_user(
+        &self,
+        display_name: &str,
+        roles: &[String],
+    ) -> Result<BootstrapState> {
+        let slug = unique_user_slug(display_name, &self.pool).await?;
+        let user_id = format!("user_{slug}");
+        let agent_id = format!("agent_{slug}");
+        let timestamp = now_rfc3339();
+
+        self.insert_user_row(&user_id, display_name, &agent_id, &timestamp)
+            .await
+            .with_context(|| format!("failed to insert user '{display_name}'"))?;
+        self.insert_primary_agent_row(&agent_id, &user_id, display_name, &timestamp)
+            .await
+            .context("failed to insert primary agent")?;
+        for role_id in roles {
+            self.assign_role(&user_id, role_id).await?;
+        }
 
         Ok(BootstrapState {
             user_id,
@@ -108,6 +115,114 @@ impl Database {
         Ok(user)
     }
 
+    pub async fn fetch_user(&self, user_id: &str) -> Result<Option<UserRow>> {
+        let user = sqlx::query_as::<_, UserRow>(
+            "SELECT user_id, display_name, status, primary_agent_id, created_at, updated_at
+             FROM users
+             WHERE user_id = ?",
+        )
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to fetch user")?;
+        Ok(user)
+    }
+
+    pub async fn list_users(&self) -> Result<Vec<UserRow>> {
+        let users = sqlx::query_as::<_, UserRow>(
+            "SELECT user_id, display_name, status, primary_agent_id, created_at, updated_at
+             FROM users
+             ORDER BY created_at ASC",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list users")?;
+        Ok(users)
+    }
+
+    pub async fn list_roles(&self) -> Result<Vec<RoleRow>> {
+        let roles = sqlx::query_as::<_, RoleRow>(
+            "SELECT role_id, description FROM roles ORDER BY role_id ASC",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list roles")?;
+        Ok(roles)
+    }
+
+    pub async fn list_user_roles(&self, user_id: &str) -> Result<Vec<UserRoleRow>> {
+        let roles = sqlx::query_as::<_, UserRoleRow>(
+            "SELECT user_id, role_id, created_at
+             FROM user_roles
+             WHERE user_id = ?
+             ORDER BY role_id ASC",
+        )
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list user roles")?;
+        Ok(roles)
+    }
+
+    pub async fn assign_role(&self, user_id: &str, role_id: &str) -> Result<()> {
+        sqlx::query(
+            "INSERT OR IGNORE INTO user_roles (user_id, role_id, created_at)
+             VALUES (?, ?, ?)",
+        )
+        .bind(user_id)
+        .bind(role_id)
+        .bind(now_rfc3339())
+        .execute(&self.pool)
+        .await
+        .context("failed to assign role")?;
+        Ok(())
+    }
+
+    async fn insert_user_row(
+        &self,
+        user_id: &str,
+        display_name: &str,
+        primary_agent_id: &str,
+        timestamp: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO users (user_id, display_name, status, primary_agent_id, created_at, updated_at)
+             VALUES (?, ?, 'enabled', ?, ?, ?)",
+        )
+        .bind(user_id)
+        .bind(display_name)
+        .bind(primary_agent_id)
+        .bind(timestamp)
+        .bind(timestamp)
+        .execute(&self.pool)
+        .await
+        .context("failed to insert user")?;
+        Ok(())
+    }
+
+    async fn insert_primary_agent_row(
+        &self,
+        agent_id: &str,
+        user_id: &str,
+        display_name: &str,
+        timestamp: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO agents
+             (agent_id, kind, owner_user_id, parent_agent_id, status, persona, memory_scope, permission_profile, created_at, updated_at)
+             VALUES (?, 'primary', ?, NULL, 'active', ?, 'private', 'builtin_primary', ?, ?)",
+        )
+        .bind(agent_id)
+        .bind(user_id)
+        .bind(format!("Primary agent for {display_name}"))
+        .bind(timestamp)
+        .bind(timestamp)
+        .execute(&self.pool)
+        .await
+        .context("failed to insert primary agent")?;
+        Ok(())
+    }
+
     pub async fn create_task(
         &self,
         owner_user_id: &str,
@@ -115,29 +230,46 @@ impl Database {
         objective: &str,
         scope: MemoryScope,
     ) -> Result<TaskRow> {
+        self.create_task_with_params(NewTask {
+            owner_user_id,
+            primary_agent_id,
+            assigned_agent_id: primary_agent_id,
+            parent_task_id: None,
+            kind: "interactive",
+            objective,
+            context_summary: None,
+            scope,
+        })
+        .await
+    }
+
+    pub async fn create_task_with_params(&self, input: NewTask<'_>) -> Result<TaskRow> {
         let task_id = new_prefixed_id("task");
         let timestamp = now_rfc3339();
 
         sqlx::query(
             "INSERT INTO tasks
              (task_id, owner_user_id, initiating_identity_id, primary_agent_id, assigned_agent_id, parent_task_id, kind, state, objective, context_summary, result_text, scope, wake_at, created_at, updated_at, completed_at)
-             VALUES (?, ?, ?, ?, ?, NULL, 'interactive', ?, ?, NULL, NULL, ?, NULL, ?, ?, NULL)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, NULL, ?, ?, NULL)",
         )
         .bind(&task_id)
-        .bind(owner_user_id)
-        .bind(format!("cli:{owner_user_id}"))
-        .bind(primary_agent_id)
-        .bind(primary_agent_id)
+        .bind(input.owner_user_id)
+        .bind(format!("cli:{}", input.owner_user_id))
+        .bind(input.primary_agent_id)
+        .bind(input.assigned_agent_id)
+        .bind(input.parent_task_id)
+        .bind(input.kind)
         .bind(TaskState::Pending.as_str())
-        .bind(objective)
-        .bind(scope.as_str())
+        .bind(input.objective)
+        .bind(input.context_summary)
+        .bind(input.scope.as_str())
         .bind(&timestamp)
         .bind(&timestamp)
         .execute(&self.pool)
         .await
         .context("failed to insert task")?;
 
-        self.fetch_task_for_owner(owner_user_id, &task_id)
+        self.fetch_task_for_owner(input.owner_user_id, &task_id)
             .await?
             .context("task missing after insert")
     }
@@ -150,6 +282,33 @@ impl Database {
             .execute(&self.pool)
             .await
             .context("failed to update task state")?;
+        Ok(())
+    }
+
+    pub async fn set_task_waiting_approval(&self, task_id: &str, message: &str) -> Result<()> {
+        let timestamp = now_rfc3339();
+        sqlx::query(
+            "UPDATE tasks
+             SET state = ?, result_text = ?, updated_at = ?
+             WHERE task_id = ?",
+        )
+        .bind(TaskState::WaitingApproval.as_str())
+        .bind(message)
+        .bind(&timestamp)
+        .bind(task_id)
+        .execute(&self.pool)
+        .await
+        .context("failed to mark task waiting approval")?;
+        Ok(())
+    }
+
+    pub async fn clear_task_result(&self, task_id: &str) -> Result<()> {
+        sqlx::query("UPDATE tasks SET result_text = NULL, completed_at = NULL, updated_at = ? WHERE task_id = ?")
+            .bind(now_rfc3339())
+            .bind(task_id)
+            .execute(&self.pool)
+            .await
+            .context("failed to clear task result")?;
         Ok(())
     }
 
@@ -263,6 +422,49 @@ impl Database {
         Ok(())
     }
 
+    pub async fn create_subagent(
+        &self,
+        owner_user_id: &str,
+        parent_agent_id: &str,
+        persona: &str,
+        permission_profile: &str,
+    ) -> Result<AgentRow> {
+        let agent_id = new_prefixed_id("agent");
+        let timestamp = now_rfc3339();
+        sqlx::query(
+            "INSERT INTO agents
+             (agent_id, kind, owner_user_id, parent_agent_id, status, persona, memory_scope, permission_profile, created_at, updated_at)
+             VALUES (?, 'subagent', ?, ?, 'active', ?, 'task', ?, ?, ?)",
+        )
+        .bind(&agent_id)
+        .bind(owner_user_id)
+        .bind(parent_agent_id)
+        .bind(persona)
+        .bind(permission_profile)
+        .bind(&timestamp)
+        .bind(&timestamp)
+        .execute(&self.pool)
+        .await
+        .context("failed to create subagent")?;
+
+        self.fetch_agent(&agent_id)
+            .await?
+            .context("subagent missing after insert")
+    }
+
+    pub async fn fetch_agent(&self, agent_id: &str) -> Result<Option<AgentRow>> {
+        let row = sqlx::query_as::<_, AgentRow>(
+            "SELECT agent_id, kind, owner_user_id, parent_agent_id, status, persona, memory_scope, permission_profile, created_at, updated_at
+             FROM agents
+             WHERE agent_id = ?",
+        )
+        .bind(agent_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to fetch agent")?;
+        Ok(row)
+    }
+
     pub async fn insert_memory(&self, input: NewMemory<'_>) -> Result<String> {
         let memory_id = new_prefixed_id("mem");
         let timestamp = now_rfc3339();
@@ -358,6 +560,206 @@ impl Database {
         Ok(audit_id)
     }
 
+    pub async fn create_approval(
+        &self,
+        task_id: &str,
+        action_type: &str,
+        target_ref: Option<&str>,
+        requested_by_agent_id: &str,
+        requested_from_user_id: &str,
+        rationale_text: &str,
+    ) -> Result<ApprovalRow> {
+        let approval_id = new_prefixed_id("approval");
+        let created_at = now_rfc3339();
+        sqlx::query(
+            "INSERT INTO approvals
+             (approval_id, task_id, action_type, target_ref, requested_by_agent_id, requested_from_user_id, status, rationale_text, decided_at, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, NULL, ?)",
+        )
+        .bind(&approval_id)
+        .bind(task_id)
+        .bind(action_type)
+        .bind(target_ref)
+        .bind(requested_by_agent_id)
+        .bind(requested_from_user_id)
+        .bind(rationale_text)
+        .bind(&created_at)
+        .execute(&self.pool)
+        .await
+        .context("failed to create approval")?;
+        self.fetch_approval_for_user(requested_from_user_id, &approval_id)
+            .await?
+            .context("approval missing after insert")
+    }
+
+    pub async fn fetch_approval_for_user(
+        &self,
+        requested_from_user_id: &str,
+        approval_id: &str,
+    ) -> Result<Option<ApprovalRow>> {
+        let row = sqlx::query_as::<_, ApprovalRow>(
+            "SELECT approval_id, task_id, action_type, target_ref, requested_by_agent_id, requested_from_user_id, status, rationale_text, decided_at, created_at
+             FROM approvals
+             WHERE requested_from_user_id = ? AND approval_id = ?",
+        )
+        .bind(requested_from_user_id)
+        .bind(approval_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to fetch approval")?;
+        Ok(row)
+    }
+
+    pub async fn list_approvals_for_user(
+        &self,
+        requested_from_user_id: &str,
+        status: Option<&str>,
+    ) -> Result<Vec<ApprovalRow>> {
+        let approvals = if let Some(status) = status {
+            sqlx::query_as::<_, ApprovalRow>(
+                "SELECT approval_id, task_id, action_type, target_ref, requested_by_agent_id, requested_from_user_id, status, rationale_text, decided_at, created_at
+                 FROM approvals
+                 WHERE requested_from_user_id = ? AND status = ?
+                 ORDER BY created_at DESC",
+            )
+            .bind(requested_from_user_id)
+            .bind(status)
+            .fetch_all(&self.pool)
+            .await
+            .context("failed to list approvals")?
+        } else {
+            sqlx::query_as::<_, ApprovalRow>(
+                "SELECT approval_id, task_id, action_type, target_ref, requested_by_agent_id, requested_from_user_id, status, rationale_text, decided_at, created_at
+                 FROM approvals
+                 WHERE requested_from_user_id = ?
+                 ORDER BY created_at DESC",
+            )
+            .bind(requested_from_user_id)
+            .fetch_all(&self.pool)
+            .await
+            .context("failed to list approvals")?
+        };
+        Ok(approvals)
+    }
+
+    pub async fn resolve_approval(&self, approval_id: &str, status: &str) -> Result<()> {
+        sqlx::query(
+            "UPDATE approvals
+             SET status = ?, decided_at = ?
+             WHERE approval_id = ?",
+        )
+        .bind(status)
+        .bind(now_rfc3339())
+        .bind(approval_id)
+        .execute(&self.pool)
+        .await
+        .context("failed to resolve approval")?;
+        Ok(())
+    }
+
+    pub async fn approved_shell_commands_for_task(
+        &self,
+        task_id: &str,
+        requested_from_user_id: &str,
+    ) -> Result<Vec<String>> {
+        let approvals = sqlx::query_scalar::<_, String>(
+            "SELECT target_ref
+             FROM approvals
+             WHERE task_id = ?
+               AND requested_from_user_id = ?
+               AND action_type = 'shell_command'
+               AND status = 'approved'
+               AND target_ref IS NOT NULL
+             ORDER BY created_at ASC",
+        )
+        .bind(task_id)
+        .bind(requested_from_user_id)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to fetch approved shell commands")?;
+        Ok(approvals)
+    }
+
+    pub async fn upsert_connector_identity(
+        &self,
+        connector_type: &str,
+        external_user_id: &str,
+        external_channel_id: Option<&str>,
+        mapped_user_id: &str,
+        trust_level: &str,
+    ) -> Result<ConnectorIdentityRow> {
+        let existing = sqlx::query_as::<_, ConnectorIdentityRow>(
+            "SELECT identity_id, connector_type, external_user_id, external_channel_id, mapped_user_id, trust_level, created_at, updated_at
+             FROM connector_identities
+             WHERE connector_type = ? AND external_user_id = ?",
+        )
+        .bind(connector_type)
+        .bind(external_user_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to fetch connector identity")?;
+
+        let timestamp = now_rfc3339();
+        if let Some(existing) = existing {
+            sqlx::query(
+                "UPDATE connector_identities
+                 SET external_channel_id = ?, mapped_user_id = ?, trust_level = ?, updated_at = ?
+                 WHERE identity_id = ?",
+            )
+            .bind(external_channel_id)
+            .bind(mapped_user_id)
+            .bind(trust_level)
+            .bind(&timestamp)
+            .bind(&existing.identity_id)
+            .execute(&self.pool)
+            .await
+            .context("failed to update connector identity")?;
+            return self
+                .fetch_connector_identity(connector_type, external_user_id)
+                .await?
+                .context("connector identity missing after update");
+        }
+
+        let identity_id = new_prefixed_id("identity");
+        sqlx::query(
+            "INSERT INTO connector_identities
+             (identity_id, connector_type, external_user_id, external_channel_id, mapped_user_id, trust_level, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&identity_id)
+        .bind(connector_type)
+        .bind(external_user_id)
+        .bind(external_channel_id)
+        .bind(mapped_user_id)
+        .bind(trust_level)
+        .bind(&timestamp)
+        .bind(&timestamp)
+        .execute(&self.pool)
+        .await
+        .context("failed to create connector identity")?;
+        self.fetch_connector_identity(connector_type, external_user_id)
+            .await?
+            .context("connector identity missing after insert")
+    }
+
+    pub async fn fetch_connector_identity(
+        &self,
+        connector_type: &str,
+        external_user_id: &str,
+    ) -> Result<Option<ConnectorIdentityRow>> {
+        let row = sqlx::query_as::<_, ConnectorIdentityRow>(
+            "SELECT identity_id, connector_type, external_user_id, external_channel_id, mapped_user_id, trust_level, created_at, updated_at
+             FROM connector_identities
+             WHERE connector_type = ? AND external_user_id = ?",
+        )
+        .bind(connector_type)
+        .bind(external_user_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to fetch connector identity")?;
+        Ok(row)
+    }
+
     pub async fn fetch_task_for_owner(
         &self,
         owner_user_id: &str,
@@ -430,6 +832,18 @@ pub struct BootstrapState {
 }
 
 #[derive(Debug, Clone, Copy)]
+pub struct NewTask<'a> {
+    pub owner_user_id: &'a str,
+    pub primary_agent_id: &'a str,
+    pub assigned_agent_id: &'a str,
+    pub parent_task_id: Option<&'a str>,
+    pub kind: &'a str,
+    pub objective: &'a str,
+    pub context_summary: Option<&'a str>,
+    pub scope: MemoryScope,
+}
+
+#[derive(Debug, Clone, Copy)]
 pub struct NewMemory<'a> {
     pub owner_user_id: Option<&'a str>,
     pub scope: MemoryScope,
@@ -448,6 +862,33 @@ pub struct UserRow {
     pub display_name: String,
     pub status: String,
     pub primary_agent_id: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, FromRow, Serialize)]
+pub struct RoleRow {
+    pub role_id: String,
+    pub description: String,
+}
+
+#[derive(Debug, Clone, FromRow, Serialize)]
+pub struct UserRoleRow {
+    pub user_id: String,
+    pub role_id: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, FromRow, Serialize)]
+pub struct AgentRow {
+    pub agent_id: String,
+    pub kind: String,
+    pub owner_user_id: Option<String>,
+    pub parent_agent_id: Option<String>,
+    pub status: String,
+    pub persona: Option<String>,
+    pub memory_scope: String,
+    pub permission_profile: String,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -514,6 +955,32 @@ pub struct ToolInvocationRow {
     pub finished_at: Option<String>,
 }
 
+#[derive(Debug, Clone, FromRow, Serialize)]
+pub struct ApprovalRow {
+    pub approval_id: String,
+    pub task_id: String,
+    pub action_type: String,
+    pub target_ref: Option<String>,
+    pub requested_by_agent_id: String,
+    pub requested_from_user_id: String,
+    pub status: String,
+    pub rationale_text: Option<String>,
+    pub decided_at: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, FromRow, Serialize)]
+pub struct ConnectorIdentityRow {
+    pub identity_id: String,
+    pub connector_type: String,
+    pub external_user_id: String,
+    pub external_channel_id: Option<String>,
+    pub mapped_user_id: String,
+    pub trust_level: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
 fn slugify(input: &str) -> String {
     let mut slug = String::new();
     let mut previous_dash = false;
@@ -529,6 +996,34 @@ fn slugify(input: &str) -> String {
     }
 
     slug.trim_matches('_').to_owned()
+}
+
+async fn unique_user_slug(display_name: &str, pool: &SqlitePool) -> Result<String> {
+    let base = slugify(display_name);
+    let base = if base.is_empty() {
+        "user".to_owned()
+    } else {
+        base
+    };
+
+    for attempt in 0..1000 {
+        let candidate = if attempt == 0 {
+            base.clone()
+        } else {
+            format!("{base}_{attempt}")
+        };
+        let user_id = format!("user_{candidate}");
+        let exists = sqlx::query_scalar::<_, i64>("SELECT COUNT(1) FROM users WHERE user_id = ?")
+            .bind(&user_id)
+            .fetch_one(pool)
+            .await
+            .context("failed to check for existing user slug")?;
+        if exists == 0 {
+            return Ok(candidate);
+        }
+    }
+
+    Err(anyhow!("could not allocate a unique user slug"))
 }
 
 #[cfg(test)]

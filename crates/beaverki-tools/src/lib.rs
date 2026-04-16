@@ -25,6 +25,7 @@ pub struct ToolContext {
     pub working_dir: PathBuf,
     pub allowed_roots: Vec<PathBuf>,
     pub max_output_chars: usize,
+    pub approved_shell_commands: Vec<String>,
 }
 
 impl ToolContext {
@@ -33,6 +34,7 @@ impl ToolContext {
             working_dir,
             allowed_roots,
             max_output_chars: 12_000,
+            approved_shell_commands: Vec::new(),
         }
     }
 }
@@ -167,12 +169,17 @@ impl Tool for ShellExecTool {
             .ok_or_else(|| ToolError::Failed(anyhow!("shell_exec requires a non-empty command")))?;
 
         let risk = classify_shell_command(command);
-        if !generated_shell_execution_allowed(risk) {
+        let approved = context
+            .approved_shell_commands
+            .iter()
+            .any(|approved| approved.trim() == command);
+        if !approved && !generated_shell_execution_allowed(risk) {
             return Err(ToolError::Denied {
-                message: "shell command denied by M0 policy".to_owned(),
+                message: "shell command denied by policy".to_owned(),
                 detail: json!({
                     "risk": risk.as_str(),
                     "command": command,
+                    "approved": approved,
                 }),
             });
         }
@@ -194,6 +201,7 @@ impl Tool for ShellExecTool {
             payload: json!({
                 "risk": risk.as_str(),
                 "allowed": true,
+                "approved_by_override": approved,
                 "command": command,
                 "exit_code": output.status.code(),
                 "stdout": truncate_text(&String::from_utf8_lossy(&output.stdout), context.max_output_chars),

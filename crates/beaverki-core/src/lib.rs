@@ -51,6 +51,8 @@ impl FromStr for MemoryScope {
 pub enum TaskState {
     Pending,
     Running,
+    WaitingApproval,
+    Blocked,
     Completed,
     Failed,
 }
@@ -60,8 +62,26 @@ impl TaskState {
         match self {
             Self::Pending => "pending",
             Self::Running => "running",
+            Self::WaitingApproval => "waiting_approval",
+            Self::Blocked => "blocked",
             Self::Completed => "completed",
             Self::Failed => "failed",
+        }
+    }
+}
+
+impl FromStr for TaskState {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "pending" => Ok(Self::Pending),
+            "running" => Ok(Self::Running),
+            "waiting_approval" => Ok(Self::WaitingApproval),
+            "blocked" => Ok(Self::Blocked),
+            "completed" => Ok(Self::Completed),
+            "failed" => Ok(Self::Failed),
+            other => Err(anyhow!("unsupported task state: {other}")),
         }
     }
 }

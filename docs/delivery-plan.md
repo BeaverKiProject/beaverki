@@ -71,6 +71,10 @@ Goal:
 
 Extend the core runtime to support multiple users, RBAC, private plus household memory, approvals, and bounded sub-agent execution on the existing CLI-driven execution model.
 
+Status:
+
+- implemented in the repository
+
 Stories:
 
 - `M1-001` Add users, roles, and connector identity abstractions to the data model.
@@ -174,13 +178,13 @@ Candidate follow-up work:
 
 These are the first stories to execute before moving backlog management fully into GitHub:
 
-1. `M1-001` Add users, roles, and connector identity abstractions to the data model.
-2. `M1-002` Implement built-in roles: `owner`, `adult`, `child`, `guest`, `service`.
-3. `M1-003` Implement per-user primary agents.
-4. `M1-004` Implement private and household memory scopes.
-5. `M1-005` Enforce retrieval-time scope filtering for all prompt assembly paths.
-6. `M1-009` Add integration tests for cross-user isolation and denial cases.
-7. `M1.5-001` Add a long-lived daemon mode for BeaverKI with clean startup and shutdown.
+1. `M1.5-001` Add a long-lived daemon mode for BeaverKI with clean startup and shutdown.
+2. `M1.5-002` Add local runtime management commands to the CLI.
+3. `M1.5-003` Add a local IPC surface such as a Unix socket or named pipe for task submission and status inspection.
+4. `M1.5-004` Move task execution behind the daemon while preserving the current CLI workflow.
+5. `M1.5-005` Add a background worker loop for queued tasks.
+6. `M1.5-006` Add persistent runtime status, health, and audit events for daemon lifecycle.
+7. `M1.5-008` Add tests for daemon startup, shutdown, IPC submission, and persistence across restart.
 
 ## 5. Migration To GitHub Issues
 

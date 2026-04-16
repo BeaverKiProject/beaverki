@@ -208,13 +208,17 @@ name = "beaverki-agent"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "beaverki-config",
  "beaverki-core",
  "beaverki-db",
  "beaverki-memory",
  "beaverki-models",
+ "beaverki-policy",
  "beaverki-tools",
  "serde_json",
+ "tempfile",
+ "tokio",
  "tracing",
 ]
 
@@ -227,6 +231,7 @@ dependencies = [
  "beaverki-core",
  "beaverki-db",
  "beaverki-models",
+ "beaverki-policy",
  "beaverki-runtime",
  "clap",
  "dialoguer",
@@ -315,6 +320,7 @@ dependencies = [
  "beaverki-db",
  "beaverki-memory",
  "beaverki-models",
+ "beaverki-policy",
  "beaverki-tools",
  "tracing",
 ]

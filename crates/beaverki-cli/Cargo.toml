@@ -10,6 +10,7 @@ beaverki-config = { path = "../beaverki-config" }
 beaverki-core = { path = "../beaverki-core" }
 beaverki-db = { path = "../beaverki-db" }
 beaverki-models = { path = "../beaverki-models" }
+beaverki-policy = { path = "../beaverki-policy" }
 beaverki-runtime = { path = "../beaverki-runtime" }
 clap.workspace = true
 dialoguer.workspace = true
