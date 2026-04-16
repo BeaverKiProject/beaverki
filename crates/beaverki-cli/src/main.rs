@@ -1,17 +1,19 @@
+use std::fs::OpenOptions;
 use std::path::PathBuf;
+use std::process::Stdio;
 
 use anyhow::{Context, Result, anyhow, bail};
 use beaverki_config::{
     LoadedConfig, SetupAnswers, default_app_paths, prompt_passphrase_from_env,
     write_providers_config, write_setup_files,
 };
-use beaverki_core::MemoryScope;
 use beaverki_db::{Database, UserRow};
 use beaverki_models::OpenAiProvider;
 use beaverki_policy::is_builtin_role;
-use beaverki_runtime::Runtime;
+use beaverki_runtime::{DaemonClient, Runtime, RuntimeDaemon, latest_daemon_status};
 use clap::{Args, Parser, Subcommand};
 use dialoguer::{Input, Password};
+use tokio::time::{self, Duration};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
@@ -24,6 +26,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    Daemon {
+        #[command(subcommand)]
+        command: Box<DaemonCommand>,
+    },
     Setup {
         #[command(subcommand)]
         command: Box<SetupCommand>,
@@ -52,6 +58,16 @@ enum SetupCommand {
     VerifyOpenai(VerifyOpenAiArgs),
     ShowModels(ConfigDirArgs),
     SetModels(Box<SetModelsArgs>),
+}
+
+#[derive(Subcommand)]
+enum DaemonCommand {
+    Start(DaemonStartArgs),
+    Run(DaemonRunArgs),
+    Status(ConfigDirArgs),
+    Stop(ConfigDirArgs),
+    #[command(hide = true)]
+    Serve(DaemonServeArgs),
 }
 
 #[derive(Subcommand)]
@@ -194,6 +210,32 @@ struct SetModelsArgs {
     skip_openai_check: bool,
 }
 
+#[derive(Args, Clone)]
+struct DaemonStartArgs {
+    #[arg(long)]
+    config_dir: Option<PathBuf>,
+    #[arg(long, default_value = "BEAVERKI_MASTER_PASSPHRASE")]
+    passphrase_env: String,
+    #[arg(long, default_value_t = 10)]
+    startup_timeout_secs: u64,
+}
+
+#[derive(Args, Clone)]
+struct DaemonRunArgs {
+    #[arg(long)]
+    config_dir: Option<PathBuf>,
+    #[arg(long, default_value = "BEAVERKI_MASTER_PASSPHRASE")]
+    passphrase_env: String,
+}
+
+#[derive(Args, Clone)]
+struct DaemonServeArgs {
+    #[arg(long)]
+    config_dir: Option<PathBuf>,
+    #[arg(long, default_value = "BEAVERKI_MASTER_PASSPHRASE")]
+    passphrase_env: String,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -206,6 +248,13 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
     match cli.command {
+        Commands::Daemon { command } => match *command {
+            DaemonCommand::Start(args) => daemon_start(args).await,
+            DaemonCommand::Run(args) => daemon_run(args).await,
+            DaemonCommand::Status(args) => daemon_status(args).await,
+            DaemonCommand::Stop(args) => daemon_stop(args).await,
+            DaemonCommand::Serve(args) => daemon_serve(args).await,
+        },
         Commands::Setup { command } => match *command {
             SetupCommand::Init(args) => setup_init(*args).await,
             SetupCommand::VerifyOpenai(args) => verify_openai(args).await,
@@ -330,7 +379,61 @@ async fn setup_init(args: SetupInitArgs) -> Result<()> {
     Ok(())
 }
 
-async fn task_run(args: TaskRunArgs) -> Result<()> {
+async fn daemon_start(args: DaemonStartArgs) -> Result<()> {
+    let config_dir = resolve_config_dir(args.config_dir)?;
+    let config = LoadedConfig::load_from_dir(&config_dir)?;
+    let socket_path = config.runtime.state_dir.join("daemon.sock");
+    if DaemonClient::is_reachable(socket_path.clone()).await {
+        println!("Daemon already running at {}", socket_path.display());
+        return Ok(());
+    }
+
+    std::fs::create_dir_all(&config.runtime.log_dir)
+        .with_context(|| format!("failed to create {}", config.runtime.log_dir.display()))?;
+    let passphrase = prompt_passphrase_from_env(&args.passphrase_env).unwrap_or_else(|| {
+        Password::new()
+            .with_prompt("Master passphrase")
+            .interact()
+            .expect("failed to read master passphrase")
+    });
+    let log_path = config.runtime.log_dir.join("daemon.log");
+    let log_file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .with_context(|| format!("failed to open {}", log_path.display()))?;
+    let log_file_err = log_file
+        .try_clone()
+        .with_context(|| format!("failed to clone {}", log_path.display()))?;
+
+    let current_exe = std::env::current_exe().context("failed to determine current executable")?;
+    let mut child = std::process::Command::new(current_exe);
+    child
+        .arg("daemon")
+        .arg("serve")
+        .arg("--config-dir")
+        .arg(&config_dir)
+        .arg("--passphrase-env")
+        .arg(&args.passphrase_env)
+        .env(&args.passphrase_env, passphrase)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log_file))
+        .stderr(Stdio::from(log_file_err));
+
+    child.spawn().context("failed to spawn daemon process")?;
+
+    let _client = DaemonClient::wait_until_ready(
+        socket_path.clone(),
+        Duration::from_secs(args.startup_timeout_secs),
+    )
+    .await?;
+    println!("Daemon started.");
+    println!("Socket: {}", socket_path.display());
+    println!("Log: {}", log_path.display());
+    Ok(())
+}
+
+async fn daemon_run(args: DaemonRunArgs) -> Result<()> {
     let config_dir = resolve_config_dir(args.config_dir)?;
     let passphrase = prompt_passphrase_from_env(&args.passphrase_env).unwrap_or_else(|| {
         Password::new()
@@ -339,17 +442,79 @@ async fn task_run(args: TaskRunArgs) -> Result<()> {
             .expect("failed to read master passphrase")
     });
     let runtime = Runtime::load(&config_dir, &passphrase).await?;
-    let result = runtime
-        .run_objective(
-            args.user.as_deref(),
-            &args.objective,
-            parse_scope(&args.scope)?,
-        )
+    let daemon = RuntimeDaemon::new(runtime);
+    println!("Daemon listening on {}", daemon.socket_path().display());
+    daemon
+        .run_until(async {
+            let _ = tokio::signal::ctrl_c().await;
+        })
+        .await
+}
+
+async fn daemon_serve(args: DaemonServeArgs) -> Result<()> {
+    let config_dir = resolve_config_dir(args.config_dir)?;
+    let passphrase = prompt_passphrase_from_env(&args.passphrase_env)
+        .with_context(|| format!("missing environment variable {}", args.passphrase_env))?;
+    let runtime = Runtime::load(&config_dir, &passphrase).await?;
+    RuntimeDaemon::new(runtime)
+        .run_until(std::future::pending::<()>())
+        .await
+}
+
+async fn daemon_status(args: ConfigDirArgs) -> Result<()> {
+    let config_dir = resolve_config_dir(args.config_dir)?;
+    let config = LoadedConfig::load_from_dir(&config_dir)?;
+    let client = DaemonClient::new(config.runtime.state_dir.join("daemon.sock"));
+
+    if let Ok(status) = client.status().await {
+        print_daemon_status(&status, true);
+        return Ok(());
+    }
+
+    if let Some(status) = latest_daemon_status(&config_dir).await? {
+        print_daemon_status(&status, false);
+        return Ok(());
+    }
+
+    println!("Daemon is not running.");
+    Ok(())
+}
+
+async fn daemon_stop(args: ConfigDirArgs) -> Result<()> {
+    let config_dir = resolve_config_dir(args.config_dir)?;
+    let config = LoadedConfig::load_from_dir(&config_dir)?;
+    let socket_path = config.runtime.state_dir.join("daemon.sock");
+    let client = DaemonClient::new(socket_path.clone());
+    let status = client
+        .shutdown()
+        .await
+        .with_context(|| format!("daemon not reachable at {}", socket_path.display()))?;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if !DaemonClient::is_reachable(socket_path.clone()).await {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            bail!("daemon did not stop within the timeout");
+        }
+        time::sleep(Duration::from_millis(150)).await;
+    }
+
+    println!("Daemon stop requested for session {}.", status.session_id);
+    Ok(())
+}
+
+async fn task_run(args: TaskRunArgs) -> Result<()> {
+    let config_dir = resolve_config_dir(args.config_dir)?;
+    let client = require_daemon_client(&config_dir).await?;
+    let task = client
+        .run_task(args.user, args.objective, args.scope, true)
         .await?;
 
-    println!("Task ID: {}", result.task.task_id);
-    println!("State: {}", result.task.state);
-    if let Some(result_text) = result.task.result_text {
+    println!("Task ID: {}", task.task_id);
+    println!("State: {}", task.state);
+    if let Some(result_text) = task.result_text {
         println!("\n{result_text}");
     }
 
@@ -358,30 +523,41 @@ async fn task_run(args: TaskRunArgs) -> Result<()> {
 
 async fn task_show(args: TaskShowArgs) -> Result<()> {
     let config_dir = resolve_config_dir(args.config_dir)?;
-    let (_, db) = load_db(&config_dir).await?;
-    let user = resolve_user_for_db(&db, args.user.as_deref()).await?;
-    let task = db
-        .fetch_task_for_owner(&user.user_id, &args.task_id)
-        .await?
-        .with_context(|| format!("task '{}' not found", args.task_id))?;
-    let events = db
-        .fetch_task_events_for_owner(&user.user_id, &args.task_id)
-        .await?;
-    let invocations = db
-        .fetch_tool_invocations_for_owner(&user.user_id, &args.task_id)
-        .await?;
+    let inspection = if let Ok(client) = try_daemon_client(&config_dir).await {
+        client
+            .show_task(args.user.clone(), args.task_id.clone())
+            .await?
+    } else {
+        let (_, db) = load_db(&config_dir).await?;
+        let user = resolve_user_for_db(&db, args.user.as_deref()).await?;
+        let task = db
+            .fetch_task_for_owner(&user.user_id, &args.task_id)
+            .await?
+            .with_context(|| format!("task '{}' not found", args.task_id))?;
+        let events = db
+            .fetch_task_events_for_owner(&user.user_id, &args.task_id)
+            .await?;
+        let tool_invocations = db
+            .fetch_tool_invocations_for_owner(&user.user_id, &args.task_id)
+            .await?;
+        beaverki_runtime::TaskInspection {
+            task,
+            events,
+            tool_invocations,
+        }
+    };
 
-    println!("Task: {}", task.task_id);
-    println!("Owner: {}", task.owner_user_id);
-    println!("State: {}", task.state);
-    println!("Kind: {}", task.kind);
-    println!("Objective: {}", task.objective);
-    if let Some(result_text) = task.result_text {
+    println!("Task: {}", inspection.task.task_id);
+    println!("Owner: {}", inspection.task.owner_user_id);
+    println!("State: {}", inspection.task.state);
+    println!("Kind: {}", inspection.task.kind);
+    println!("Objective: {}", inspection.task.objective);
+    if let Some(result_text) = inspection.task.result_text {
         println!("Result: {result_text}");
     }
 
     println!("\nEvents:");
-    for event in events {
+    for event in inspection.events {
         println!(
             "- {} {} {} {}",
             event.created_at, event.actor_type, event.event_type, event.payload_json
@@ -389,7 +565,7 @@ async fn task_show(args: TaskShowArgs) -> Result<()> {
     }
 
     println!("\nTool Invocations:");
-    for invocation in invocations {
+    for invocation in inspection.tool_invocations {
         println!(
             "- {} {} {}",
             invocation.started_at, invocation.tool_name, invocation.status
@@ -446,11 +622,16 @@ async fn user_list(args: ConfigDirArgs) -> Result<()> {
 
 async fn approval_list(args: ApprovalListArgs) -> Result<()> {
     let config_dir = resolve_config_dir(args.config_dir)?;
-    let (_, db) = load_db(&config_dir).await?;
-    let user = resolve_user_for_db(&db, args.user.as_deref()).await?;
-    let approvals = db
-        .list_approvals_for_user(&user.user_id, args.status.as_deref())
-        .await?;
+    let approvals = if let Ok(client) = try_daemon_client(&config_dir).await {
+        client
+            .list_approvals(args.user.clone(), args.status.clone())
+            .await?
+    } else {
+        let (_, db) = load_db(&config_dir).await?;
+        let user = resolve_user_for_db(&db, args.user.as_deref()).await?;
+        db.list_approvals_for_user(&user.user_id, args.status.as_deref())
+            .await?
+    };
 
     for approval in approvals {
         println!(
@@ -468,15 +649,9 @@ async fn approval_list(args: ApprovalListArgs) -> Result<()> {
 
 async fn approval_resolve(args: ApprovalResolveArgs, approve: bool) -> Result<()> {
     let config_dir = resolve_config_dir(args.config_dir)?;
-    let passphrase = prompt_passphrase_from_env(&args.passphrase_env).unwrap_or_else(|| {
-        Password::new()
-            .with_prompt("Master passphrase")
-            .interact()
-            .expect("failed to read master passphrase")
-    });
-    let runtime = Runtime::load(&config_dir, &passphrase).await?;
-    let task = runtime
-        .resolve_approval(args.user.as_deref(), &args.approval_id, approve)
+    let client = require_daemon_client(&config_dir).await?;
+    let task = client
+        .resolve_approval(args.user, args.approval_id.clone(), approve)
         .await?;
 
     println!(
@@ -607,6 +782,22 @@ async fn load_db(config_dir: &PathBuf) -> Result<(LoadedConfig, Database)> {
     Ok((config, db))
 }
 
+async fn try_daemon_client(config_dir: &PathBuf) -> Result<DaemonClient> {
+    let config = LoadedConfig::load_from_dir(config_dir)?;
+    let client = DaemonClient::new(config.runtime.state_dir.join("daemon.sock"));
+    client
+        .ping()
+        .await
+        .with_context(|| format!("daemon not reachable at {}", client.socket_path().display()))?;
+    Ok(client)
+}
+
+async fn require_daemon_client(config_dir: &PathBuf) -> Result<DaemonClient> {
+    try_daemon_client(config_dir).await.with_context(
+        || "daemon is not running. Start it with 'beaverki daemon start' or 'beaverki daemon run'",
+    )
+}
+
 async fn resolve_user_for_db(db: &Database, user_id: Option<&str>) -> Result<UserRow> {
     match user_id {
         Some(user_id) => db
@@ -620,16 +811,40 @@ async fn resolve_user_for_db(db: &Database, user_id: Option<&str>) -> Result<Use
     }
 }
 
-fn parse_scope(value: &str) -> Result<MemoryScope> {
-    value
-        .parse::<MemoryScope>()
-        .map_err(|_| anyhow!("unsupported scope '{value}', expected private or household"))
-}
-
 fn resolve_config_dir(config_dir: Option<PathBuf>) -> Result<PathBuf> {
     Ok(config_dir.unwrap_or(default_app_paths()?.config_dir))
 }
 
 fn default_workspace_root() -> Result<PathBuf> {
     std::env::current_dir().context("failed to determine current working directory")
+}
+
+fn print_daemon_status(status: &beaverki_runtime::DaemonStatus, reachable: bool) {
+    println!("Daemon reachable: {}", if reachable { "yes" } else { "no" });
+    println!("Session: {}", status.session_id);
+    println!("State: {}", status.state);
+    println!("PID: {}", status.pid);
+    println!("Socket: {}", status.socket_path);
+    println!("Queue depth: {}", status.queue_depth);
+    println!(
+        "Automation planning enabled: {}",
+        if status.automation_planning_enabled {
+            "yes"
+        } else {
+            "no"
+        }
+    );
+    println!("Started at: {}", status.started_at);
+    if let Some(last_heartbeat_at) = &status.last_heartbeat_at {
+        println!("Last heartbeat: {last_heartbeat_at}");
+    }
+    if let Some(active_task_id) = &status.active_task_id {
+        println!("Active task: {active_task_id}");
+    }
+    if let Some(stopped_at) = &status.stopped_at {
+        println!("Stopped at: {stopped_at}");
+    }
+    if let Some(last_error) = &status.last_error {
+        println!("Last error: {last_error}");
+    }
 }

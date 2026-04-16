@@ -100,6 +100,10 @@ Goal:
 
 Introduce the always-running local runtime process that later connector and automation work will build on.
 
+Status:
+
+- implemented in the repository
+
 Stories:
 
 - `M1.5-001` Add a long-lived daemon mode for BeaverKI with clean startup and shutdown.
@@ -178,13 +182,13 @@ Candidate follow-up work:
 
 These are the first stories to execute before moving backlog management fully into GitHub:
 
-1. `M1.5-001` Add a long-lived daemon mode for BeaverKI with clean startup and shutdown.
-2. `M1.5-002` Add local runtime management commands to the CLI.
-3. `M1.5-003` Add a local IPC surface such as a Unix socket or named pipe for task submission and status inspection.
-4. `M1.5-004` Move task execution behind the daemon while preserving the current CLI workflow.
-5. `M1.5-005` Add a background worker loop for queued tasks.
-6. `M1.5-006` Add persistent runtime status, health, and audit events for daemon lifecycle.
-7. `M1.5-008` Add tests for daemon startup, shutdown, IPC submission, and persistence across restart.
+1. `M2-001` Implement browser tooling with interactive and headless modes.
+2. `M2-002` Implement Discord connector configuration and token handling.
+3. `M2-003` Implement Discord identity mapping to BeaverKI users.
+4. `M2-004` Support command intake from DMs and allowlisted channels.
+5. `M2-005` Support approval interactions through Discord.
+6. `M2-006` Add audit coverage for connector events and approval responses.
+7. `M2-007` Add end-to-end tests for Discord task submission and approval routing.
 
 ## 5. Migration To GitHub Issues
 

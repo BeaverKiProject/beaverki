@@ -235,6 +235,7 @@ dependencies = [
  "beaverki-runtime",
  "clap",
  "dialoguer",
+ "serde",
  "serde_json",
  "tokio",
  "tracing",
@@ -314,6 +315,7 @@ name = "beaverki-runtime"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "beaverki-agent",
  "beaverki-config",
  "beaverki-core",
@@ -322,6 +324,10 @@ dependencies = [
  "beaverki-models",
  "beaverki-policy",
  "beaverki-tools",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
  "tracing",
 ]
 

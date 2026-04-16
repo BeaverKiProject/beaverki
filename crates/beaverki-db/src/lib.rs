@@ -560,6 +560,160 @@ impl Database {
         Ok(audit_id)
     }
 
+    pub async fn begin_runtime_session(
+        &self,
+        instance_id: &str,
+        pid: i64,
+        socket_path: &str,
+        automation_planning_enabled: bool,
+    ) -> Result<RuntimeSessionRow> {
+        let session_id = new_prefixed_id("runtime");
+        let started_at = now_rfc3339();
+        sqlx::query(
+            "INSERT INTO runtime_sessions
+             (session_id, instance_id, state, pid, socket_path, queue_depth, active_task_id, automation_planning_enabled, started_at, last_heartbeat_at, stopped_at, last_error)
+             VALUES (?, ?, 'starting', ?, ?, 0, NULL, ?, ?, NULL, NULL, NULL)",
+        )
+        .bind(&session_id)
+        .bind(instance_id)
+        .bind(pid)
+        .bind(socket_path)
+        .bind(if automation_planning_enabled { 1_i64 } else { 0_i64 })
+        .bind(&started_at)
+        .execute(&self.pool)
+        .await
+        .context("failed to create runtime session")?;
+
+        self.fetch_runtime_session(&session_id)
+            .await?
+            .context("runtime session missing after insert")
+    }
+
+    pub async fn heartbeat_runtime_session(
+        &self,
+        session_id: &str,
+        state: &str,
+        queue_depth: i64,
+        active_task_id: Option<&str>,
+        automation_planning_enabled: bool,
+    ) -> Result<()> {
+        let observed_at = now_rfc3339();
+        sqlx::query(
+            "UPDATE runtime_sessions
+             SET state = ?, queue_depth = ?, active_task_id = ?, automation_planning_enabled = ?, last_heartbeat_at = ?
+             WHERE session_id = ?",
+        )
+        .bind(state)
+        .bind(queue_depth)
+        .bind(active_task_id)
+        .bind(if automation_planning_enabled { 1_i64 } else { 0_i64 })
+        .bind(&observed_at)
+        .bind(session_id)
+        .execute(&self.pool)
+        .await
+        .context("failed to update runtime session heartbeat")?;
+
+        let heartbeat_id = new_prefixed_id("heartbeat");
+        sqlx::query(
+            "INSERT INTO runtime_heartbeats
+             (heartbeat_id, session_id, state, queue_depth, active_task_id, automation_planning_enabled, observed_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&heartbeat_id)
+        .bind(session_id)
+        .bind(state)
+        .bind(queue_depth)
+        .bind(active_task_id)
+        .bind(if automation_planning_enabled { 1_i64 } else { 0_i64 })
+        .bind(&observed_at)
+        .execute(&self.pool)
+        .await
+        .context("failed to record runtime heartbeat")?;
+
+        Ok(())
+    }
+
+    pub async fn finish_runtime_session(
+        &self,
+        session_id: &str,
+        state: &str,
+        queue_depth: i64,
+        active_task_id: Option<&str>,
+        last_error: Option<&str>,
+    ) -> Result<()> {
+        let stopped_at = now_rfc3339();
+        sqlx::query(
+            "UPDATE runtime_sessions
+             SET state = ?, queue_depth = ?, active_task_id = ?, last_error = ?, stopped_at = ?, last_heartbeat_at = ?
+             WHERE session_id = ?",
+        )
+        .bind(state)
+        .bind(queue_depth)
+        .bind(active_task_id)
+        .bind(last_error)
+        .bind(&stopped_at)
+        .bind(&stopped_at)
+        .bind(session_id)
+        .execute(&self.pool)
+        .await
+        .context("failed to finish runtime session")?;
+        Ok(())
+    }
+
+    pub async fn fetch_runtime_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<RuntimeSessionRow>> {
+        let row = sqlx::query_as::<_, RuntimeSessionRow>(
+            "SELECT session_id, instance_id, state, pid, socket_path, queue_depth, active_task_id, automation_planning_enabled, started_at, last_heartbeat_at, stopped_at, last_error
+             FROM runtime_sessions
+             WHERE session_id = ?",
+        )
+        .bind(session_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to fetch runtime session")?;
+        Ok(row)
+    }
+
+    pub async fn latest_runtime_session(
+        &self,
+        instance_id: &str,
+    ) -> Result<Option<RuntimeSessionRow>> {
+        let row = sqlx::query_as::<_, RuntimeSessionRow>(
+            "SELECT session_id, instance_id, state, pid, socket_path, queue_depth, active_task_id, automation_planning_enabled, started_at, last_heartbeat_at, stopped_at, last_error
+             FROM runtime_sessions
+             WHERE instance_id = ?
+             ORDER BY started_at DESC
+             LIMIT 1",
+        )
+        .bind(instance_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to fetch latest runtime session")?;
+        Ok(row)
+    }
+
+    pub async fn list_runtime_heartbeats(
+        &self,
+        session_id: &str,
+        limit: i64,
+    ) -> Result<Vec<RuntimeHeartbeatRow>> {
+        let rows = sqlx::query_as::<_, RuntimeHeartbeatRow>(
+            "SELECT heartbeat_id, session_id, state, queue_depth, active_task_id, automation_planning_enabled, observed_at
+             FROM runtime_heartbeats
+             WHERE session_id = ?
+             ORDER BY observed_at DESC
+             LIMIT ?",
+        )
+        .bind(session_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list runtime heartbeats")?;
+        Ok(rows)
+    }
+
     pub async fn create_approval(
         &self,
         task_id: &str,
@@ -778,6 +932,50 @@ impl Database {
         Ok(row)
     }
 
+    pub async fn fetch_task(&self, task_id: &str) -> Result<Option<TaskRow>> {
+        let row = sqlx::query_as::<_, TaskRow>(
+            "SELECT task_id, owner_user_id, initiating_identity_id, primary_agent_id, assigned_agent_id, parent_task_id, kind, state, objective, context_summary, result_text, scope, wake_at, created_at, updated_at, completed_at
+             FROM tasks
+             WHERE task_id = ?",
+        )
+        .bind(task_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to fetch task")?;
+        Ok(row)
+    }
+
+    pub async fn fetch_next_runnable_task(&self) -> Result<Option<TaskRow>> {
+        let now = now_rfc3339();
+        let row = sqlx::query_as::<_, TaskRow>(
+            "SELECT task_id, owner_user_id, initiating_identity_id, primary_agent_id, assigned_agent_id, parent_task_id, kind, state, objective, context_summary, result_text, scope, wake_at, created_at, updated_at, completed_at
+             FROM tasks
+             WHERE state = ?
+               AND (wake_at IS NULL OR wake_at <= ?)
+             ORDER BY created_at ASC
+             LIMIT 1",
+        )
+        .bind(TaskState::Pending.as_str())
+        .bind(now)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to fetch next runnable task")?;
+        Ok(row)
+    }
+
+    pub async fn pending_task_count(&self) -> Result<i64> {
+        let count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*)
+             FROM tasks
+             WHERE state = ?",
+        )
+        .bind(TaskState::Pending.as_str())
+        .fetch_one(&self.pool)
+        .await
+        .context("failed to count pending tasks")?;
+        Ok(count)
+    }
+
     pub async fn fetch_task_events_for_owner(
         &self,
         owner_user_id: &str,
@@ -856,7 +1054,7 @@ pub struct NewMemory<'a> {
     pub task_id: Option<&'a str>,
 }
 
-#[derive(Debug, Clone, FromRow, Serialize)]
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
 pub struct UserRow {
     pub user_id: String,
     pub display_name: String,
@@ -866,20 +1064,20 @@ pub struct UserRow {
     pub updated_at: String,
 }
 
-#[derive(Debug, Clone, FromRow, Serialize)]
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
 pub struct RoleRow {
     pub role_id: String,
     pub description: String,
 }
 
-#[derive(Debug, Clone, FromRow, Serialize)]
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
 pub struct UserRoleRow {
     pub user_id: String,
     pub role_id: String,
     pub created_at: String,
 }
 
-#[derive(Debug, Clone, FromRow, Serialize)]
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
 pub struct AgentRow {
     pub agent_id: String,
     pub kind: String,
@@ -893,7 +1091,7 @@ pub struct AgentRow {
     pub updated_at: String,
 }
 
-#[derive(Debug, Clone, FromRow, Serialize)]
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
 pub struct TaskRow {
     pub task_id: String,
     pub owner_user_id: String,
@@ -913,7 +1111,7 @@ pub struct TaskRow {
     pub completed_at: Option<String>,
 }
 
-#[derive(Debug, Clone, FromRow, Serialize)]
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
 pub struct TaskEventRow {
     pub event_id: String,
     pub task_id: String,
@@ -924,7 +1122,7 @@ pub struct TaskEventRow {
     pub created_at: String,
 }
 
-#[derive(Debug, Clone, FromRow, Serialize)]
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
 pub struct MemoryRow {
     pub memory_id: String,
     pub owner_user_id: Option<String>,
@@ -942,7 +1140,7 @@ pub struct MemoryRow {
     pub last_accessed_at: Option<String>,
 }
 
-#[derive(Debug, Clone, FromRow, Serialize)]
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
 pub struct ToolInvocationRow {
     pub invocation_id: String,
     pub task_id: String,
@@ -955,7 +1153,7 @@ pub struct ToolInvocationRow {
     pub finished_at: Option<String>,
 }
 
-#[derive(Debug, Clone, FromRow, Serialize)]
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
 pub struct ApprovalRow {
     pub approval_id: String,
     pub task_id: String,
@@ -969,7 +1167,7 @@ pub struct ApprovalRow {
     pub created_at: String,
 }
 
-#[derive(Debug, Clone, FromRow, Serialize)]
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
 pub struct ConnectorIdentityRow {
     pub identity_id: String,
     pub connector_type: String,
@@ -979,6 +1177,33 @@ pub struct ConnectorIdentityRow {
     pub trust_level: String,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct RuntimeSessionRow {
+    pub session_id: String,
+    pub instance_id: String,
+    pub state: String,
+    pub pid: i64,
+    pub socket_path: String,
+    pub queue_depth: i64,
+    pub active_task_id: Option<String>,
+    pub automation_planning_enabled: i64,
+    pub started_at: String,
+    pub last_heartbeat_at: Option<String>,
+    pub stopped_at: Option<String>,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct RuntimeHeartbeatRow {
+    pub heartbeat_id: String,
+    pub session_id: String,
+    pub state: String,
+    pub queue_depth: i64,
+    pub active_task_id: Option<String>,
+    pub automation_planning_enabled: i64,
+    pub observed_at: String,
 }
 
 fn slugify(input: &str) -> String {

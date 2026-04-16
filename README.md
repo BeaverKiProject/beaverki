@@ -27,6 +27,7 @@ The repository now includes:
 
 - `M0 Foundation`
 - `M1 Core Multi-User`
+- `M1.5 Runtime Daemon`
 
 Implemented so far:
 
@@ -48,7 +49,6 @@ Implemented so far:
 
 Still intentionally out of scope:
 
-- always-running daemon/runtime
 - Discord
 - browser automation
 - Lua runtime
@@ -101,18 +101,19 @@ Every material change should start from an issue with clear acceptance criteria.
 
 ## Near-Term Next Steps
 
-- add the always-running daemon/runtime milestone (`M1.5`)
-- move CLI task execution behind a long-lived local process
-- add queued/background execution and heartbeat scaffolding
 - add Discord and browser integrations on top of the daemon
+- expand the daemon into connector-driven and scheduled background work
+- add safety review flows for risky generated actions and scripts
 
 ## Quick Start
 
 1. Run `make setup`.
 2. Enter an OpenAI API key and a local master passphrase when prompted.
-3. Run `make user-list`.
-4. Run `make run-task OBJECTIVE="Summarize the current README and list the docs folder."`
-5. Inspect the recorded task with `make show-task TASK_ID=<task-id>`.
+3. Run `make daemon-start`.
+4. Run `make user-list`.
+5. Run `make run-task OBJECTIVE="Summarize the current README and list the docs folder."`
+6. Inspect the recorded task with `make show-task TASK_ID=<task-id>`.
+7. Run `make daemon-stop` when you are done.
 
 Default storage locations are now platform-standard:
 
@@ -127,6 +128,9 @@ cargo run -p beaverki-cli -- setup verify-openai
 cargo run -p beaverki-cli -- setup init
 cargo run -p beaverki-cli -- setup show-models
 cargo run -p beaverki-cli -- setup set-models --planner-model gpt-5.4 --executor-model gpt-5.4-mini --summarizer-model gpt-5.4-mini
+cargo run -p beaverki-cli -- daemon start
+cargo run -p beaverki-cli -- daemon status
+cargo run -p beaverki-cli -- daemon stop
 cargo run -p beaverki-cli -- role list
 cargo run -p beaverki-cli -- user list
 cargo run -p beaverki-cli -- user add --display-name Casey --role adult
@@ -139,7 +143,9 @@ cargo run -p beaverki-cli -- approval approve --approval-id <approval-id>
 
 Use `--config-dir` if you want a non-default location.
 
-`setup init` verifies the OpenAI API key unless `--skip-openai-check` is passed. The API token is stored in an age-encrypted local secret file under the BeaverKI state directory. `task run` reads the master passphrase from `BEAVERKI_MASTER_PASSPHRASE` when available, otherwise it prompts for it.
+`setup init` verifies the OpenAI API key unless `--skip-openai-check` is passed. The API token is stored in an age-encrypted local secret file under the BeaverKI state directory. `daemon start` and `daemon run` read the master passphrase from `BEAVERKI_MASTER_PASSPHRASE` when available, otherwise they prompt for it.
+
+The daemon keeps the decrypted provider credentials only in memory for the current runtime process. Start it once with `daemon start` or `daemon run`, then use the existing `task` and `approval` CLI commands against the local socket.
 
 The initial defaults are:
 

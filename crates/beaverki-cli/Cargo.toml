@@ -14,6 +14,7 @@ beaverki-policy = { path = "../beaverki-policy" }
 beaverki-runtime = { path = "../beaverki-runtime" }
 clap.workspace = true
 dialoguer.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
