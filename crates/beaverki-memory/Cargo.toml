@@ -1,0 +1,14 @@
+[package]
+name = "beaverki-memory"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+beaverki-core = { path = "../beaverki-core" }
+beaverki-db = { path = "../beaverki-db" }
+serde.workspace = true
+
+[lints]
+workspace = true

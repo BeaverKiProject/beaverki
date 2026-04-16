@@ -23,7 +23,7 @@ Planned capabilities include:
 
 ## Current Status
 
-The repository is currently in the design and specification phase.
+The repository now includes the `M0 Foundation` milestone implementation.
 
 Implemented so far:
 
@@ -31,15 +31,20 @@ Implemented so far:
 - V1 technical spec
 - GitHub-native contributor workflow
 - issue and PR templates
+- Rust workspace and crate boundaries for the core runtime
+- encrypted local OpenAI credential storage
+- SQLite-backed task, memory, tool-invocation, and audit persistence
+- single-user CLI setup and task execution flow
+- shell and filesystem tools for the primary agent
+- CI for formatting, linting, and tests
 
-Not implemented yet:
+Still intentionally out of scope for `M0`:
 
-- Rust workspace
-- runtime
-- providers
-- tools
-- connectors
-- CI
+- multi-user support
+- Discord
+- browser automation
+- Lua runtime
+- safety-agent review flows
 
 Implementation will be staged. The first shippable milestone is intentionally smaller than the full V1 target.
 
@@ -88,10 +93,46 @@ Every material change should start from an issue with clear acceptance criteria.
 
 ## Near-Term Next Steps
 
-- scaffold the Rust workspace
-- define initial SQLite migrations
-- implement config loading and setup assistant
-- add the first CI workflow
+- turn `M1 Core Multi-User` stories into GitHub issues
+- add multi-user identity and RBAC
+- enforce private versus household memory separation end to end
+- add approval flows and sub-agent task slicing
+
+## Quick Start
+
+1. Run `make setup`.
+2. Enter an OpenAI API key and a local master passphrase when prompted.
+3. Run `make run-task OBJECTIVE="Summarize the current README and list the docs folder."`
+4. Inspect the recorded task with `make show-task TASK_ID=<task-id>`.
+
+Default storage locations are now platform-standard:
+
+- Linux: `~/.config/beaverki` for config and `~/.local/share/beaverki` or `~/.local/state/beaverki` for runtime state
+- macOS: `~/Library/Application Support/beaverki`
+- Windows: `%APPDATA%\beaverki` and `%LOCALAPPDATA%\beaverki`
+
+You can also call the CLI directly:
+
+```bash
+cargo run -p beaverki-cli -- setup verify-openai
+cargo run -p beaverki-cli -- setup init
+cargo run -p beaverki-cli -- setup show-models
+cargo run -p beaverki-cli -- setup set-models --planner-model gpt-5.4 --executor-model gpt-5.4-mini --summarizer-model gpt-5.4-mini
+cargo run -p beaverki-cli -- task run --objective "Inspect the repository and summarize it."
+cargo run -p beaverki-cli -- task show --task-id <task-id>
+```
+
+Use `--config-dir` if you want a non-default location.
+
+`setup init` verifies the OpenAI API key unless `--skip-openai-check` is passed. The API token is stored in an age-encrypted local secret file under the BeaverKI state directory. `task run` reads the master passphrase from `BEAVERKI_MASTER_PASSPHRASE` when available, otherwise it prompts for it.
+
+The initial defaults are:
+
+- planner: `gpt-5.4`
+- executor: `gpt-5.4-mini`
+- summarizer: `gpt-5.4-mini`
+
+After setup, use `setup show-models` and `setup set-models` to inspect or change them without editing YAML manually.
 
 ## Repository
 

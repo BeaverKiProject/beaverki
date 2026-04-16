@@ -1,0 +1,5 @@
+/target
+/.beaverki
+/.env
+config/
+!config/.gitkeep

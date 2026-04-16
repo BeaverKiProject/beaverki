@@ -1,0 +1,47 @@
+[workspace]
+members = [
+  "crates/beaverki-agent",
+  "crates/beaverki-cli",
+  "crates/beaverki-config",
+  "crates/beaverki-core",
+  "crates/beaverki-db",
+  "crates/beaverki-memory",
+  "crates/beaverki-models",
+  "crates/beaverki-policy",
+  "crates/beaverki-runtime",
+  "crates/beaverki-tools",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+version = "0.1.0"
+
+[workspace.dependencies]
+age = "0.11"
+anyhow = "1.0"
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4.5", features = ["derive", "env"] }
+dialoguer = "0.11"
+directories = "5.0"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite", "chrono", "uuid"] }
+tempfile = "3.20"
+tokio = { version = "1.48", features = ["fs", "macros", "process", "rt-multi-thread", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+uuid = { version = "1.18", features = ["serde", "v4"] }
+walkdir = "2.5"
+
+[workspace.lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+unwrap_used = "deny"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"

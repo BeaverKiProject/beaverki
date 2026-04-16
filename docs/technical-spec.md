@@ -954,7 +954,7 @@ trait Tool {
 
 ### 13.2 V1 Tools
 
-- `shell.exec`
+- `shell_exec`
 - `fs.read`
 - `fs.write`
 - `fs.search`

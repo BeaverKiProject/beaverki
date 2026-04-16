@@ -28,6 +28,10 @@ Goal:
 
 Ship a minimal single-user CLI runtime that can execute the core agent loop with SQLite-backed state, OpenAI as provider, and shell/filesystem tools.
 
+Status:
+
+- implemented in the repository
+
 Out of scope:
 
 - multi-user support
@@ -160,4 +164,3 @@ When the workspace is scaffolded enough to support normal development flow:
 2. link each issue to the relevant milestone
 3. copy acceptance criteria from this document into the issue
 4. keep this file as a milestone overview, not the active task tracker
-

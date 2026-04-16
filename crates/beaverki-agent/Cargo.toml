@@ -1,0 +1,19 @@
+[package]
+name = "beaverki-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+beaverki-config = { path = "../beaverki-config" }
+beaverki-core = { path = "../beaverki-core" }
+beaverki-db = { path = "../beaverki-db" }
+beaverki-memory = { path = "../beaverki-memory" }
+beaverki-models = { path = "../beaverki-models" }
+beaverki-tools = { path = "../beaverki-tools" }
+serde_json.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true
