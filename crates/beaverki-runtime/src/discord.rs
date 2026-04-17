@@ -1,14 +1,15 @@
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
-use chrono::{DateTime, Utc};
 use beaverki_db::{Database, TaskEventRow, TaskRow};
+use chrono::{DateTime, Utc};
 use futures_util::{SinkExt, StreamExt};
 use reqwest::StatusCode;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::time::{self, MissedTickBehavior};
+use tokio::time::{self, Instant, MissedTickBehavior};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::warn;
@@ -22,6 +23,7 @@ const DISCORD_INTENTS: i64 = (1 << 0) | (1 << 9) | (1 << 12) | (1 << 15);
 const DISCORD_MAX_MESSAGE_LEN: usize = 1_900;
 const DISCORD_CONVERSATION_HISTORY_LIMIT: i64 = 4;
 const DISCORD_ACTIVE_CONVERSATION_WINDOW_SECS: i64 = 45 * 60;
+const DISCORD_TYPING_REFRESH_INTERVAL: Duration = Duration::from_secs(8);
 
 #[derive(Debug, Deserialize)]
 struct DiscordGatewayInfo {
@@ -120,9 +122,7 @@ async fn run_gateway_session(
     if gateway_response.status() == StatusCode::TOO_MANY_REQUESTS {
         let retry_after = parse_retry_after_secs(gateway_response).await;
         if let Some(retry_after) = retry_after {
-            bail!(
-                "Discord gateway URL request rate limited; retry_after_secs={retry_after}"
-            );
+            bail!("Discord gateway URL request rate limited; retry_after_secs={retry_after}");
         }
         bail!("Discord gateway URL request rate limited");
     }
@@ -192,15 +192,21 @@ async fn run_gateway_session(
                                                 continue;
                                             }
                                             let external_display_name = discord_author_display_name(&message.author);
-                                            let reply = daemon.handle_connector_message(ConnectorMessageRequest {
-                                                connector_type: "discord".to_owned(),
-                                                external_user_id: message.author.id,
-                                                external_display_name,
-                                                channel_id: message.channel_id.clone(),
-                                                message_id: message.id,
-                                                content: message.content,
-                                                is_direct_message: message.guild_id.is_none(),
-                                            }).await?;
+                                            let reply = daemon
+                                                .handle_discord_gateway_message(
+                                                    http_client,
+                                                    token,
+                                                    ConnectorMessageRequest {
+                                                        connector_type: "discord".to_owned(),
+                                                        external_user_id: message.author.id,
+                                                        external_display_name,
+                                                        channel_id: message.channel_id.clone(),
+                                                        message_id: message.id,
+                                                        content: message.content,
+                                                        is_direct_message: message.guild_id.is_none(),
+                                                    },
+                                                )
+                                                .await?;
                                             if let Some(reply_text) = reply.reply {
                                                 send_discord_message(
                                                     http_client,
@@ -292,10 +298,132 @@ async fn send_discord_message(
     Ok(())
 }
 
+async fn send_discord_typing(
+    http_client: &reqwest::Client,
+    token: &str,
+    channel_id: &str,
+) -> Result<()> {
+    http_client
+        .post(format!("{DISCORD_API_BASE}/channels/{channel_id}/typing"))
+        .header("Authorization", format!("Bot {token}"))
+        .send()
+        .await
+        .with_context(|| {
+            format!("failed to send Discord typing indicator for channel {channel_id}")
+        })?
+        .error_for_status()
+        .with_context(|| format!("Discord rejected typing indicator for channel {channel_id}"))?;
+    Ok(())
+}
+
+async fn with_discord_typing<F, T>(
+    http_client: &reqwest::Client,
+    token: &str,
+    channel_id: &str,
+    future: F,
+) -> Result<T>
+where
+    F: Future<Output = Result<T>>,
+{
+    let stop_signal = Arc::new(tokio::sync::Notify::new());
+    let typing_http_client = http_client.clone();
+    let typing_token = token.to_owned();
+    let typing_channel_id = channel_id.to_owned();
+    let typing_stop_signal = Arc::clone(&stop_signal);
+    let typing_task = tokio::spawn(async move {
+        if let Err(error) =
+            send_discord_typing(&typing_http_client, &typing_token, &typing_channel_id).await
+        {
+            warn!(
+                "failed to send Discord typing indicator for channel {}: {error:#}",
+                typing_channel_id
+            );
+        }
+
+        let mut typing_refresh = time::interval_at(
+            Instant::now() + DISCORD_TYPING_REFRESH_INTERVAL,
+            DISCORD_TYPING_REFRESH_INTERVAL,
+        );
+        typing_refresh.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+        loop {
+            tokio::select! {
+                _ = typing_stop_signal.notified() => break,
+                _ = typing_refresh.tick() => {
+                    if let Err(error) = send_discord_typing(
+                        &typing_http_client,
+                        &typing_token,
+                        &typing_channel_id,
+                    )
+                    .await
+                    {
+                        warn!(
+                            "failed to refresh Discord typing indicator for channel {}: {error:#}",
+                            typing_channel_id
+                        );
+                    }
+                }
+            }
+        }
+    });
+
+    let result = future.await;
+    stop_signal.notify_one();
+    if let Err(error) = typing_task.await {
+        warn!("Discord typing task join failed for channel {channel_id}: {error}");
+    }
+    result
+}
+
+async fn wait_for_discord_task_completion(
+    daemon: &RuntimeDaemon,
+    owner_user_id: &str,
+    task_id: &str,
+    timeout_secs: u64,
+    typing_context: Option<(&reqwest::Client, &str, &str)>,
+) -> Result<Option<TaskRow>> {
+    let wait_for_task = async {
+        match time::timeout(
+            Duration::from_secs(timeout_secs),
+            daemon.wait_for_task_state(owner_user_id, task_id),
+        )
+        .await
+        {
+            Ok(result) => result.map(Some),
+            Err(_) => Ok(None),
+        }
+    };
+
+    match typing_context {
+        Some((http_client, token, channel_id)) => {
+            with_discord_typing(http_client, token, channel_id, wait_for_task).await
+        }
+        None => wait_for_task.await,
+    }
+}
+
 impl RuntimeDaemon {
+    async fn handle_discord_gateway_message(
+        &self,
+        http_client: &reqwest::Client,
+        token: &str,
+        message: ConnectorMessageRequest,
+    ) -> Result<ConnectorMessageReply> {
+        self.handle_connector_message_internal(message, Some((http_client, token)))
+            .await
+    }
+
     pub(crate) async fn handle_connector_message(
         &self,
         message: ConnectorMessageRequest,
+    ) -> Result<ConnectorMessageReply> {
+        self.handle_connector_message_internal(message, None).await
+    }
+
+    async fn handle_connector_message_internal(
+        &self,
+        message: ConnectorMessageRequest,
+        typing_context: Option<(&reqwest::Client, &str)>,
     ) -> Result<ConnectorMessageReply> {
         if message.connector_type != "discord" {
             bail!("unsupported connector type '{}'", message.connector_type);
@@ -484,15 +612,15 @@ impl RuntimeDaemon {
             .await?;
         self.wake_worker.notify_one();
 
-        let waited_task = match time::timeout(
-            Duration::from_secs(discord_config.task_wait_timeout_secs),
-            self.wait_for_task_state(&task.owner_user_id, &task.task_id),
+        let waited_task = wait_for_discord_task_completion(
+            self,
+            &task.owner_user_id,
+            &task.task_id,
+            discord_config.task_wait_timeout_secs,
+            typing_context
+                .map(|(http_client, token)| (http_client, token, message.channel_id.as_str())),
         )
-        .await
-        {
-            Ok(result) => Some(result?),
-            Err(_) => None,
-        };
+        .await?;
 
         let reply = if let Some(waited_task) = waited_task {
             format_task_reply(&waited_task)
@@ -730,7 +858,9 @@ async fn load_recent_conversation_exchanges(
         .await?;
     let mut exchanges = Vec::with_capacity(tasks.len());
     for task in tasks {
-        let events = db.fetch_task_events_for_owner(owner_user_id, &task.task_id).await?;
+        let events = db
+            .fetch_task_events_for_owner(owner_user_id, &task.task_id)
+            .await?;
         exchanges.push(build_conversation_exchange(
             &task,
             &events,
@@ -750,7 +880,9 @@ fn build_conversation_exchange(
         (
             context.source_label,
             Some(context.channel_id),
-            context.user_label.unwrap_or_else(|| fallback_user_label.to_owned()),
+            context
+                .user_label
+                .unwrap_or_else(|| fallback_user_label.to_owned()),
         )
     } else if task.initiating_identity_id.starts_with("cli:") {
         ("CLI".to_owned(), None, fallback_user_label.to_owned())
@@ -790,7 +922,10 @@ fn connector_context_from_events(events: &[TaskEventRow]) -> Option<ConnectorEve
         .and_then(Value::as_str)
         .unwrap_or("Connector")
         .to_owned();
-    let channel_id = payload.get("channel_id").and_then(Value::as_str)?.to_owned();
+    let channel_id = payload
+        .get("channel_id")
+        .and_then(Value::as_str)?
+        .to_owned();
     let user_label = payload
         .get("external_display_name")
         .and_then(Value::as_str)
@@ -980,12 +1115,20 @@ mod tests {
             assistant_text: "You said your name is Joe.".to_owned(),
         };
 
-        let context =
-            build_discord_task_context(&[recent_exchange], "Discord direct message", "Torlenor", "dm-1");
+        let context = build_discord_task_context(
+            &[recent_exchange],
+            "Discord direct message",
+            "Torlenor",
+            "dm-1",
+        );
 
         assert!(context.contains("Conversation status: active follow-up"));
-        assert!(context.contains("[Discord direct message | channel dm-1] User (Torlenor): Who am I?"));
-        assert!(context.contains("[Discord direct message | channel dm-1] Assistant: You said your name is Joe."));
+        assert!(
+            context.contains("[Discord direct message | channel dm-1] User (Torlenor): Who am I?")
+        );
+        assert!(context.contains(
+            "[Discord direct message | channel dm-1] Assistant: You said your name is Joe."
+        ));
     }
 
     #[test]
@@ -1000,8 +1143,12 @@ mod tests {
             assistant_text: "old reply".to_owned(),
         };
 
-        let context =
-            build_discord_task_context(&[stale_exchange], "Discord direct message", "Torlenor", "dm-1");
+        let context = build_discord_task_context(
+            &[stale_exchange],
+            "Discord direct message",
+            "Torlenor",
+            "dm-1",
+        );
 
         assert!(context.contains("Conversation status: fresh conversation"));
         assert!(!context.contains("Recent attributed exchanges"));
