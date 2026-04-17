@@ -940,23 +940,19 @@ impl PrimaryAgentRunner {
         )
         .await
         .map_err(ToolError::Failed)?;
+        let approved_status = if prior_status.as_deref() == Some("active") {
+            "active"
+        } else {
+            "draft"
+        };
+        let application = automation::apply_script_review(&review, approved_status, prior_status.as_deref());
 
         self.db
             .update_script_safety(
                 &script.script_id,
-                if review.approved() {
-                    "approved"
-                } else {
-                    "rejected"
-                },
+                &application.safety_status,
                 &review.summary,
-                if review.approved() && prior_status.as_deref() == Some("active") {
-                    Some("active")
-                } else if review.approved() {
-                    Some("draft")
-                } else {
-                    Some("blocked")
-                },
+                Some(&application.resulting_status),
             )
             .await
             .map_err(ToolError::Failed)?;
@@ -982,9 +978,8 @@ impl PrimaryAgentRunner {
                     "task_id": task.task_id,
                     "script_id": script.script_id,
                     "prior_status": prior_status,
-                    "reactivated_after_rewrite": review.approved()
-                        && prior_status.as_deref() == Some("active"),
-                    "safety_status": if review.approved() { "approved" } else { "rejected" },
+                    "reactivated_after_rewrite": application.reactivated_after_rewrite,
+                    "safety_status": application.safety_status,
                     "verdict": review.verdict,
                 }),
             )
@@ -1004,8 +999,7 @@ impl PrimaryAgentRunner {
                 "status": updated.status,
                 "safety_status": updated.safety_status,
                 "safety_summary": updated.safety_summary,
-                "reactivated_after_rewrite": review.approved()
-                    && prior_status.as_deref() == Some("active"),
+                "reactivated_after_rewrite": application.reactivated_after_rewrite,
                 "review_verdict": review.verdict,
                 "risk_level": review.risk_level,
                 "findings": review.findings,
@@ -1115,8 +1109,45 @@ impl PrimaryAgentRunner {
             browser_headless_program: tool_context.browser_headless_program.clone(),
             browser_headless_args: tool_context.browser_headless_args.clone(),
         })
-        .await
-        .map_err(ToolError::Failed)?;
+        .await;
+        let execution = match execution {
+            Ok(execution) => execution,
+            Err(error) => {
+                if let Some(policy_error) = error.downcast_ref::<automation::LuaToolPolicyDenied>() {
+                    self.db
+                        .append_task_event(
+                            &task.task_id,
+                            "lua_tool_denied",
+                            "tool",
+                            "lua",
+                            json!({
+                                "script_id": script.script_id,
+                                "tool_name": policy_error.tool_name,
+                                "detail": policy_error.detail,
+                                "message": policy_error.message,
+                            }),
+                        )
+                        .await
+                        .map_err(ToolError::Failed)?;
+                    self.db
+                        .record_audit_event(
+                            "agent",
+                            &request.assigned_agent_id,
+                            "lua_script_tool_denied",
+                            json!({
+                                "task_id": task.task_id,
+                                "script_id": script.script_id,
+                                "tool_name": policy_error.tool_name,
+                                "detail": policy_error.detail,
+                                "message": policy_error.message,
+                            }),
+                        )
+                        .await
+                        .map_err(ToolError::Failed)?;
+                }
+                return Err(ToolError::Failed(error));
+            }
+        };
 
         for log_line in &execution.logs {
             self.db
@@ -2311,6 +2342,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn lua_script_write_preserves_needs_changes_verdict() {
+        let provider = FakeProvider::new(vec![
+            ModelTurnResponse {
+                output_items: vec![json!({
+                    "type": "function_call",
+                    "call_id": "call_write",
+                    "name": "lua_script_write",
+                    "arguments": "{\"script_id\":\"script_needs_changes_agent\",\"source_text\":\"return function(ctx)\\n    return \\\"retry\\\"\\nend\",\"capability_profile\":{},\"intended_behavior_summary\":\"Return a retry marker.\"}"
+                })],
+                tool_calls: vec![beaverki_models::ModelToolCall {
+                    call_id: "call_write".to_owned(),
+                    name: "lua_script_write".to_owned(),
+                    arguments: json!({
+                        "script_id": "script_needs_changes_agent",
+                        "source_text": "return function(ctx)\n    return \"retry\"\nend",
+                        "capability_profile": {},
+                        "intended_behavior_summary": "Return a retry marker."
+                    }),
+                }],
+                output_text: String::new(),
+            },
+            ModelTurnResponse {
+                output_items: vec![json!({
+                    "type": "message",
+                    "content": [{
+                        "type": "output_text",
+                        "text": "{\"verdict\":\"needs_changes\",\"risk_level\":\"medium\",\"findings\":[\"The script behavior is still too broad.\"],\"required_changes\":[\"Constrain the script before activation.\"],\"summary\":\"The automation needs changes before it can be trusted.\"}"
+                    }]
+                })],
+                tool_calls: vec![],
+                output_text: "{\"verdict\":\"needs_changes\",\"risk_level\":\"medium\",\"findings\":[\"The script behavior is still too broad.\"],\"required_changes\":[\"Constrain the script before activation.\"],\"summary\":\"The automation needs changes before it can be trusted.\"}".to_owned(),
+            },
+            ModelTurnResponse {
+                output_items: vec![json!({
+                    "type": "message",
+                    "content": [{ "type": "output_text", "text": "write complete" }]
+                })],
+                tool_calls: vec![],
+                output_text: "write complete".to_owned(),
+            },
+        ]);
+        let (db, runner) = test_runner(provider).await;
+        let default_user = db.default_user().await.expect("default").expect("user");
+        let roles = db
+            .list_user_roles(&default_user.user_id)
+            .await
+            .expect("roles")
+            .into_iter()
+            .map(|row| row.role_id)
+            .collect::<Vec<_>>();
+
+        let result = runner
+            .run_task(AgentRequest {
+                owner_user_id: default_user.user_id.clone(),
+                initiating_identity_id: format!("cli:{}", default_user.user_id),
+                primary_agent_id: default_user.primary_agent_id.clone().expect("agent"),
+                assigned_agent_id: default_user.primary_agent_id.clone().expect("agent"),
+                role_ids: roles.clone(),
+                objective: "Write a Lua automation that still needs changes".to_owned(),
+                scope: MemoryScope::Private,
+                kind: "interactive".to_owned(),
+                parent_task_id: None,
+                task_context: None,
+                visible_scopes: visible_memory_scopes(&roles),
+                memory_mode: AgentMemoryMode::ScopedRetrieval,
+                approved_shell_commands: Vec::new(),
+                approved_automation_actions: Vec::new(),
+            })
+            .await
+            .expect("task");
+
+        assert_eq!(result.task.state, TaskState::Completed.as_str());
+        let script = db
+            .fetch_script_for_owner(&default_user.user_id, "script_needs_changes_agent")
+            .await
+            .expect("script fetch")
+            .expect("script");
+        assert_eq!(script.status, "blocked");
+        assert_eq!(script.safety_status, "needs_changes");
+    }
+
+    #[tokio::test]
     async fn lua_script_schedule_pauses_for_approval_and_resumes() {
         let provider = FakeProvider::new(vec![
             ModelTurnResponse {
@@ -2750,6 +2863,97 @@ mod tests {
             payload["capability_profile"]["allowed_tools"],
             json!(["shell_exec"])
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn lua_script_run_surfaces_typed_policy_denial() {
+        let (db, runner) = test_runner(FakeProvider::new(vec![])).await;
+        let default_user = db.default_user().await.expect("default").expect("user");
+        let roles = db
+            .list_user_roles(&default_user.user_id)
+            .await
+            .expect("roles")
+            .into_iter()
+            .map(|row| row.role_id)
+            .collect::<Vec<_>>();
+        let task = db
+            .create_task_with_params(NewTask {
+                owner_user_id: &default_user.user_id,
+                initiating_identity_id: &format!("cli:{}", default_user.user_id),
+                primary_agent_id: default_user.primary_agent_id.as_deref().expect("agent"),
+                assigned_agent_id: default_user.primary_agent_id.as_deref().expect("agent"),
+                parent_task_id: None,
+                kind: "interactive",
+                objective: "Run a Lua script with risky shell",
+                context_summary: None,
+                scope: MemoryScope::Private,
+                wake_at: None,
+            })
+            .await
+            .expect("task");
+        db.create_script(NewScript {
+            script_id: Some("script_risky_lua_run"),
+            owner_user_id: &default_user.user_id,
+            kind: "lua",
+            status: "active",
+            source_text: r#"return function(ctx)
+    return ctx.tool_call("shell_exec", { command = "mkdir /tmp/beaverki_agent_lua_policy_denied" })
+end"#,
+            capability_profile_json: json!({
+                "allowed_tools": ["shell_exec"]
+            }),
+            created_from_task_id: Some(&task.task_id),
+            safety_status: "approved",
+            safety_summary: Some("approved"),
+        })
+        .await
+        .expect("script");
+
+        let error = runner
+            .handle_lua_script_run(
+                &task,
+                &AgentRequest {
+                    owner_user_id: default_user.user_id.clone(),
+                    initiating_identity_id: format!("cli:{}", default_user.user_id),
+                    primary_agent_id: default_user.primary_agent_id.clone().expect("agent"),
+                    assigned_agent_id: default_user.primary_agent_id.clone().expect("agent"),
+                    role_ids: roles.clone(),
+                    objective: "Run a Lua script with risky shell".to_owned(),
+                    scope: MemoryScope::Private,
+                    kind: "interactive".to_owned(),
+                    parent_task_id: None,
+                    task_context: None,
+                    visible_scopes: visible_memory_scopes(&roles),
+                    memory_mode: AgentMemoryMode::ScopedRetrieval,
+                    approved_shell_commands: Vec::new(),
+                    approved_automation_actions: Vec::new(),
+                },
+                json!({ "script_id": "script_risky_lua_run" }),
+                &ToolContext::new(std::env::temp_dir(), vec![]),
+            )
+            .await
+            .expect_err("policy denial");
+
+        let ToolError::Failed(error) = error else {
+            panic!("expected ToolError::Failed");
+        };
+        let policy_error = error
+            .downcast_ref::<automation::LuaToolPolicyDenied>()
+            .expect("typed policy error");
+        assert_eq!(policy_error.tool_name, "shell_exec");
+        assert_eq!(policy_error.detail["risk"], json!("high"));
+
+        let events = db
+            .fetch_task_events_for_owner(&default_user.user_id, &task.task_id)
+            .await
+            .expect("events");
+        let denial_event = events
+            .iter()
+            .find(|event| event.event_type == "lua_tool_denied")
+            .expect("lua_tool_denied event");
+        let payload: Value = serde_json::from_str(&denial_event.payload_json).expect("payload");
+        assert_eq!(payload["tool_name"], json!("shell_exec"));
+        assert_eq!(payload["detail"]["risk"], json!("high"));
     }
 
     #[tokio::test]

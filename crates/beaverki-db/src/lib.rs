@@ -586,6 +586,20 @@ impl Database {
         Ok(audit_id)
     }
 
+    pub async fn list_audit_events(&self, limit: i64) -> Result<Vec<AuditEventRow>> {
+        let rows = sqlx::query_as::<_, AuditEventRow>(
+            "SELECT audit_id, actor_type, actor_id, event_type, payload_json, created_at
+             FROM audit_events
+             ORDER BY created_at DESC
+             LIMIT ?",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list audit events")?;
+        Ok(rows)
+    }
+
     pub async fn begin_runtime_session(
         &self,
         instance_id: &str,
@@ -1874,6 +1888,16 @@ pub struct TaskEventRow {
     pub event_type: String,
     pub actor_type: String,
     pub actor_id: String,
+    pub payload_json: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct AuditEventRow {
+    pub audit_id: String,
+    pub actor_type: String,
+    pub actor_id: String,
+    pub event_type: String,
     pub payload_json: String,
     pub created_at: String,
 }

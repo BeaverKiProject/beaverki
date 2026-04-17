@@ -1,6 +1,6 @@
-# BeaverKI
+# BeaverKi
 
-BeaverKI is an open-source autonomous AI agent framework for running a personal, always-on digital assistant on your own hardware.
+BeaverKi is an open-source autonomous AI agent framework for running a personal, always-on digital assistant on your own hardware. It is a Beaver with Ki (a Japanese concept of energy or life force), a small but powerful helper that lives on your machine and can assist you and your family with a wide range of tasks through natural language interaction.
 
 The goal is to build a local-first Rust platform that can:
 

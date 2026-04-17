@@ -1002,6 +1002,7 @@ async fn script_review(args: ScriptReviewArgs) -> Result<()> {
     println!("Verdict: {}", review.verdict);
     println!("Risk level: {}", review.risk_level);
     println!("Summary: {}", review.summary_text);
+    print_script_review_details(&review);
     Ok(())
 }
 
@@ -1129,6 +1130,7 @@ fn print_script_inspection(inspection: &beaverki_runtime::ScriptInspection) {
                 "- {} verdict={} risk={} summary={}",
                 review.review_id, review.verdict, review.risk_level, review.summary_text
             );
+            print_script_review_details(review);
         }
     }
 
@@ -1142,6 +1144,33 @@ fn print_script_inspection(inspection: &beaverki_runtime::ScriptInspection) {
                 if schedule.enabled != 0 { "yes" } else { "no" },
                 schedule.next_run_at
             );
+        }
+    }
+}
+
+fn print_script_review_details(review: &beaverki_db::ScriptReviewRow) {
+    let findings_json = match serde_json::from_str::<serde_json::Value>(&review.findings_json) {
+        Ok(value) => value,
+        Err(_) => return,
+    };
+
+    if let Some(findings) = findings_json.get("findings").and_then(serde_json::Value::as_array)
+        && !findings.is_empty()
+    {
+        println!("  Findings:");
+        for finding in findings.iter().filter_map(serde_json::Value::as_str) {
+            println!("    - {finding}");
+        }
+    }
+
+    if let Some(required_changes) = findings_json
+        .get("required_changes")
+        .and_then(serde_json::Value::as_array)
+        && !required_changes.is_empty()
+    {
+        println!("  Required changes:");
+        for required_change in required_changes.iter().filter_map(serde_json::Value::as_str) {
+            println!("    - {required_change}");
         }
     }
 }

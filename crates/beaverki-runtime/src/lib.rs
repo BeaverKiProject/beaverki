@@ -364,21 +364,13 @@ impl Runtime {
             intended_behavior_summary,
         )
         .await?;
-        let next_status = if review.approved() {
-            None
-        } else {
-            Some("blocked")
-        };
+        let application = automation::apply_script_review(&review, &script.status, Some(&script.status));
         self.db
             .update_script_safety(
                 &script.script_id,
-                if review.approved() {
-                    "approved"
-                } else {
-                    "rejected"
-                },
+                &application.safety_status,
                 &review.summary,
-                next_status,
+                Some(&application.resulting_status),
             )
             .await?;
         let review_row = self
@@ -614,13 +606,62 @@ impl Runtime {
         let due = self.db.list_due_schedules(&now).await?;
         let mut tasks = Vec::new();
         for schedule in due {
+            let next_run_at = automation::next_run_after(&schedule.cron_expr, &now)?;
             let Some(script) = self.db.fetch_script(&schedule.target_id).await? else {
+                self.db
+                    .update_schedule_state(
+                        &schedule.schedule_id,
+                        automation::schedule_enabled(&schedule),
+                        &next_run_at,
+                        Some(&now),
+                    )
+                    .await?;
+                self.db
+                    .record_audit_event(
+                        "runtime",
+                        &self.config.runtime.instance_id,
+                        "schedule_skipped",
+                        json!({
+                            "schedule_id": schedule.schedule_id,
+                            "target_id": schedule.target_id,
+                            "reason": "script_missing",
+                            "next_run_at": next_run_at,
+                        }),
+                    )
+                    .await?;
                 continue;
             };
             if script.status != "active" || script.safety_status != "approved" {
+                let reason = if script.status != "active" {
+                    "script_not_active"
+                } else {
+                    "script_not_approved"
+                };
+                self.db
+                    .update_schedule_state(
+                        &schedule.schedule_id,
+                        automation::schedule_enabled(&schedule),
+                        &next_run_at,
+                        Some(&now),
+                    )
+                    .await?;
+                self.db
+                    .record_audit_event(
+                        "runtime",
+                        &self.config.runtime.instance_id,
+                        "schedule_skipped",
+                        json!({
+                            "schedule_id": schedule.schedule_id,
+                            "script_id": script.script_id,
+                            "reason": reason,
+                            "script_status": script.status,
+                            "safety_status": script.safety_status,
+                            "next_run_at": next_run_at,
+                        }),
+                    )
+                    .await?;
                 continue;
             }
-            let next_run_at = automation::next_run_after(&schedule.cron_expr, &now)?;
             let primary_agent_id = self
                 .primary_agent_id_for_owner(&schedule.owner_user_id)
                 .await?;
@@ -723,7 +764,43 @@ impl Runtime {
             browser_headless_program: self.config.integrations.browser.headless_browser.clone(),
             browser_headless_args: self.config.integrations.browser.headless_args.clone(),
         })
-        .await?;
+        .await;
+        let execution = match execution {
+            Ok(execution) => execution,
+            Err(error) => {
+                if let Some(policy_error) = error.downcast_ref::<automation::LuaToolPolicyDenied>() {
+                    self.db
+                        .append_task_event(
+                            &task.task_id,
+                            "lua_tool_denied",
+                            "tool",
+                            "lua",
+                            json!({
+                                "script_id": script.script_id,
+                                "tool_name": policy_error.tool_name,
+                                "detail": policy_error.detail,
+                                "message": policy_error.message,
+                            }),
+                        )
+                        .await?;
+                    self.db
+                        .record_audit_event(
+                            "runtime",
+                            &self.config.runtime.instance_id,
+                            "lua_script_tool_denied",
+                            json!({
+                                "task_id": task.task_id,
+                                "script_id": script.script_id,
+                                "tool_name": policy_error.tool_name,
+                                "detail": policy_error.detail,
+                                "message": policy_error.message,
+                            }),
+                        )
+                        .await?;
+                }
+                return Err(error);
+            }
+        };
 
         for log_line in &execution.logs {
             self.db
@@ -2543,6 +2620,267 @@ return "top level ok""#,
                 .iter()
                 .any(|event| event.event_type == "lua_log")
         );
+    }
+
+    #[tokio::test]
+    async fn create_lua_script_preserves_needs_changes_verdict() {
+        let (_tempdir, runtime) = test_runtime(vec![ModelTurnResponse {
+            output_items: vec![json!({
+                "type": "message",
+                "content": [{
+                    "type": "output_text",
+                    "text": "{\"verdict\":\"needs_changes\",\"risk_level\":\"medium\",\"findings\":[\"Writes files more broadly than needed.\"],\"required_changes\":[\"Limit writes to the intended target.\"],\"summary\":\"The script needs a narrower scope before it can be trusted.\"}"
+                }]
+            })],
+            tool_calls: vec![],
+            output_text: "{\"verdict\":\"needs_changes\",\"risk_level\":\"medium\",\"findings\":[\"Writes files more broadly than needed.\"],\"required_changes\":[\"Limit writes to the intended target.\"],\"summary\":\"The script needs a narrower scope before it can be trusted.\"}".to_owned(),
+        }])
+        .await;
+
+        let inspection = runtime
+            .create_lua_script(
+                None,
+                Some("script_needs_changes_runtime"),
+                r#"return function(ctx)
+    return "not yet"
+end"#,
+                json!({}),
+                None,
+                "Return a placeholder value.",
+            )
+            .await
+            .expect("create script");
+
+        assert_eq!(inspection.script.status, "blocked");
+        assert_eq!(inspection.script.safety_status, "needs_changes");
+        assert_eq!(inspection.reviews[0].verdict, "needs_changes");
+    }
+
+    #[tokio::test]
+    async fn blocked_script_schedule_is_skipped_and_advanced() {
+        let (_tempdir, runtime) = test_runtime(vec![]).await;
+        let db = runtime.db.clone();
+        let default_user = runtime.default_user.clone();
+        db.create_script(NewScript {
+            script_id: Some("script_blocked_sched"),
+            owner_user_id: &default_user.user_id,
+            kind: "lua",
+            status: "blocked",
+            source_text: "return function(ctx) return \"blocked\" end",
+            capability_profile_json: json!({}),
+            created_from_task_id: None,
+            safety_status: "needs_changes",
+            safety_summary: Some("needs changes"),
+        })
+        .await
+        .expect("script");
+        let original_next_run_at = now_rfc3339();
+        db.create_schedule(NewSchedule {
+            schedule_id: Some("sched_blocked_script"),
+            owner_user_id: &default_user.user_id,
+            target_type: "lua_script",
+            target_id: "script_blocked_sched",
+            cron_expr: "0/5 * * * * * *",
+            enabled: true,
+            next_run_at: &original_next_run_at,
+        })
+        .await
+        .expect("schedule");
+
+        let tasks = runtime
+            .materialize_due_schedules()
+            .await
+            .expect("materialize schedules");
+        assert!(tasks.is_empty());
+        assert_eq!(db.pending_task_count().await.expect("pending tasks"), 0);
+
+        let updated = db
+            .fetch_schedule_for_owner(&default_user.user_id, "sched_blocked_script")
+            .await
+            .expect("fetch schedule")
+            .expect("schedule");
+        assert_ne!(updated.next_run_at, original_next_run_at);
+        assert!(updated.last_run_at.is_some());
+
+        let audit = db
+            .list_audit_events(8)
+            .await
+            .expect("audit events")
+            .into_iter()
+            .find(|event| event.event_type == "schedule_skipped")
+            .expect("schedule_skipped audit");
+        let payload: Value = serde_json::from_str(&audit.payload_json).expect("payload");
+        assert_eq!(payload["schedule_id"], json!("sched_blocked_script"));
+        assert_eq!(payload["reason"], json!("script_not_active"));
+        assert_eq!(payload["safety_status"], json!("needs_changes"));
+    }
+
+    #[tokio::test]
+    async fn automation_lifecycle_emits_auditable_event_chain() {
+        let (_tempdir, runtime) = test_runtime(vec![ModelTurnResponse {
+            output_items: vec![json!({
+                "type": "message",
+                "content": [{
+                    "type": "output_text",
+                    "text": "{\"verdict\":\"approved\",\"risk_level\":\"low\",\"findings\":[],\"required_changes\":[],\"summary\":\"The Lua automation matches the stated intent.\"}"
+                }]
+            })],
+            tool_calls: vec![],
+            output_text: "{\"verdict\":\"approved\",\"risk_level\":\"low\",\"findings\":[],\"required_changes\":[],\"summary\":\"The Lua automation matches the stated intent.\"}".to_owned(),
+        }])
+        .await;
+        let db = runtime.db.clone();
+
+        let inspection = runtime
+            .create_lua_script(
+                None,
+                Some("script_audit_chain"),
+                r#"return function(ctx)
+    ctx.log_info("audit chain lua ran")
+    return "audit chain ok"
+end"#,
+                json!({}),
+                None,
+                "Return a confirmation string for audit testing.",
+            )
+            .await
+            .expect("create script");
+        let script = inspection.script;
+
+        runtime
+            .activate_script(None, &script.script_id)
+            .await
+            .expect("activate script");
+        runtime
+            .create_schedule(
+                None,
+                Some("sched_audit_chain"),
+                &script.script_id,
+                "0/5 * * * * * *",
+                true,
+            )
+            .await
+            .expect("create schedule");
+
+        db.update_schedule_state(
+            "sched_audit_chain",
+            true,
+            &now_rfc3339(),
+            None,
+        )
+        .await
+        .expect("force due schedule");
+
+        let result = runtime
+            .execute_next_runnable_task()
+            .await
+            .expect("execute next")
+            .expect("task");
+        assert_eq!(result.task.state, TaskState::Completed.as_str());
+
+        let inspection = runtime
+            .inspect_task(None, &result.task.task_id)
+            .await
+            .expect("inspect task");
+        let task_event_types = inspection
+            .events
+            .iter()
+            .map(|event| event.event_type.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(task_event_types.contains("lua_task_started"));
+        assert!(task_event_types.contains("lua_log"));
+        assert!(task_event_types.contains("lua_task_completed"));
+
+        let audit_events = db.list_audit_events(16).await.expect("audit events");
+        let audit_event_types = audit_events
+            .iter()
+            .map(|event| event.event_type.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(audit_event_types.contains("script_created"));
+        assert!(audit_event_types.contains("script_reviewed"));
+        assert!(audit_event_types.contains("script_activated"));
+        assert!(audit_event_types.contains("schedule_created"));
+        assert!(audit_event_types.contains("schedule_triggered"));
+        assert!(audit_event_types.contains("lua_script_executed"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn lua_runtime_records_policy_denial_for_risky_shell_tool_call() {
+        let (_tempdir, runtime) = test_runtime(vec![ModelTurnResponse {
+            output_items: vec![json!({
+                "type": "message",
+                "content": [{
+                    "type": "output_text",
+                    "text": "{\"verdict\":\"approved\",\"risk_level\":\"low\",\"findings\":[],\"required_changes\":[],\"summary\":\"The Lua automation matches the stated intent.\"}"
+                }]
+            })],
+            tool_calls: vec![],
+            output_text: "{\"verdict\":\"approved\",\"risk_level\":\"low\",\"findings\":[],\"required_changes\":[],\"summary\":\"The Lua automation matches the stated intent.\"}".to_owned(),
+        }])
+        .await;
+        let script = runtime
+            .create_lua_script(
+                None,
+                Some("script_policy_denied_runtime"),
+                r#"return function(ctx)
+    return ctx.tool_call("shell_exec", { command = "mkdir /tmp/beaverki_lua_policy_denied" })
+end"#,
+                json!({
+                    "allowed_tools": ["shell_exec"]
+                }),
+                None,
+                "Attempt to create a directory from a Lua script.",
+            )
+            .await
+            .expect("create script")
+            .script;
+        runtime
+            .activate_script(None, &script.script_id)
+            .await
+            .expect("activate script");
+
+        let primary_agent_id = runtime
+            .default_user
+            .primary_agent_id
+            .clone()
+            .expect("primary agent");
+        let task_context = json!({ "script_id": script.script_id }).to_string();
+        let task = runtime
+            .db
+            .create_task_with_params(NewTask {
+                owner_user_id: &script.owner_user_id,
+                initiating_identity_id: "test:lua-runtime",
+                primary_agent_id: &primary_agent_id,
+                assigned_agent_id: &primary_agent_id,
+                parent_task_id: None,
+                kind: "lua_script",
+                objective: "Run a denied Lua script",
+                context_summary: Some(&task_context),
+                scope: MemoryScope::Private,
+                wake_at: None,
+            })
+            .await
+            .expect("task");
+
+        let error = runtime.execute_task(task.clone()).await.expect_err("policy denial");
+        let policy_error = error
+            .downcast_ref::<automation::LuaToolPolicyDenied>()
+            .expect("typed policy error");
+        assert_eq!(policy_error.tool_name, "shell_exec");
+        assert_eq!(policy_error.detail["risk"], json!("high"));
+
+        let inspection = runtime
+            .inspect_task(None, &task.task_id)
+            .await
+            .expect("inspection");
+        let denial_event = inspection
+            .events
+            .iter()
+            .find(|event| event.event_type == "lua_tool_denied")
+            .expect("lua_tool_denied event");
+        let payload: Value = serde_json::from_str(&denial_event.payload_json).expect("payload");
+        assert_eq!(payload["tool_name"], json!("shell_exec"));
+        assert_eq!(payload["detail"]["risk"], json!("high"));
     }
 
     #[tokio::test]

@@ -16,8 +16,59 @@ use serde_json::{Value, json};
 
 pub const SAFETY_AGENT_ID: &str = "agent_safety_builtin";
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LuaToolPolicyDenied {
+    pub tool_name: String,
+    pub message: String,
+    pub detail: Value,
+}
+
+impl std::fmt::Display for LuaToolPolicyDenied {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)?;
+        if !self.detail.is_null() {
+            write!(f, " (detail: {})", self.detail)?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for LuaToolPolicyDenied {}
+
 fn lua_to_anyhow(error: mlua::Error) -> anyhow::Error {
     anyhow!(error.to_string())
+}
+
+fn lua_tool_policy_denied(tool_name: &str, detail: Value) -> LuaToolPolicyDenied {
+    let message = if tool_name == "shell_exec" {
+        let risk = detail
+            .get("risk")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        format!(
+            "Lua script tool '{tool_name}' denied by policy; {risk}-risk shell commands cannot enter the interactive approval flow from Lua scripts"
+        )
+    } else {
+        format!("Lua script tool '{tool_name}' denied by policy")
+    };
+    LuaToolPolicyDenied {
+        tool_name: tool_name.to_owned(),
+        message,
+        detail,
+    }
+}
+
+fn extract_lua_tool_policy_denied(error: &mlua::Error) -> Option<LuaToolPolicyDenied> {
+    error
+        .chain()
+        .find_map(|source| source.downcast_ref::<LuaToolPolicyDenied>().cloned())
+}
+
+fn map_lua_runtime_error(error: mlua::Error) -> anyhow::Error {
+    if let Some(policy_error) = extract_lua_tool_policy_denied(&error) {
+        return anyhow!(policy_error.clone());
+    }
+    anyhow!(format!("failed to execute Lua script: {error}"))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,6 +116,33 @@ pub struct LuaExecutionResult {
     pub deferred_until: Option<String>,
     pub notifications: Vec<String>,
     pub logs: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScriptReviewApplication {
+    pub safety_status: String,
+    pub resulting_status: String,
+    pub reactivated_after_rewrite: bool,
+}
+
+pub fn apply_script_review(
+    review: &SafetyReviewOutcome,
+    approved_status: &str,
+    prior_status: Option<&str>,
+) -> ScriptReviewApplication {
+    if review.approved() {
+        return ScriptReviewApplication {
+            safety_status: review.verdict.clone(),
+            resulting_status: approved_status.to_owned(),
+            reactivated_after_rewrite: prior_status == Some("active") && approved_status == "active",
+        };
+    }
+
+    ScriptReviewApplication {
+        safety_status: review.verdict.clone(),
+        resulting_status: "blocked".to_owned(),
+        reactivated_after_rewrite: false,
+    }
 }
 
 pub async fn review_lua_script(
@@ -295,6 +373,7 @@ pub async fn execute_lua_script(input: LuaExecutionInput) -> Result<LuaExecution
                 }
 
                 let args_json: Value = lua.from_value(args).map_err(mlua::Error::external)?;
+                let tool_name = name.clone();
                 let mut tool_context = ToolContext::new(working_dir.clone(), tool_roots.clone());
                 tool_context.max_output_chars = 12_000;
                 tool_context.browser_interactive_launcher = browser_interactive_launcher.clone();
@@ -307,7 +386,12 @@ pub async fn execute_lua_script(input: LuaExecutionInput) -> Result<LuaExecution
                         registry.invoke(&name, args_json, &tool_context).await
                     })
                 })
-                .map_err(|error| mlua::Error::external(anyhow!(error.as_json().to_string())))?;
+                .map_err(|error| match error {
+                    beaverki_tools::ToolError::Denied { detail, .. } => {
+                        mlua::Error::external(lua_tool_policy_denied(&tool_name, detail))
+                    }
+                    beaverki_tools::ToolError::Failed(error) => mlua::Error::external(error),
+                })?;
                 lua.to_value(&output.payload)
             })
             .map_err(lua_to_anyhow)?;
@@ -364,9 +448,9 @@ pub async fn execute_lua_script(input: LuaExecutionInput) -> Result<LuaExecution
     let entry = lua
         .load(&input.source_text)
         .eval::<LuaValue>()
-        .map_err(|error| anyhow!("failed to evaluate Lua script: {error}"))?;
+        .map_err(map_lua_runtime_error)?;
     let value = match entry {
-        LuaValue::Function(function) => function.call::<LuaValue>(ctx).map_err(lua_to_anyhow)?,
+        LuaValue::Function(function) => function.call::<LuaValue>(ctx).map_err(map_lua_runtime_error)?,
         other => other,
     };
     let result_text = match value {
@@ -433,3 +517,34 @@ const LUA_REVIEW_INSTRUCTIONS: &str = r#"You are BeaverKI's safety review agent.
 Review the provided Lua automation script for intent matching, dangerous side effects, privilege escalation, hidden exfiltration, and capability/profile mismatch.
 Return only JSON with this exact schema:
 {"verdict":"approved|rejected|needs_changes","risk_level":"low|medium|high|critical","findings":["..."],"required_changes":["..."],"summary":"..."}"#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn review(verdict: &str) -> SafetyReviewOutcome {
+        SafetyReviewOutcome {
+            verdict: verdict.to_owned(),
+            risk_level: "medium".to_owned(),
+            findings: Vec::new(),
+            required_changes: Vec::new(),
+            summary: "summary".to_owned(),
+        }
+    }
+
+    #[test]
+    fn approved_review_keeps_requested_status() {
+        let application = apply_script_review(&review("approved"), "active", Some("active"));
+        assert_eq!(application.safety_status, "approved");
+        assert_eq!(application.resulting_status, "active");
+        assert!(application.reactivated_after_rewrite);
+    }
+
+    #[test]
+    fn needs_changes_review_is_preserved_and_blocks_script() {
+        let application = apply_script_review(&review("needs_changes"), "draft", Some("draft"));
+        assert_eq!(application.safety_status, "needs_changes");
+        assert_eq!(application.resulting_status, "blocked");
+        assert!(!application.reactivated_after_rewrite);
+    }
+}
