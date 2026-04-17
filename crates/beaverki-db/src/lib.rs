@@ -32,6 +32,7 @@ impl Database {
 
         let db = Self { pool };
         db.migrate().await?;
+        db.reconcile_single_user_owner_role().await?;
         Ok(db)
     }
 
@@ -46,8 +47,28 @@ impl Database {
             .context("failed to run sqlite migrations")
     }
 
+    async fn reconcile_single_user_owner_role(&self) -> Result<()> {
+        let user_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users")
+            .fetch_one(&self.pool)
+            .await
+            .context("failed to count users during owner-role reconciliation")?;
+        let user_role_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM user_roles")
+            .fetch_one(&self.pool)
+            .await
+            .context("failed to count user roles during owner-role reconciliation")?;
+
+        if user_count == 1 && user_role_count == 0
+            && let Some(user) = self.default_user().await?
+        {
+            self.assign_role(&user.user_id, "owner").await?;
+        }
+
+        Ok(())
+    }
+
     pub async fn bootstrap_single_user(&self, display_name: &str) -> Result<BootstrapState> {
         if let Some(existing) = self.default_user().await? {
+            self.assign_role(&existing.user_id, "owner").await?;
             return Ok(BootstrapState {
                 user_id: existing.user_id,
                 primary_agent_id: existing
@@ -240,6 +261,7 @@ impl Database {
             objective,
             context_summary: None,
             scope,
+            wake_at: None,
         })
         .await
     }
@@ -251,7 +273,7 @@ impl Database {
         sqlx::query(
             "INSERT INTO tasks
              (task_id, owner_user_id, initiating_identity_id, primary_agent_id, assigned_agent_id, parent_task_id, kind, state, objective, context_summary, result_text, scope, wake_at, created_at, updated_at, completed_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, NULL, ?, ?, NULL)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, NULL)",
         )
         .bind(&task_id)
         .bind(input.owner_user_id)
@@ -264,6 +286,7 @@ impl Database {
         .bind(input.objective)
         .bind(input.context_summary)
         .bind(input.scope.as_str())
+        .bind(input.wake_at)
         .bind(&timestamp)
         .bind(&timestamp)
         .execute(&self.pool)
@@ -835,6 +858,350 @@ impl Database {
         Ok(approvals)
     }
 
+    pub async fn approved_approvals_for_task(
+        &self,
+        task_id: &str,
+        requested_from_user_id: &str,
+    ) -> Result<Vec<ApprovalRow>> {
+        let approvals = sqlx::query_as::<_, ApprovalRow>(
+            "SELECT approval_id, task_id, action_type, target_ref, requested_by_agent_id, requested_from_user_id, status, rationale_text, decided_at, created_at
+             FROM approvals
+             WHERE task_id = ?
+               AND requested_from_user_id = ?
+               AND status = 'approved'
+             ORDER BY created_at ASC",
+        )
+        .bind(task_id)
+        .bind(requested_from_user_id)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to fetch approved approvals")?;
+        Ok(approvals)
+    }
+
+    pub async fn create_script(&self, input: NewScript<'_>) -> Result<ScriptRow> {
+        let script_id = input
+            .script_id
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| new_prefixed_id("script"));
+        let timestamp = now_rfc3339();
+        sqlx::query(
+            "INSERT INTO scripts
+             (script_id, owner_user_id, kind, status, source_text, capability_profile_json, created_from_task_id, safety_status, safety_summary, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&script_id)
+        .bind(input.owner_user_id)
+        .bind(input.kind)
+        .bind(input.status)
+        .bind(input.source_text)
+        .bind(input.capability_profile_json.to_string())
+        .bind(input.created_from_task_id)
+        .bind(input.safety_status)
+        .bind(input.safety_summary)
+        .bind(&timestamp)
+        .bind(&timestamp)
+        .execute(&self.pool)
+        .await
+        .context("failed to create script")?;
+
+        self.fetch_script_for_owner(input.owner_user_id, &script_id)
+            .await?
+            .context("script missing after insert")
+    }
+
+    pub async fn fetch_script_for_owner(
+        &self,
+        owner_user_id: &str,
+        script_id: &str,
+    ) -> Result<Option<ScriptRow>> {
+        let row = sqlx::query_as::<_, ScriptRow>(
+            "SELECT script_id, owner_user_id, kind, status, source_text, capability_profile_json, created_from_task_id, safety_status, safety_summary, created_at, updated_at
+             FROM scripts
+             WHERE owner_user_id = ? AND script_id = ?",
+        )
+        .bind(owner_user_id)
+        .bind(script_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to fetch script")?;
+        Ok(row)
+    }
+
+    pub async fn fetch_script(&self, script_id: &str) -> Result<Option<ScriptRow>> {
+        let row = sqlx::query_as::<_, ScriptRow>(
+            "SELECT script_id, owner_user_id, kind, status, source_text, capability_profile_json, created_from_task_id, safety_status, safety_summary, created_at, updated_at
+             FROM scripts
+             WHERE script_id = ?",
+        )
+        .bind(script_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to fetch script")?;
+        Ok(row)
+    }
+
+    pub async fn list_scripts_for_owner(&self, owner_user_id: &str) -> Result<Vec<ScriptRow>> {
+        let rows = sqlx::query_as::<_, ScriptRow>(
+            "SELECT script_id, owner_user_id, kind, status, source_text, capability_profile_json, created_from_task_id, safety_status, safety_summary, created_at, updated_at
+             FROM scripts
+             WHERE owner_user_id = ?
+             ORDER BY created_at DESC",
+        )
+        .bind(owner_user_id)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list scripts")?;
+        Ok(rows)
+    }
+
+    pub async fn update_script_status(&self, script_id: &str, status: &str) -> Result<()> {
+        sqlx::query(
+            "UPDATE scripts
+             SET status = ?, updated_at = ?
+             WHERE script_id = ?",
+        )
+        .bind(status)
+        .bind(now_rfc3339())
+        .bind(script_id)
+        .execute(&self.pool)
+        .await
+        .context("failed to update script status")?;
+        Ok(())
+    }
+
+    pub async fn update_script_contents(&self, input: UpdateScript<'_>) -> Result<()> {
+        sqlx::query(
+            "UPDATE scripts
+             SET source_text = ?, capability_profile_json = ?, created_from_task_id = ?, status = ?, safety_status = ?, safety_summary = ?, updated_at = ?
+             WHERE script_id = ? AND owner_user_id = ?",
+        )
+        .bind(input.source_text)
+        .bind(input.capability_profile_json.to_string())
+        .bind(input.created_from_task_id)
+        .bind(input.status)
+        .bind(input.safety_status)
+        .bind(input.safety_summary)
+        .bind(now_rfc3339())
+        .bind(input.script_id)
+        .bind(input.owner_user_id)
+        .execute(&self.pool)
+        .await
+        .context("failed to update script contents")?;
+        Ok(())
+    }
+
+    pub async fn update_script_safety(
+        &self,
+        script_id: &str,
+        safety_status: &str,
+        safety_summary: &str,
+        status: Option<&str>,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE scripts
+             SET safety_status = ?, safety_summary = ?, status = COALESCE(?, status), updated_at = ?
+             WHERE script_id = ?",
+        )
+        .bind(safety_status)
+        .bind(safety_summary)
+        .bind(status)
+        .bind(now_rfc3339())
+        .bind(script_id)
+        .execute(&self.pool)
+        .await
+        .context("failed to update script safety")?;
+        Ok(())
+    }
+
+    pub async fn create_script_review(&self, input: NewScriptReview<'_>) -> Result<ScriptReviewRow> {
+        let review_id = new_prefixed_id("review");
+        let timestamp = now_rfc3339();
+        sqlx::query(
+            "INSERT INTO script_reviews
+             (review_id, script_id, reviewer_agent_id, review_type, verdict, risk_level, findings_json, summary_text, reviewed_artifact_text, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&review_id)
+        .bind(input.script_id)
+        .bind(input.reviewer_agent_id)
+        .bind(input.review_type)
+        .bind(input.verdict)
+        .bind(input.risk_level)
+        .bind(input.findings_json.to_string())
+        .bind(input.summary_text)
+        .bind(input.reviewed_artifact_text)
+        .bind(&timestamp)
+        .execute(&self.pool)
+        .await
+        .context("failed to create script review")?;
+
+        self.list_script_reviews(input.script_id)
+            .await?
+            .into_iter()
+            .find(|row| row.review_id == review_id)
+            .ok_or_else(|| anyhow!("script review missing after insert"))
+    }
+
+    pub async fn list_script_reviews(&self, script_id: &str) -> Result<Vec<ScriptReviewRow>> {
+        let rows = sqlx::query_as::<_, ScriptReviewRow>(
+            "SELECT review_id, script_id, reviewer_agent_id, review_type, verdict, risk_level, findings_json, summary_text, reviewed_artifact_text, created_at
+             FROM script_reviews
+             WHERE script_id = ?
+             ORDER BY created_at DESC",
+        )
+        .bind(script_id)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list script reviews")?;
+        Ok(rows)
+    }
+
+    pub async fn create_schedule(&self, input: NewSchedule<'_>) -> Result<ScheduleRow> {
+        let schedule_id = input
+            .schedule_id
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| new_prefixed_id("sched"));
+        let timestamp = now_rfc3339();
+        sqlx::query(
+            "INSERT INTO schedules
+             (schedule_id, owner_user_id, target_type, target_id, cron_expr, enabled, next_run_at, last_run_at, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)",
+        )
+        .bind(&schedule_id)
+        .bind(input.owner_user_id)
+        .bind(input.target_type)
+        .bind(input.target_id)
+        .bind(input.cron_expr)
+        .bind(if input.enabled { 1_i64 } else { 0_i64 })
+        .bind(input.next_run_at)
+        .bind(&timestamp)
+        .bind(&timestamp)
+        .execute(&self.pool)
+        .await
+        .context("failed to create schedule")?;
+
+        self.fetch_schedule_for_owner(input.owner_user_id, &schedule_id)
+            .await?
+            .context("schedule missing after insert")
+    }
+
+    pub async fn upsert_schedule(&self, input: NewSchedule<'_>) -> Result<ScheduleRow> {
+        if let Some(schedule_id) = input.schedule_id
+            && self
+                .fetch_schedule_for_owner(input.owner_user_id, schedule_id)
+                .await?
+                .is_some()
+        {
+            sqlx::query(
+                "UPDATE schedules
+                 SET target_type = ?, target_id = ?, cron_expr = ?, enabled = ?, next_run_at = ?, updated_at = ?
+                 WHERE owner_user_id = ? AND schedule_id = ?",
+            )
+            .bind(input.target_type)
+            .bind(input.target_id)
+            .bind(input.cron_expr)
+            .bind(if input.enabled { 1_i64 } else { 0_i64 })
+            .bind(input.next_run_at)
+            .bind(now_rfc3339())
+            .bind(input.owner_user_id)
+            .bind(schedule_id)
+            .execute(&self.pool)
+            .await
+            .context("failed to update schedule")?;
+
+            return self
+                .fetch_schedule_for_owner(input.owner_user_id, schedule_id)
+                .await?
+                .context("schedule missing after update");
+        }
+
+        self.create_schedule(input).await
+    }
+
+    pub async fn fetch_schedule_for_owner(
+        &self,
+        owner_user_id: &str,
+        schedule_id: &str,
+    ) -> Result<Option<ScheduleRow>> {
+        let row = sqlx::query_as::<_, ScheduleRow>(
+            "SELECT schedule_id, owner_user_id, target_type, target_id, cron_expr, enabled, next_run_at, last_run_at, created_at, updated_at
+             FROM schedules
+             WHERE owner_user_id = ? AND schedule_id = ?",
+        )
+        .bind(owner_user_id)
+        .bind(schedule_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to fetch schedule")?;
+        Ok(row)
+    }
+
+    pub async fn fetch_schedule(&self, schedule_id: &str) -> Result<Option<ScheduleRow>> {
+        let row = sqlx::query_as::<_, ScheduleRow>(
+            "SELECT schedule_id, owner_user_id, target_type, target_id, cron_expr, enabled, next_run_at, last_run_at, created_at, updated_at
+             FROM schedules
+             WHERE schedule_id = ?",
+        )
+        .bind(schedule_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to fetch schedule")?;
+        Ok(row)
+    }
+
+    pub async fn list_schedules_for_owner(&self, owner_user_id: &str) -> Result<Vec<ScheduleRow>> {
+        let rows = sqlx::query_as::<_, ScheduleRow>(
+            "SELECT schedule_id, owner_user_id, target_type, target_id, cron_expr, enabled, next_run_at, last_run_at, created_at, updated_at
+             FROM schedules
+             WHERE owner_user_id = ?
+             ORDER BY created_at DESC",
+        )
+        .bind(owner_user_id)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list schedules")?;
+        Ok(rows)
+    }
+
+    pub async fn list_due_schedules(&self, now: &str) -> Result<Vec<ScheduleRow>> {
+        let rows = sqlx::query_as::<_, ScheduleRow>(
+            "SELECT schedule_id, owner_user_id, target_type, target_id, cron_expr, enabled, next_run_at, last_run_at, created_at, updated_at
+             FROM schedules
+             WHERE enabled = 1
+               AND next_run_at <= ?
+             ORDER BY next_run_at ASC",
+        )
+        .bind(now)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list due schedules")?;
+        Ok(rows)
+    }
+
+    pub async fn update_schedule_state(
+        &self,
+        schedule_id: &str,
+        enabled: bool,
+        next_run_at: &str,
+        last_run_at: Option<&str>,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE schedules
+             SET enabled = ?, next_run_at = ?, last_run_at = ?, updated_at = ?
+             WHERE schedule_id = ?",
+        )
+        .bind(if enabled { 1_i64 } else { 0_i64 })
+        .bind(next_run_at)
+        .bind(last_run_at)
+        .bind(now_rfc3339())
+        .bind(schedule_id)
+        .execute(&self.pool)
+        .await
+        .context("failed to update schedule state")?;
+        Ok(())
+    }
+
     pub async fn upsert_connector_identity(
         &self,
         connector_type: &str,
@@ -1090,6 +1457,7 @@ pub struct NewTask<'a> {
     pub objective: &'a str,
     pub context_summary: Option<&'a str>,
     pub scope: MemoryScope,
+    pub wake_at: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1103,6 +1471,54 @@ pub struct NewMemory<'a> {
     pub source_type: &'a str,
     pub source_ref: Option<&'a str>,
     pub task_id: Option<&'a str>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewScript<'a> {
+    pub script_id: Option<&'a str>,
+    pub owner_user_id: &'a str,
+    pub kind: &'a str,
+    pub status: &'a str,
+    pub source_text: &'a str,
+    pub capability_profile_json: Value,
+    pub created_from_task_id: Option<&'a str>,
+    pub safety_status: &'a str,
+    pub safety_summary: Option<&'a str>,
+}
+
+#[derive(Debug, Clone)]
+pub struct UpdateScript<'a> {
+    pub script_id: &'a str,
+    pub owner_user_id: &'a str,
+    pub source_text: &'a str,
+    pub capability_profile_json: Value,
+    pub created_from_task_id: Option<&'a str>,
+    pub status: &'a str,
+    pub safety_status: &'a str,
+    pub safety_summary: Option<&'a str>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewScriptReview<'a> {
+    pub script_id: &'a str,
+    pub reviewer_agent_id: &'a str,
+    pub review_type: &'a str,
+    pub verdict: &'a str,
+    pub risk_level: &'a str,
+    pub findings_json: Value,
+    pub summary_text: &'a str,
+    pub reviewed_artifact_text: &'a str,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct NewSchedule<'a> {
+    pub schedule_id: Option<&'a str>,
+    pub owner_user_id: &'a str,
+    pub target_type: &'a str,
+    pub target_id: &'a str,
+    pub cron_expr: &'a str,
+    pub enabled: bool,
+    pub next_run_at: &'a str,
 }
 
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
@@ -1216,6 +1632,49 @@ pub struct ApprovalRow {
     pub rationale_text: Option<String>,
     pub decided_at: Option<String>,
     pub created_at: String,
+}
+
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct ScriptRow {
+    pub script_id: String,
+    pub owner_user_id: String,
+    pub kind: String,
+    pub status: String,
+    pub source_text: String,
+    pub capability_profile_json: String,
+    pub created_from_task_id: Option<String>,
+    pub safety_status: String,
+    pub safety_summary: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct ScriptReviewRow {
+    pub review_id: String,
+    pub script_id: String,
+    pub reviewer_agent_id: String,
+    pub review_type: String,
+    pub verdict: String,
+    pub risk_level: String,
+    pub findings_json: String,
+    pub summary_text: String,
+    pub reviewed_artifact_text: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct ScheduleRow {
+    pub schedule_id: String,
+    pub owner_user_id: String,
+    pub target_type: String,
+    pub target_id: String,
+    pub cron_expr: String,
+    pub enabled: i64,
+    pub next_run_at: String,
+    pub last_run_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
 }
 
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
@@ -1436,5 +1895,91 @@ mod tests {
                 .expect("fetch invocations")
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn connect_repairs_single_user_owner_role_when_missing() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("test.db");
+        let db = Database::connect(&db_path).await.expect("connect");
+        let timestamp = now_rfc3339();
+
+        sqlx::query(
+            "INSERT INTO users (user_id, display_name, status, primary_agent_id, created_at, updated_at)
+             VALUES (?, ?, 'enabled', ?, ?, ?)",
+        )
+        .bind("user_alex")
+        .bind("Alex")
+        .bind("agent_alex")
+        .bind(&timestamp)
+        .bind(&timestamp)
+        .execute(db.pool())
+        .await
+        .expect("insert user");
+        sqlx::query(
+            "INSERT INTO agents
+             (agent_id, kind, owner_user_id, parent_agent_id, status, persona, memory_scope, permission_profile, created_at, updated_at)
+             VALUES (?, 'primary', ?, NULL, 'active', ?, 'private', 'm0_single_user', ?, ?)",
+        )
+        .bind("agent_alex")
+        .bind("user_alex")
+        .bind("Primary agent for Alex")
+        .bind(&timestamp)
+        .bind(&timestamp)
+        .execute(db.pool())
+        .await
+        .expect("insert agent");
+        drop(db);
+
+        let repaired = Database::connect(&db_path).await.expect("reconnect");
+        let roles = repaired
+            .list_user_roles("user_alex")
+            .await
+            .expect("roles");
+
+        assert_eq!(roles.len(), 1);
+        assert_eq!(roles[0].role_id, "owner");
+    }
+
+    #[tokio::test]
+    async fn bootstrap_single_user_repairs_existing_default_owner_role() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("test.db");
+        let db = Database::connect(&db_path).await.expect("connect");
+        let timestamp = now_rfc3339();
+
+        sqlx::query(
+            "INSERT INTO users (user_id, display_name, status, primary_agent_id, created_at, updated_at)
+             VALUES (?, ?, 'enabled', ?, ?, ?)",
+        )
+        .bind("user_alex")
+        .bind("Alex")
+        .bind("agent_alex")
+        .bind(&timestamp)
+        .bind(&timestamp)
+        .execute(db.pool())
+        .await
+        .expect("insert user");
+        sqlx::query(
+            "INSERT INTO agents
+             (agent_id, kind, owner_user_id, parent_agent_id, status, persona, memory_scope, permission_profile, created_at, updated_at)
+             VALUES (?, 'primary', ?, NULL, 'active', ?, 'private', 'm0_single_user', ?, ?)",
+        )
+        .bind("agent_alex")
+        .bind("user_alex")
+        .bind("Primary agent for Alex")
+        .bind(&timestamp)
+        .bind(&timestamp)
+        .execute(db.pool())
+        .await
+        .expect("insert agent");
+
+        let bootstrap = db.bootstrap_single_user("Alex").await.expect("bootstrap");
+        let roles = db.list_user_roles("user_alex").await.expect("roles");
+
+        assert_eq!(bootstrap.user_id, "user_alex");
+        assert_eq!(bootstrap.primary_agent_id, "agent_alex");
+        assert_eq!(roles.len(), 1);
+        assert_eq!(roles[0].role_id, "owner");
     }
 }

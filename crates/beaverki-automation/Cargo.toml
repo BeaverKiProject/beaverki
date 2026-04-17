@@ -1,26 +1,21 @@
 [package]
-name = "beaverki-agent"
+name = "beaverki-automation"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-async-trait.workspace = true
-beaverki-automation = { path = "../beaverki-automation" }
-beaverki-config = { path = "../beaverki-config" }
 beaverki-core = { path = "../beaverki-core" }
 beaverki-db = { path = "../beaverki-db" }
-beaverki-memory = { path = "../beaverki-memory" }
 beaverki-models = { path = "../beaverki-models" }
 beaverki-policy = { path = "../beaverki-policy" }
 beaverki-tools = { path = "../beaverki-tools" }
+chrono.workspace = true
+cron.workspace = true
+mlua.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-tracing.workspace = true
-
-[dev-dependencies]
-tempfile.workspace = true
 tokio.workspace = true
 
 [lints]

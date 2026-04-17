@@ -63,6 +63,12 @@ pub fn can_request_shell_approval(role_ids: &[String], risk: ShellRisk) -> bool 
         .any(|role| APPROVAL_ELIGIBLE_ROLES.contains(&role.as_str()))
 }
 
+pub fn can_request_automation_approval(role_ids: &[String]) -> bool {
+    role_ids
+        .iter()
+        .any(|role| APPROVAL_ELIGIBLE_ROLES.contains(&role.as_str()))
+}
+
 pub fn visible_memory_scopes(role_ids: &[String]) -> Vec<MemoryScope> {
     let mut scopes = vec![MemoryScope::Private];
     if can_view_household_memory(role_ids) {

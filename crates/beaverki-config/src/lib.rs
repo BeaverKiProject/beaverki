@@ -8,10 +8,15 @@ use age::Encryptor;
 use age::secrecy::SecretString;
 use anyhow::{Context, Result, anyhow};
 use directories::BaseDirs;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+
+const CURRENT_CONFIG_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeConfig {
+    #[serde(default = "default_config_version")]
+    pub version: u32,
     pub instance_id: String,
     pub mode: String,
     pub data_dir: PathBuf,
@@ -37,6 +42,8 @@ pub struct RuntimeDefaults {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProvidersConfig {
+    #[serde(default = "default_config_version")]
+    pub version: u32,
     pub active: String,
     pub entries: Vec<ProviderEntry>,
 }
@@ -69,13 +76,27 @@ pub struct ProviderModels {
     pub planner: String,
     pub executor: String,
     pub summarizer: String,
+    #[serde(default = "default_safety_review_model")]
+    pub safety_review: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct IntegrationsConfig {
+    #[serde(default = "default_config_version")]
+    pub version: u32,
     pub browser: BrowserConfig,
     pub discord: DiscordConfig,
+}
+
+impl Default for IntegrationsConfig {
+    fn default() -> Self {
+        Self {
+            version: CURRENT_CONFIG_VERSION,
+            browser: BrowserConfig::default(),
+            discord: DiscordConfig::default(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -135,22 +156,12 @@ impl LoadedConfig {
         let providers_path = config_dir.join("providers.yaml");
         let integrations_path = config_dir.join("integrations.yaml");
 
-        let mut runtime: RuntimeConfig = serde_yaml::from_str(
-            &fs::read_to_string(&runtime_path)
-                .with_context(|| format!("failed to read {}", runtime_path.display()))?,
-        )
-        .with_context(|| format!("failed to parse {}", runtime_path.display()))?;
-        let providers: ProvidersConfig = serde_yaml::from_str(
-            &fs::read_to_string(&providers_path)
-                .with_context(|| format!("failed to read {}", providers_path.display()))?,
-        )
-        .with_context(|| format!("failed to parse {}", providers_path.display()))?;
+        let mut runtime: RuntimeConfig =
+            load_versioned_yaml(&runtime_path, migrate_runtime_config_value)?;
+        let providers: ProvidersConfig =
+            load_versioned_yaml(&providers_path, migrate_providers_config_value)?;
         let integrations = if integrations_path.exists() {
-            serde_yaml::from_str::<IntegrationsConfig>(
-                &fs::read_to_string(&integrations_path)
-                    .with_context(|| format!("failed to read {}", integrations_path.display()))?,
-            )
-            .with_context(|| format!("failed to parse {}", integrations_path.display()))?
+            load_versioned_yaml(&integrations_path, migrate_integrations_config_value)?
         } else {
             IntegrationsConfig::default()
         };
@@ -186,6 +197,7 @@ pub struct SetupAnswers {
     pub planner_model: String,
     pub executor_model: String,
     pub summarizer_model: String,
+    pub safety_review_model: String,
     pub openai_api_token: String,
     pub master_passphrase: String,
 }
@@ -213,6 +225,7 @@ pub fn write_setup_files(answers: &SetupAnswers) -> Result<SetupArtifacts> {
     let provider_id = "openai_main";
     let secret_ref = format!("secret://local/{provider_id}_api_token");
     let runtime = RuntimeConfig {
+        version: CURRENT_CONFIG_VERSION,
         instance_id: answers.instance_id.clone(),
         mode: "cli".to_owned(),
         data_dir: answers.data_dir.clone(),
@@ -228,6 +241,7 @@ pub fn write_setup_files(answers: &SetupAnswers) -> Result<SetupArtifacts> {
         defaults: RuntimeDefaults { max_agent_steps: 8 },
     };
     let providers = ProvidersConfig {
+        version: CURRENT_CONFIG_VERSION,
         active: provider_id.to_owned(),
         entries: vec![ProviderEntry {
             provider_id: provider_id.to_owned(),
@@ -240,6 +254,7 @@ pub fn write_setup_files(answers: &SetupAnswers) -> Result<SetupArtifacts> {
                 planner: answers.planner_model.clone(),
                 executor: answers.executor_model.clone(),
                 summarizer: answers.summarizer_model.clone(),
+                safety_review: answers.safety_review_model.clone(),
             },
         }],
     };
@@ -269,6 +284,14 @@ pub fn write_setup_files(answers: &SetupAnswers) -> Result<SetupArtifacts> {
     })
 }
 
+fn default_safety_review_model() -> String {
+    "gpt-5.4-mini".to_owned()
+}
+
+fn default_config_version() -> u32 {
+    CURRENT_CONFIG_VERSION
+}
+
 pub fn write_providers_config(
     config_dir: impl AsRef<Path>,
     providers: &ProvidersConfig,
@@ -296,6 +319,146 @@ fn write_integrations_config_path(path: &Path, integrations: &IntegrationsConfig
     fs::write(path, serde_yaml::to_string(integrations)?)
         .with_context(|| format!("failed to write {}", path.display()))
 }
+
+fn load_versioned_yaml<T>(
+    path: &Path,
+    migrate: fn(serde_yaml::Value) -> Result<(serde_yaml::Value, bool)>,
+) -> Result<T>
+where
+    T: DeserializeOwned + Serialize,
+{
+    let original = fs::read_to_string(path)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    let raw: serde_yaml::Value = serde_yaml::from_str(&original)
+        .with_context(|| format!("failed to parse {}", path.display()))?;
+    let (migrated, changed) = migrate(raw)
+        .with_context(|| format!("failed to migrate {}", path.display()))?;
+    let parsed: T = serde_yaml::from_value(migrated)
+        .with_context(|| format!("failed to parse {}", path.display()))?;
+
+    if changed {
+        write_yaml_atomically_with_backup(path, &original, &serde_yaml::to_string(&parsed)?)?;
+    }
+
+    Ok(parsed)
+}
+
+fn migrate_runtime_config_value(
+    value: serde_yaml::Value,
+) -> Result<(serde_yaml::Value, bool)> {
+    migrate_root_mapping(value, |_, _| Ok(false))
+}
+
+fn migrate_providers_config_value(
+    value: serde_yaml::Value,
+) -> Result<(serde_yaml::Value, bool)> {
+    migrate_root_mapping(value, |mapping, version| {
+        let mut changed = false;
+        if version < CURRENT_CONFIG_VERSION
+            && let Some(entries) = mapping
+                .get_mut(serde_yaml::Value::String("entries".to_owned()))
+                .and_then(serde_yaml::Value::as_sequence_mut)
+        {
+            for entry in entries {
+                let Some(entry_mapping) = entry.as_mapping_mut() else {
+                    continue;
+                };
+                let Some(models) = entry_mapping
+                    .get_mut(serde_yaml::Value::String("models".to_owned()))
+                    .and_then(serde_yaml::Value::as_mapping_mut)
+                else {
+                    continue;
+                };
+                let safety_key = serde_yaml::Value::String("safety_review".to_owned());
+                if !models.contains_key(&safety_key) {
+                    models.insert(
+                        safety_key,
+                        serde_yaml::Value::String(default_safety_review_model()),
+                    );
+                    changed = true;
+                }
+            }
+        }
+        Ok(changed)
+    })
+}
+
+fn migrate_integrations_config_value(
+    value: serde_yaml::Value,
+) -> Result<(serde_yaml::Value, bool)> {
+    migrate_root_mapping(value, |_, _| Ok(false))
+}
+
+fn migrate_root_mapping(
+    value: serde_yaml::Value,
+    migrate_body: impl FnOnce(&mut serde_yaml::Mapping, u32) -> Result<bool>,
+) -> Result<(serde_yaml::Value, bool)> {
+    let mut changed = false;
+    let mut mapping = value
+        .as_mapping()
+        .cloned()
+        .ok_or_else(|| anyhow!("expected YAML mapping at document root"))?;
+
+    let version_key = serde_yaml::Value::String("version".to_owned());
+    let version = match mapping.get(&version_key).and_then(serde_yaml::Value::as_u64) {
+        Some(version) => u32::try_from(version).context("config version out of range")?,
+        None => {
+            mapping.insert(
+                version_key.clone(),
+                serde_yaml::Value::Number(serde_yaml::Number::from(CURRENT_CONFIG_VERSION)),
+            );
+            changed = true;
+            0
+        }
+    };
+
+    if version > CURRENT_CONFIG_VERSION {
+        return Err(anyhow!(
+            "unsupported config version {version}; this build supports up to {CURRENT_CONFIG_VERSION}"
+        ));
+    }
+
+    changed |= migrate_body(&mut mapping, version)?;
+
+    if version < CURRENT_CONFIG_VERSION {
+        mapping.insert(
+            version_key,
+            serde_yaml::Value::Number(serde_yaml::Number::from(CURRENT_CONFIG_VERSION)),
+        );
+        changed = true;
+    }
+
+    Ok((serde_yaml::Value::Mapping(mapping), changed))
+}
+
+fn write_yaml_atomically_with_backup(path: &Path, original: &str, updated: &str) -> Result<()> {
+    if original == updated {
+        return Ok(());
+    }
+
+    let backup_path = backup_path_for(path);
+    fs::write(&backup_path, original)
+        .with_context(|| format!("failed to write {}", backup_path.display()))?;
+
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow!("invalid config path {}", path.display()))?;
+    let temp_path = path.with_file_name(format!("{file_name}.tmp"));
+    fs::write(&temp_path, updated)
+        .with_context(|| format!("failed to write {}", temp_path.display()))?;
+    fs::rename(&temp_path, path)
+        .with_context(|| format!("failed to replace {}", path.display()))?;
+    Ok(())
+}
+
+fn backup_path_for(path: &Path) -> PathBuf {
+    match path.extension().and_then(|ext| ext.to_str()) {
+        Some(ext) if !ext.is_empty() => path.with_extension(format!("{ext}.bak")),
+        _ => path.with_extension("bak"),
+    }
+}
+
 pub struct SecretStore {
     secret_dir: PathBuf,
 }
@@ -433,6 +596,7 @@ mod tests {
             config_dir: config_dir.clone(),
             base_dir: config_base_dir(&config_dir),
             runtime: RuntimeConfig {
+                version: CURRENT_CONFIG_VERSION,
                 instance_id: "test".to_owned(),
                 mode: "cli".to_owned(),
                 data_dir: PathBuf::from("./.beaverki"),
@@ -448,6 +612,7 @@ mod tests {
                 defaults: RuntimeDefaults { max_agent_steps: 8 },
             },
             providers: ProvidersConfig {
+                version: CURRENT_CONFIG_VERSION,
                 active: "openai_main".to_owned(),
                 entries: vec![],
             },
@@ -486,5 +651,139 @@ mod tests {
         assert!(paths.data_dir.ends_with("beaverki"));
         assert!(paths.state_dir.ends_with("beaverki"));
         assert!(paths.secret_dir.ends_with("secrets"));
+    }
+
+    #[test]
+    fn load_from_dir_migrates_legacy_configs_and_creates_backups() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let config_dir = tempdir.path().join("config");
+        fs::create_dir_all(&config_dir).expect("config dir");
+
+        let runtime_path = config_dir.join("runtime.yaml");
+        let providers_path = config_dir.join("providers.yaml");
+        let integrations_path = config_dir.join("integrations.yaml");
+
+        fs::write(
+            &runtime_path,
+            r#"instance_id: test-instance
+mode: cli
+data_dir: ./data
+state_dir: ./state
+log_dir: ./logs
+secret_dir: ./secrets
+database_path: ./state/runtime.db
+workspace_root: .
+default_timezone: UTC
+features:
+  markdown_exports: true
+defaults:
+  max_agent_steps: 8
+"#,
+        )
+        .expect("write runtime");
+        fs::write(
+            &providers_path,
+            r#"active: openai_main
+entries:
+  - provider_id: openai_main
+    kind: openai
+    auth:
+      mode: api_token
+      secret_ref: secret://local/openai_main_api_token
+    models:
+      planner: gpt-5.4
+      executor: gpt-5.4-mini
+      summarizer: gpt-5.4-mini
+"#,
+        )
+        .expect("write providers");
+        fs::write(
+            &integrations_path,
+            r#"discord:
+  enabled: true
+  command_prefix: "!bk-test"
+"#,
+        )
+        .expect("write integrations");
+
+        let loaded = LoadedConfig::load_from_dir(&config_dir).expect("load");
+        assert_eq!(loaded.runtime.version, CURRENT_CONFIG_VERSION);
+        assert_eq!(loaded.providers.version, CURRENT_CONFIG_VERSION);
+        assert_eq!(loaded.integrations.version, CURRENT_CONFIG_VERSION);
+        assert_eq!(
+            loaded.providers.entries[0].models.safety_review,
+            default_safety_review_model()
+        );
+        assert_eq!(loaded.integrations.discord.task_wait_timeout_secs, 5);
+
+        let runtime_rewritten = fs::read_to_string(&runtime_path).expect("runtime content");
+        let providers_rewritten =
+            fs::read_to_string(&providers_path).expect("providers content");
+        let integrations_rewritten =
+            fs::read_to_string(&integrations_path).expect("integrations content");
+
+        assert!(runtime_rewritten.contains("version: 1"));
+        assert!(providers_rewritten.contains("version: 1"));
+        assert!(providers_rewritten.contains("safety_review: gpt-5.4-mini"));
+        assert!(integrations_rewritten.contains("version: 1"));
+
+        let runtime_backup =
+            fs::read_to_string(backup_path_for(&runtime_path)).expect("runtime backup");
+        let providers_backup =
+            fs::read_to_string(backup_path_for(&providers_path)).expect("providers backup");
+        let integrations_backup =
+            fs::read_to_string(backup_path_for(&integrations_path)).expect("integrations backup");
+
+        assert!(!runtime_backup.contains("version:"));
+        assert!(!providers_backup.contains("safety_review:"));
+        assert!(!integrations_backup.contains("version:"));
+    }
+
+    #[test]
+    fn load_from_dir_rejects_future_config_version() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let config_dir = tempdir.path().join("config");
+        fs::create_dir_all(&config_dir).expect("config dir");
+
+        fs::write(
+            config_dir.join("runtime.yaml"),
+            r#"version: 999
+instance_id: test-instance
+mode: cli
+data_dir: ./data
+state_dir: ./state
+log_dir: ./logs
+secret_dir: ./secrets
+database_path: ./state/runtime.db
+workspace_root: .
+default_timezone: UTC
+features:
+  markdown_exports: true
+defaults:
+  max_agent_steps: 8
+"#,
+        )
+        .expect("write runtime");
+        fs::write(
+            config_dir.join("providers.yaml"),
+            r#"version: 1
+active: openai_main
+entries:
+  - provider_id: openai_main
+    kind: openai
+    auth:
+      mode: api_token
+      secret_ref: secret://local/openai_main_api_token
+    models:
+      planner: gpt-5.4
+      executor: gpt-5.4-mini
+      summarizer: gpt-5.4-mini
+      safety_review: gpt-5.4-mini
+"#,
+        )
+        .expect("write providers");
+
+        let error = LoadedConfig::load_from_dir(&config_dir).expect_err("future version error");
+        assert!(format!("{error:#}").contains("unsupported config version 999"));
     }
 }

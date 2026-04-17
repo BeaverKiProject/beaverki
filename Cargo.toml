@@ -1,5 +1,6 @@
 [workspace]
 members = [
+  "crates/beaverki-automation",
   "crates/beaverki-agent",
   "crates/beaverki-cli",
   "crates/beaverki-config",
@@ -24,8 +25,10 @@ anyhow = "1.0"
 async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.5", features = ["derive", "env"] }
+cron = "0.12"
 dialoguer = "0.11"
 directories = "5.0"
+mlua = { version = "0.10", features = ["lua54", "serialize", "vendored"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

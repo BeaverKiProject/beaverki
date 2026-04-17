@@ -4,20 +4,21 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
+use beaverki_automation as automation;
 use beaverki_agent::{AgentMemoryMode, AgentRequest, AgentResult, PrimaryAgentRunner};
 use beaverki_config::{LoadedConfig, SecretStore};
 use beaverki_core::{MemoryScope, TaskState, now_rfc3339};
 use beaverki_db::{
-    ApprovalRow, BootstrapState, ConnectorIdentityRow, Database, NewTask, RoleRow,
-    RuntimeHeartbeatRow, RuntimeSessionRow, TaskEventRow, TaskRow, ToolInvocationRow, UserRoleRow,
-    UserRow,
+    ApprovalRow, BootstrapState, ConnectorIdentityRow, Database, NewSchedule, NewScript,
+    NewScriptReview, NewTask, RoleRow, RuntimeHeartbeatRow, RuntimeSessionRow, ScheduleRow,
+    ScriptReviewRow, ScriptRow, TaskEventRow, TaskRow, ToolInvocationRow, UserRoleRow, UserRow,
 };
 use beaverki_memory::MemoryStore;
 use beaverki_models::{ModelProvider, OpenAiProvider};
 use beaverki_policy::{can_grant_approvals, visible_memory_scopes};
 use beaverki_tools::{ToolContext, builtin_registry};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Notify, RwLock};
@@ -37,10 +38,18 @@ pub struct TaskInspection {
     pub tool_invocations: Vec<ToolInvocationRow>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScriptInspection {
+    pub script: ScriptRow,
+    pub reviews: Vec<ScriptReviewRow>,
+    pub schedules: Vec<ScheduleRow>,
+}
+
 pub struct Runtime {
     config: LoadedConfig,
     db: Database,
     default_user: UserRow,
+    provider: Arc<dyn ModelProvider>,
     runner: PrimaryAgentRunner,
     discord_bot_token: Option<String>,
 }
@@ -89,7 +98,7 @@ impl Runtime {
         let runner = PrimaryAgentRunner::new(
             db.clone(),
             memory,
-            provider,
+            provider.clone(),
             builtin_registry(),
             tool_context,
             usize::from(config.runtime.defaults.max_agent_steps),
@@ -99,6 +108,7 @@ impl Runtime {
             config,
             db,
             default_user,
+            provider,
             runner,
             discord_bot_token,
         })
@@ -191,11 +201,15 @@ impl Runtime {
                 objective: &request.objective,
                 context_summary: task_context.or(request.task_context.as_deref()),
                 scope: request.scope,
+                wake_at: None,
             })
             .await
     }
 
     pub async fn execute_task(&self, task: TaskRow) -> Result<AgentResult> {
+        if task.kind == "scheduled_lua" || task.kind == "lua_script" {
+            return self.execute_lua_task(task).await;
+        }
         let approved_shell_commands = self
             .db
             .approved_shell_commands_for_task(&task.task_id, &task.owner_user_id)
@@ -207,6 +221,7 @@ impl Runtime {
     }
 
     pub async fn execute_next_runnable_task(&self) -> Result<Option<AgentResult>> {
+        let _ = self.materialize_due_schedules().await?;
         let Some(task) = self.db.fetch_next_runnable_task().await? else {
             return Ok(None);
         };
@@ -256,6 +271,503 @@ impl Runtime {
             events,
             tool_invocations,
         })
+    }
+
+    pub async fn create_lua_script(
+        &self,
+        user_id: Option<&str>,
+        script_id: Option<&str>,
+        source_text: &str,
+        capability_profile: Value,
+        created_from_task_id: Option<&str>,
+        intended_behavior_summary: &str,
+    ) -> Result<ScriptInspection> {
+        let user = self.resolve_user(user_id).await?;
+        let script = self
+            .db
+            .create_script(NewScript {
+                script_id,
+                owner_user_id: &user.user_id,
+                kind: "lua",
+                status: "draft",
+                source_text,
+                capability_profile_json: capability_profile.clone(),
+                created_from_task_id,
+                safety_status: "pending",
+                safety_summary: Some("Awaiting safety review."),
+            })
+            .await?;
+        self.db
+            .record_audit_event(
+                "user",
+                &user.user_id,
+                "script_created",
+                json!({
+                    "script_id": script.script_id,
+                    "created_from_task_id": created_from_task_id,
+                    "kind": "lua",
+                }),
+            )
+            .await?;
+        let _ = self
+            .review_lua_script(
+                Some(&user.user_id),
+                &script.script_id,
+                intended_behavior_summary,
+            )
+            .await?;
+        self.inspect_script(Some(&user.user_id), &script.script_id).await
+    }
+
+    pub async fn review_lua_script(
+        &self,
+        user_id: Option<&str>,
+        script_id: &str,
+        intended_behavior_summary: &str,
+    ) -> Result<ScriptReviewRow> {
+        let user = self.resolve_user(user_id).await?;
+        let script = self
+            .db
+            .fetch_script_for_owner(&user.user_id, script_id)
+            .await?
+            .ok_or_else(|| anyhow!("script '{script_id}' not found"))?;
+        let capability_profile: Value = serde_json::from_str(&script.capability_profile_json)
+            .context("failed to parse capability profile")?;
+        let review = automation::review_lua_script(
+            &self.provider,
+            &script.script_id,
+            script.created_from_task_id.as_deref(),
+            &user.user_id,
+            &script.source_text,
+            &capability_profile,
+            intended_behavior_summary,
+        )
+        .await?;
+        let next_status = if review.approved() { None } else { Some("blocked") };
+        self.db
+            .update_script_safety(
+                &script.script_id,
+                if review.approved() {
+                    "approved"
+                } else {
+                    "rejected"
+                },
+                &review.summary,
+                next_status,
+            )
+            .await?;
+        let review_row = self
+            .db
+            .create_script_review(NewScriptReview {
+                script_id: &script.script_id,
+                reviewer_agent_id: automation::SAFETY_AGENT_ID,
+                review_type: "lua_script",
+                verdict: &review.verdict,
+                risk_level: &review.risk_level,
+                findings_json: review.as_findings_json(),
+                summary_text: &review.summary,
+                reviewed_artifact_text: &script.source_text,
+            })
+            .await?;
+        self.db
+            .record_audit_event(
+                "safety_agent",
+                automation::SAFETY_AGENT_ID,
+                "script_reviewed",
+                json!({
+                    "script_id": script.script_id,
+                    "owner_user_id": user.user_id,
+                    "verdict": review.verdict,
+                    "risk_level": review.risk_level,
+                    "summary": review.summary,
+                }),
+            )
+            .await?;
+        Ok(review_row)
+    }
+
+    pub async fn list_scripts(&self, user_id: Option<&str>) -> Result<Vec<ScriptRow>> {
+        let user = self.resolve_user(user_id).await?;
+        self.db.list_scripts_for_owner(&user.user_id).await
+    }
+
+    pub async fn inspect_script(
+        &self,
+        user_id: Option<&str>,
+        script_id: &str,
+    ) -> Result<ScriptInspection> {
+        let user = self.resolve_user(user_id).await?;
+        let script = self
+            .db
+            .fetch_script_for_owner(&user.user_id, script_id)
+            .await?
+            .ok_or_else(|| anyhow!("script '{script_id}' not found"))?;
+        let reviews = self.db.list_script_reviews(&script.script_id).await?;
+        let schedules = self
+            .db
+            .list_schedules_for_owner(&user.user_id)
+            .await?
+            .into_iter()
+            .filter(|row| row.target_type == "lua_script" && row.target_id == script.script_id)
+            .collect();
+        Ok(ScriptInspection {
+            script,
+            reviews,
+            schedules,
+        })
+    }
+
+    pub async fn activate_script(&self, user_id: Option<&str>, script_id: &str) -> Result<ScriptRow> {
+        let user = self.resolve_user(user_id).await?;
+        let script = self
+            .db
+            .fetch_script_for_owner(&user.user_id, script_id)
+            .await?
+            .ok_or_else(|| anyhow!("script '{script_id}' not found"))?;
+        if script.safety_status != "approved" {
+            bail!(
+                "script '{}' cannot be activated until safety review is approved",
+                script.script_id
+            );
+        }
+        self.db
+            .update_script_status(&script.script_id, "active")
+            .await?;
+        self.db
+            .record_audit_event(
+                "user",
+                &user.user_id,
+                "script_activated",
+                json!({ "script_id": script.script_id }),
+            )
+            .await?;
+        self.db
+            .fetch_script_for_owner(&user.user_id, &script.script_id)
+            .await?
+            .ok_or_else(|| anyhow!("script '{}' disappeared after activation", script.script_id))
+    }
+
+    pub async fn disable_script(&self, user_id: Option<&str>, script_id: &str) -> Result<ScriptRow> {
+        let user = self.resolve_user(user_id).await?;
+        let script = self
+            .db
+            .fetch_script_for_owner(&user.user_id, script_id)
+            .await?
+            .ok_or_else(|| anyhow!("script '{script_id}' not found"))?;
+        self.db
+            .update_script_status(&script.script_id, "disabled")
+            .await?;
+        self.db
+            .record_audit_event(
+                "user",
+                &user.user_id,
+                "script_disabled",
+                json!({ "script_id": script.script_id }),
+            )
+            .await?;
+        self.db
+            .fetch_script_for_owner(&user.user_id, &script.script_id)
+            .await?
+            .ok_or_else(|| anyhow!("script '{}' disappeared after disable", script.script_id))
+    }
+
+    pub async fn create_schedule(
+        &self,
+        user_id: Option<&str>,
+        schedule_id: Option<&str>,
+        script_id: &str,
+        cron_expr: &str,
+        enabled: bool,
+    ) -> Result<ScheduleRow> {
+        let user = self.resolve_user(user_id).await?;
+        let script = self
+            .db
+            .fetch_script_for_owner(&user.user_id, script_id)
+            .await?
+            .ok_or_else(|| anyhow!("script '{script_id}' not found"))?;
+        if script.status != "active" {
+            bail!("script '{}' must be active before scheduling", script.script_id);
+        }
+        let next_run_at = automation::next_run_after(cron_expr, &now_rfc3339())?;
+        let schedule = self
+            .db
+            .create_schedule(NewSchedule {
+                schedule_id,
+                owner_user_id: &user.user_id,
+                target_type: "lua_script",
+                target_id: &script.script_id,
+                cron_expr,
+                enabled,
+                next_run_at: &next_run_at,
+            })
+            .await?;
+        self.db
+            .record_audit_event(
+                "user",
+                &user.user_id,
+                "schedule_created",
+                json!({
+                    "schedule_id": schedule.schedule_id,
+                    "script_id": script.script_id,
+                    "cron_expr": cron_expr,
+                    "enabled": enabled,
+                }),
+            )
+            .await?;
+        Ok(schedule)
+    }
+
+    pub async fn list_schedules(&self, user_id: Option<&str>) -> Result<Vec<ScheduleRow>> {
+        let user = self.resolve_user(user_id).await?;
+        self.db.list_schedules_for_owner(&user.user_id).await
+    }
+
+    pub async fn set_schedule_enabled(
+        &self,
+        user_id: Option<&str>,
+        schedule_id: &str,
+        enabled: bool,
+    ) -> Result<ScheduleRow> {
+        let user = self.resolve_user(user_id).await?;
+        let schedule = self
+            .db
+            .fetch_schedule_for_owner(&user.user_id, schedule_id)
+            .await?
+            .ok_or_else(|| anyhow!("schedule '{schedule_id}' not found"))?;
+        let next_run_at = if enabled {
+            automation::next_run_after(&schedule.cron_expr, &now_rfc3339())?
+        } else {
+            schedule.next_run_at.clone()
+        };
+        self.db
+            .update_schedule_state(
+                &schedule.schedule_id,
+                enabled,
+                &next_run_at,
+                schedule.last_run_at.as_deref(),
+            )
+            .await?;
+        self.db
+            .record_audit_event(
+                "user",
+                &user.user_id,
+                if enabled {
+                    "schedule_enabled"
+                } else {
+                    "schedule_disabled"
+                },
+                json!({
+                    "schedule_id": schedule.schedule_id,
+                    "next_run_at": next_run_at,
+                }),
+            )
+            .await?;
+        self.db
+            .fetch_schedule_for_owner(&user.user_id, &schedule.schedule_id)
+            .await?
+            .ok_or_else(|| anyhow!("schedule '{}' disappeared after update", schedule.schedule_id))
+    }
+
+    pub async fn materialize_due_schedules(&self) -> Result<Vec<TaskRow>> {
+        let now = now_rfc3339();
+        let due = self.db.list_due_schedules(&now).await?;
+        let mut tasks = Vec::new();
+        for schedule in due {
+            let Some(script) = self.db.fetch_script(&schedule.target_id).await? else {
+                continue;
+            };
+            if script.status != "active" || script.safety_status != "approved" {
+                continue;
+            }
+            let next_run_at = automation::next_run_after(&schedule.cron_expr, &now)?;
+            let primary_agent_id = self.primary_agent_id_for_owner(&schedule.owner_user_id).await?;
+            let initiating_identity_id = format!("schedule:{}", schedule.schedule_id);
+            let objective = format!("Run Lua automation {}", script.script_id);
+            let task_context = json!({
+                "script_id": script.script_id,
+                "schedule_id": schedule.schedule_id,
+            })
+            .to_string();
+            self.db
+                .update_schedule_state(
+                    &schedule.schedule_id,
+                    automation::schedule_enabled(&schedule),
+                    &next_run_at,
+                    Some(&now),
+                )
+                .await?;
+            let task = self
+                .db
+                .create_task_with_params(NewTask {
+                    owner_user_id: &schedule.owner_user_id,
+                    initiating_identity_id: &initiating_identity_id,
+                    primary_agent_id: &primary_agent_id,
+                    assigned_agent_id: &primary_agent_id,
+                    parent_task_id: None,
+                    kind: "scheduled_lua",
+                    objective: &objective,
+                    context_summary: Some(&task_context),
+                    scope: MemoryScope::Private,
+                    wake_at: None,
+                })
+                .await?;
+            self.db
+                .record_audit_event(
+                    "runtime",
+                    &self.config.runtime.instance_id,
+                    "schedule_triggered",
+                    json!({
+                        "schedule_id": schedule.schedule_id,
+                        "task_id": task.task_id,
+                        "script_id": script.script_id,
+                        "next_run_at": next_run_at,
+                    }),
+                )
+                .await?;
+            tasks.push(task);
+        }
+        Ok(tasks)
+    }
+
+    async fn execute_lua_task(&self, task: TaskRow) -> Result<AgentResult> {
+        self.db.clear_task_result(&task.task_id).await?;
+        self.db
+            .update_task_state(&task.task_id, TaskState::Running)
+            .await?;
+        self.db
+            .append_task_event(
+                &task.task_id,
+                "lua_task_started",
+                "runtime",
+                &self.config.runtime.instance_id,
+                json!({ "objective": task.objective }),
+            )
+            .await?;
+
+        let context: Value = task
+            .context_summary
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()
+            .context("failed to parse Lua task context")?
+            .unwrap_or_else(|| json!({}));
+        let script_id = context
+            .get("script_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("Lua task '{}' is missing script_id context", task.task_id))?;
+        let script = self
+            .db
+            .fetch_script(script_id)
+            .await?
+            .ok_or_else(|| anyhow!("script '{}' not found", script_id))?;
+        let capability_profile: Value = serde_json::from_str(&script.capability_profile_json)
+            .context("failed to parse script capability profile")?;
+        let execution = automation::execute_lua_script(automation::LuaExecutionInput {
+            db: self.db.clone(),
+            owner_user_id: task.owner_user_id.clone(),
+            task_id: task.task_id.clone(),
+            script_id: script.script_id.clone(),
+            source_text: script.source_text.clone(),
+            capability_profile,
+            working_dir: self.config.runtime.workspace_root.clone(),
+            allowed_roots: self.default_allowed_roots(),
+            browser_interactive_launcher: self
+                .config
+                .integrations
+                .browser
+                .interactive_launcher
+                .clone(),
+            browser_headless_program: self
+                .config
+                .integrations
+                .browser
+                .headless_browser
+                .clone(),
+            browser_headless_args: self.config.integrations.browser.headless_args.clone(),
+        })
+        .await?;
+
+        for log_line in &execution.logs {
+            self.db
+                .append_task_event(
+                    &task.task_id,
+                    "lua_log",
+                    "tool",
+                    "lua",
+                    json!({ "message": log_line }),
+                )
+                .await?;
+        }
+        for notification in &execution.notifications {
+            self.db
+                .append_task_event(
+                    &task.task_id,
+                    "lua_notify_user",
+                    "tool",
+                    "lua",
+                    json!({ "message": notification }),
+                )
+                .await?;
+        }
+        if let Some(wake_at) = &execution.deferred_until {
+            self.db
+                .create_task_with_params(NewTask {
+                    owner_user_id: &task.owner_user_id,
+                    initiating_identity_id: &task.initiating_identity_id,
+                    primary_agent_id: &task.primary_agent_id,
+                    assigned_agent_id: &task.assigned_agent_id,
+                    parent_task_id: Some(&task.task_id),
+                    kind: "lua_script",
+                    objective: &task.objective,
+                    context_summary: task.context_summary.as_deref(),
+                    scope: task.scope.parse::<MemoryScope>()?,
+                    wake_at: Some(wake_at),
+                })
+                .await?;
+            self.db
+                .append_task_event(
+                    &task.task_id,
+                    "lua_task_deferred",
+                    "tool",
+                    "lua",
+                    json!({ "wake_at": wake_at }),
+                )
+                .await?;
+        }
+
+        self.db
+            .complete_task(&task.task_id, &execution.result_text)
+            .await?;
+        self.db
+            .append_task_event(
+                &task.task_id,
+                "lua_task_completed",
+                "runtime",
+                &self.config.runtime.instance_id,
+                json!({
+                    "script_id": script.script_id,
+                    "schedule_id": context.get("schedule_id").and_then(Value::as_str),
+                }),
+            )
+            .await?;
+        self.db
+            .record_audit_event(
+                "runtime",
+                &self.config.runtime.instance_id,
+                "lua_script_executed",
+                json!({
+                    "task_id": task.task_id,
+                    "script_id": script.script_id,
+                    "schedule_id": context.get("schedule_id").and_then(Value::as_str),
+                }),
+            )
+            .await?;
+        let completed = self
+            .db
+            .fetch_task_for_owner(&task.owner_user_id, &task.task_id)
+            .await?
+            .ok_or_else(|| anyhow!("Lua task '{}' disappeared after completion", task.task_id))?;
+        Ok(AgentResult { task: completed })
     }
 
     pub async fn create_user(
@@ -448,6 +960,7 @@ impl Runtime {
             visible_scopes,
             memory_mode: AgentMemoryMode::ScopedRetrieval,
             approved_shell_commands: Vec::new(),
+            approved_automation_actions: Vec::new(),
         })
     }
 
@@ -468,6 +981,20 @@ impl Runtime {
             .parse::<MemoryScope>()
             .map_err(|_| anyhow!("unsupported task scope '{}'", task.scope))?;
 
+        let approved_automation_actions = self
+            .db
+            .approved_approvals_for_task(&task.task_id, owner_user_id)
+            .await?
+            .into_iter()
+            .filter(|approval| approval.action_type != "shell_command")
+            .filter_map(|approval| {
+                approval.target_ref.map(|target_ref| beaverki_agent::ApprovedAutomationAction {
+                    action_type: approval.action_type,
+                    target_ref,
+                })
+            })
+            .collect::<Vec<_>>();
+
         Ok(AgentRequest {
             owner_user_id: owner_user_id.to_owned(),
             initiating_identity_id: task.initiating_identity_id.clone(),
@@ -482,6 +1009,7 @@ impl Runtime {
             visible_scopes: visible_memory_scopes(&role_ids),
             memory_mode,
             approved_shell_commands,
+            approved_automation_actions,
         })
     }
 
@@ -493,6 +1021,24 @@ impl Runtime {
             .into_iter()
             .map(|row| row.role_id)
             .collect())
+    }
+
+    async fn primary_agent_id_for_owner(&self, owner_user_id: &str) -> Result<String> {
+        let user = self
+            .db
+            .fetch_user(owner_user_id)
+            .await?
+            .ok_or_else(|| anyhow!("user '{owner_user_id}' not found"))?;
+        user.primary_agent_id
+            .ok_or_else(|| anyhow!("user '{owner_user_id}' has no primary agent"))
+    }
+
+    fn default_allowed_roots(&self) -> Vec<PathBuf> {
+        let mut allowed_roots = vec![self.config.runtime.workspace_root.clone()];
+        if !allowed_roots.contains(&self.config.runtime.data_dir) {
+            allowed_roots.push(self.config.runtime.data_dir.clone());
+        }
+        allowed_roots
     }
 }
 
@@ -947,6 +1493,7 @@ impl RuntimeDaemon {
                     return Ok(());
                 }
 
+                let _ = daemon.runtime.materialize_due_schedules().await?;
                 let next_task = daemon.runtime.db.fetch_next_runnable_task().await?;
                 let Some(task) = next_task else {
                     break;
@@ -1380,6 +1927,7 @@ mod tests {
                     planner: "planner".to_owned(),
                     executor: "executor".to_owned(),
                     summarizer: "summarizer".to_owned(),
+                    safety_review: "safety".to_owned(),
                 },
                 responses: Arc::new(Mutex::new(responses.into())),
             }
@@ -1422,6 +1970,7 @@ mod tests {
             config_dir: config_dir.clone(),
             base_dir: tempdir.path().to_path_buf(),
             runtime: RuntimeConfig {
+                version: 1,
                 instance_id: "test-instance".to_owned(),
                 mode: "daemon".to_owned(),
                 data_dir,
@@ -1437,6 +1986,7 @@ mod tests {
                 defaults: RuntimeDefaults { max_agent_steps: 4 },
             },
             providers: beaverki_config::ProvidersConfig {
+                version: 1,
                 active: "fake".to_owned(),
                 entries: vec![],
             },
@@ -1584,6 +2134,71 @@ mod tests {
 
         client.shutdown().await.expect("shutdown request");
         handle.await.expect("join").expect("daemon result");
+    }
+
+    #[tokio::test]
+    async fn scheduled_lua_script_is_materialized_and_executed() {
+        let (_tempdir, runtime) = test_runtime(vec![ModelTurnResponse {
+            output_items: vec![json!({
+                "type": "message",
+                "content": [{
+                    "type": "output_text",
+                    "text": "{\"verdict\":\"approved\",\"risk_level\":\"low\",\"findings\":[],\"required_changes\":[],\"summary\":\"The Lua automation matches the stated intent.\"}"
+                }]
+            })],
+            tool_calls: vec![],
+            output_text: "{\"verdict\":\"approved\",\"risk_level\":\"low\",\"findings\":[],\"required_changes\":[],\"summary\":\"The Lua automation matches the stated intent.\"}".to_owned(),
+        }])
+        .await;
+        let db = runtime.db.clone();
+        let script = runtime
+            .create_lua_script(
+                None,
+                Some("script_schedule_test"),
+                r#"return function(ctx)
+    ctx.log_info("scheduled lua ran")
+    return "scheduled ok"
+end"#,
+                json!({}),
+                None,
+                "Return a confirmation string for the schedule test.",
+            )
+            .await
+            .expect("create script")
+            .script;
+        runtime
+            .activate_script(None, &script.script_id)
+            .await
+            .expect("activate script");
+        db.create_schedule(NewSchedule {
+            schedule_id: Some("sched_schedule_test"),
+            owner_user_id: &script.owner_user_id,
+            target_type: "lua_script",
+            target_id: &script.script_id,
+            cron_expr: "0/1 * * * * * *",
+            enabled: true,
+            next_run_at: &now_rfc3339(),
+        })
+        .await
+        .expect("create schedule");
+
+        let result = runtime
+            .execute_next_runnable_task()
+            .await
+            .expect("execute next")
+            .expect("task");
+        assert_eq!(result.task.kind, "scheduled_lua");
+        assert_eq!(result.task.state, TaskState::Completed.as_str());
+        assert_eq!(result.task.result_text.as_deref(), Some("scheduled ok"));
+
+        let inspection = runtime
+            .inspect_task(None, &result.task.task_id)
+            .await
+            .expect("inspection");
+        assert!(inspection
+            .events
+            .iter()
+            .any(|event| event.event_type == "lua_log"));
     }
 
     #[tokio::test]
@@ -1735,6 +2350,31 @@ mod tests {
                 })],
                 tool_calls: vec![beaverki_models::ModelToolCall {
                     call_id: "call_1".to_owned(),
+                    name: "shell_exec".to_owned(),
+                    arguments: json!({ "command": "mkdir approved-dir" }),
+                }],
+                output_text: String::new(),
+            },
+            ModelTurnResponse {
+                output_items: vec![json!({
+                    "type": "message",
+                    "content": [{
+                        "type": "output_text",
+                        "text": "{\"verdict\":\"approved\",\"risk_level\":\"high\",\"findings\":[],\"required_changes\":[],\"summary\":\"The command matches the task and is acceptable with explicit approval.\"}"
+                    }]
+                })],
+                tool_calls: vec![],
+                output_text: "{\"verdict\":\"approved\",\"risk_level\":\"high\",\"findings\":[],\"required_changes\":[],\"summary\":\"The command matches the task and is acceptable with explicit approval.\"}".to_owned(),
+            },
+            ModelTurnResponse {
+                output_items: vec![json!({
+                    "type": "function_call",
+                    "call_id": "call_2",
+                    "name": "shell_exec",
+                    "arguments": "{\"command\":\"mkdir approved-dir\"}"
+                })],
+                tool_calls: vec![beaverki_models::ModelToolCall {
+                    call_id: "call_2".to_owned(),
                     name: "shell_exec".to_owned(),
                     arguments: json!({ "command": "mkdir approved-dir" }),
                 }],

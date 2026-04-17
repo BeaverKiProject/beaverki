@@ -26,6 +26,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    Automation {
+        #[command(subcommand)]
+        command: Box<AutomationCommand>,
+    },
     Connector {
         #[command(subcommand)]
         command: Box<ConnectorCommand>,
@@ -54,6 +58,36 @@ enum Commands {
         #[command(subcommand)]
         command: Box<RoleCommand>,
     },
+}
+
+#[derive(Subcommand)]
+enum AutomationCommand {
+    Script {
+        #[command(subcommand)]
+        command: Box<ScriptCommand>,
+    },
+    Schedule {
+        #[command(subcommand)]
+        command: Box<ScheduleCommand>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ScriptCommand {
+    Create(ScriptCreateArgs),
+    List(UserConfigArgs),
+    Show(ScriptShowArgs),
+    Review(ScriptReviewArgs),
+    Activate(ScriptActionArgs),
+    Disable(ScriptActionArgs),
+}
+
+#[derive(Subcommand)]
+enum ScheduleCommand {
+    Add(ScheduleAddArgs),
+    List(UserConfigArgs),
+    Enable(ScheduleToggleArgs),
+    Disable(ScheduleToggleArgs),
 }
 
 #[derive(Subcommand)]
@@ -138,6 +172,8 @@ struct SetupInitArgs {
     executor_model: String,
     #[arg(long, default_value = "gpt-5.4-mini")]
     summarizer_model: String,
+    #[arg(long, default_value = "gpt-5.4-mini")]
+    safety_review_model: String,
     #[arg(long, default_value = "OPENAI_API_KEY")]
     openai_api_token_env: String,
     #[arg(long, default_value = "BEAVERKI_MASTER_PASSPHRASE")]
@@ -215,6 +251,14 @@ struct ConfigDirArgs {
 }
 
 #[derive(Args, Clone)]
+struct UserConfigArgs {
+    #[arg(long)]
+    config_dir: Option<PathBuf>,
+    #[arg(long)]
+    user: Option<String>,
+}
+
+#[derive(Args, Clone)]
 struct SetModelsArgs {
     #[arg(long)]
     config_dir: Option<PathBuf>,
@@ -224,6 +268,8 @@ struct SetModelsArgs {
     executor_model: Option<String>,
     #[arg(long)]
     summarizer_model: Option<String>,
+    #[arg(long)]
+    safety_review_model: Option<String>,
     #[arg(long, default_value = "OPENAI_API_KEY")]
     openai_api_token_env: String,
     #[arg(long, default_value_t = false)]
@@ -260,6 +306,94 @@ struct DiscordMapUserArgs {
     external_channel_id: Option<String>,
     #[arg(long, default_value = "authenticated_message")]
     trust_level: String,
+}
+
+#[derive(Args, Clone)]
+struct ScriptCreateArgs {
+    #[arg(long)]
+    config_dir: Option<PathBuf>,
+    #[arg(long)]
+    user: Option<String>,
+    #[arg(long)]
+    script_id: Option<String>,
+    #[arg(long)]
+    source_file: Option<PathBuf>,
+    #[arg(long)]
+    source_text: Option<String>,
+    #[arg(long)]
+    capability_profile_file: Option<PathBuf>,
+    #[arg(long)]
+    summary: String,
+    #[arg(long)]
+    created_from_task_id: Option<String>,
+    #[arg(long, default_value = "BEAVERKI_MASTER_PASSPHRASE")]
+    passphrase_env: String,
+}
+
+#[derive(Args, Clone)]
+struct ScriptShowArgs {
+    #[arg(long)]
+    config_dir: Option<PathBuf>,
+    #[arg(long)]
+    user: Option<String>,
+    #[arg(long)]
+    script_id: String,
+}
+
+#[derive(Args, Clone)]
+struct ScriptReviewArgs {
+    #[arg(long)]
+    config_dir: Option<PathBuf>,
+    #[arg(long)]
+    user: Option<String>,
+    #[arg(long)]
+    script_id: String,
+    #[arg(long)]
+    summary: String,
+    #[arg(long, default_value = "BEAVERKI_MASTER_PASSPHRASE")]
+    passphrase_env: String,
+}
+
+#[derive(Args, Clone)]
+struct ScriptActionArgs {
+    #[arg(long)]
+    config_dir: Option<PathBuf>,
+    #[arg(long)]
+    user: Option<String>,
+    #[arg(long)]
+    script_id: String,
+    #[arg(long, default_value = "BEAVERKI_MASTER_PASSPHRASE")]
+    passphrase_env: String,
+}
+
+#[derive(Args, Clone)]
+struct ScheduleAddArgs {
+    #[arg(long)]
+    config_dir: Option<PathBuf>,
+    #[arg(long)]
+    user: Option<String>,
+    #[arg(long)]
+    schedule_id: Option<String>,
+    #[arg(long)]
+    script_id: String,
+    #[arg(long)]
+    cron: String,
+    #[arg(long, default_value_t = true)]
+    enabled: bool,
+    #[arg(long, default_value = "BEAVERKI_MASTER_PASSPHRASE")]
+    passphrase_env: String,
+}
+
+#[derive(Args, Clone)]
+struct ScheduleToggleArgs {
+    #[arg(long)]
+    config_dir: Option<PathBuf>,
+    #[arg(long)]
+    user: Option<String>,
+    #[arg(long)]
+    schedule_id: String,
+    #[arg(long, default_value = "BEAVERKI_MASTER_PASSPHRASE")]
+    passphrase_env: String,
 }
 
 #[derive(Args, Clone)]
@@ -300,6 +434,22 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
     match cli.command {
+        Commands::Automation { command } => match *command {
+            AutomationCommand::Script { command } => match *command {
+                ScriptCommand::Create(args) => script_create(args).await,
+                ScriptCommand::List(args) => script_list(args).await,
+                ScriptCommand::Show(args) => script_show(args).await,
+                ScriptCommand::Review(args) => script_review(args).await,
+                ScriptCommand::Activate(args) => script_activate(args).await,
+                ScriptCommand::Disable(args) => script_disable(args).await,
+            },
+            AutomationCommand::Schedule { command } => match *command {
+                ScheduleCommand::Add(args) => schedule_add(args).await,
+                ScheduleCommand::List(args) => schedule_list(args).await,
+                ScheduleCommand::Enable(args) => schedule_toggle(args, true).await,
+                ScheduleCommand::Disable(args) => schedule_toggle(args, false).await,
+            },
+        },
         Commands::Connector { command } => match *command {
             ConnectorCommand::Discord { command } => match *command {
                 DiscordCommand::Show(args) => discord_show(args).await,
@@ -399,6 +549,7 @@ async fn setup_init(args: SetupInitArgs) -> Result<()> {
             &args.planner_model,
             &args.executor_model,
             &args.summarizer_model,
+            &args.safety_review_model,
         )
         .await?;
     }
@@ -416,6 +567,7 @@ async fn setup_init(args: SetupInitArgs) -> Result<()> {
         planner_model: args.planner_model,
         executor_model: args.executor_model,
         summarizer_model: args.summarizer_model,
+        safety_review_model: args.safety_review_model,
         openai_api_token: api_token,
         master_passphrase,
     };
@@ -742,10 +894,262 @@ async fn role_list(args: ConfigDirArgs) -> Result<()> {
     Ok(())
 }
 
+async fn script_create(args: ScriptCreateArgs) -> Result<()> {
+    let config_dir = resolve_config_dir(args.config_dir)?;
+    let passphrase = prompt_passphrase_from_env(&args.passphrase_env).unwrap_or_else(|| {
+        Password::new()
+            .with_prompt("Master passphrase")
+            .interact()
+            .expect("failed to read master passphrase")
+    });
+    let source_text = match (args.source_text, args.source_file) {
+        (Some(text), None) => text,
+        (None, Some(path)) => std::fs::read_to_string(&path)
+            .with_context(|| format!("failed to read {}", path.display()))?,
+        (Some(_), Some(_)) => bail!("provide either --source-text or --source-file, not both"),
+        (None, None) => bail!("provide one of --source-text or --source-file"),
+    };
+    let capability_profile = match args.capability_profile_file {
+        Some(path) => serde_json::from_str::<serde_json::Value>(
+            &std::fs::read_to_string(&path)
+                .with_context(|| format!("failed to read {}", path.display()))?,
+        )
+        .with_context(|| format!("failed to parse {}", path.display()))?,
+        None => serde_json::json!({}),
+    };
+    let runtime = Runtime::load(&config_dir, &passphrase).await?;
+    let inspection = runtime
+        .create_lua_script(
+            args.user.as_deref(),
+            args.script_id.as_deref(),
+            &source_text,
+            capability_profile,
+            args.created_from_task_id.as_deref(),
+            &args.summary,
+        )
+        .await?;
+
+    println!("Script created.");
+    println!("Script ID: {}", inspection.script.script_id);
+    println!("Status: {}", inspection.script.status);
+    println!("Safety status: {}", inspection.script.safety_status);
+    if let Some(summary) = inspection.script.safety_summary.as_deref() {
+        println!("Safety summary: {summary}");
+    }
+    Ok(())
+}
+
+async fn script_list(args: UserConfigArgs) -> Result<()> {
+    let config_dir = resolve_config_dir(args.config_dir)?;
+    let (_, db) = load_db(&config_dir).await?;
+    let user = resolve_user_for_db(&db, args.user.as_deref()).await?;
+    let scripts = db.list_scripts_for_owner(&user.user_id).await?;
+    for script in scripts {
+        println!(
+            "- {} kind={} status={} safety={}",
+            script.script_id, script.kind, script.status, script.safety_status
+        );
+    }
+    Ok(())
+}
+
+async fn script_show(args: ScriptShowArgs) -> Result<()> {
+    let config_dir = resolve_config_dir(args.config_dir)?;
+    let passphrase = prompt_passphrase_from_env("BEAVERKI_MASTER_PASSPHRASE");
+    if let Some(passphrase) = passphrase {
+        let runtime = Runtime::load(&config_dir, &passphrase).await?;
+        let inspection = runtime
+            .inspect_script(args.user.as_deref(), &args.script_id)
+            .await?;
+        print_script_inspection(&inspection);
+        return Ok(());
+    }
+
+    let (_, db) = load_db(&config_dir).await?;
+    let user = resolve_user_for_db(&db, args.user.as_deref()).await?;
+    let script = db
+        .fetch_script_for_owner(&user.user_id, &args.script_id)
+        .await?
+        .ok_or_else(|| anyhow!("script '{}' not found", args.script_id))?;
+    println!("Script ID: {}", script.script_id);
+    println!("Status: {}", script.status);
+    println!("Safety status: {}", script.safety_status);
+    if let Some(summary) = script.safety_summary {
+        println!("Safety summary: {summary}");
+    }
+    println!("\n{}", script.source_text);
+    Ok(())
+}
+
+async fn script_review(args: ScriptReviewArgs) -> Result<()> {
+    let config_dir = resolve_config_dir(args.config_dir)?;
+    let passphrase = prompt_passphrase_from_env(&args.passphrase_env).unwrap_or_else(|| {
+        Password::new()
+            .with_prompt("Master passphrase")
+            .interact()
+            .expect("failed to read master passphrase")
+    });
+    let runtime = Runtime::load(&config_dir, &passphrase).await?;
+    let review = runtime
+        .review_lua_script(args.user.as_deref(), &args.script_id, &args.summary)
+        .await?;
+    println!("Script reviewed.");
+    println!("Review ID: {}", review.review_id);
+    println!("Verdict: {}", review.verdict);
+    println!("Risk level: {}", review.risk_level);
+    println!("Summary: {}", review.summary_text);
+    Ok(())
+}
+
+async fn script_activate(args: ScriptActionArgs) -> Result<()> {
+    let config_dir = resolve_config_dir(args.config_dir)?;
+    let passphrase = prompt_passphrase_from_env(&args.passphrase_env).unwrap_or_else(|| {
+        Password::new()
+            .with_prompt("Master passphrase")
+            .interact()
+            .expect("failed to read master passphrase")
+    });
+    let runtime = Runtime::load(&config_dir, &passphrase).await?;
+    let script = runtime
+        .activate_script(args.user.as_deref(), &args.script_id)
+        .await?;
+    println!("Script {} is now {}.", script.script_id, script.status);
+    Ok(())
+}
+
+async fn script_disable(args: ScriptActionArgs) -> Result<()> {
+    let config_dir = resolve_config_dir(args.config_dir)?;
+    let passphrase = prompt_passphrase_from_env(&args.passphrase_env).unwrap_or_else(|| {
+        Password::new()
+            .with_prompt("Master passphrase")
+            .interact()
+            .expect("failed to read master passphrase")
+    });
+    let runtime = Runtime::load(&config_dir, &passphrase).await?;
+    let script = runtime
+        .disable_script(args.user.as_deref(), &args.script_id)
+        .await?;
+    println!("Script {} is now {}.", script.script_id, script.status);
+    Ok(())
+}
+
+async fn schedule_add(args: ScheduleAddArgs) -> Result<()> {
+    let config_dir = resolve_config_dir(args.config_dir)?;
+    let passphrase = prompt_passphrase_from_env(&args.passphrase_env).unwrap_or_else(|| {
+        Password::new()
+            .with_prompt("Master passphrase")
+            .interact()
+            .expect("failed to read master passphrase")
+    });
+    let runtime = Runtime::load(&config_dir, &passphrase).await?;
+    let schedule = runtime
+        .create_schedule(
+            args.user.as_deref(),
+            args.schedule_id.as_deref(),
+            &args.script_id,
+            &args.cron,
+            args.enabled,
+        )
+        .await?;
+    println!("Schedule created.");
+    println!("Schedule ID: {}", schedule.schedule_id);
+    println!("Target: {}", schedule.target_id);
+    println!("Cron: {}", schedule.cron_expr);
+    println!("Enabled: {}", if schedule.enabled != 0 { "yes" } else { "no" });
+    println!("Next run at: {}", schedule.next_run_at);
+    Ok(())
+}
+
+async fn schedule_list(args: UserConfigArgs) -> Result<()> {
+    let config_dir = resolve_config_dir(args.config_dir)?;
+    let (_, db) = load_db(&config_dir).await?;
+    let user = resolve_user_for_db(&db, args.user.as_deref()).await?;
+    let schedules = db.list_schedules_for_owner(&user.user_id).await?;
+    for schedule in schedules {
+        println!(
+            "- {} target={} enabled={} next_run_at={}",
+            schedule.schedule_id,
+            schedule.target_id,
+            if schedule.enabled != 0 { "yes" } else { "no" },
+            schedule.next_run_at
+        );
+    }
+    Ok(())
+}
+
+async fn schedule_toggle(args: ScheduleToggleArgs, enabled: bool) -> Result<()> {
+    let config_dir = resolve_config_dir(args.config_dir)?;
+    let passphrase = prompt_passphrase_from_env(&args.passphrase_env).unwrap_or_else(|| {
+        Password::new()
+            .with_prompt("Master passphrase")
+            .interact()
+            .expect("failed to read master passphrase")
+    });
+    let runtime = Runtime::load(&config_dir, &passphrase).await?;
+    let schedule = runtime
+        .set_schedule_enabled(args.user.as_deref(), &args.schedule_id, enabled)
+        .await?;
+    println!(
+        "Schedule {} is now {}. Next run at: {}",
+        schedule.schedule_id,
+        if schedule.enabled != 0 {
+            "enabled"
+        } else {
+            "disabled"
+        },
+        schedule.next_run_at
+    );
+    Ok(())
+}
+
+fn print_script_inspection(inspection: &beaverki_runtime::ScriptInspection) {
+    println!("Script ID: {}", inspection.script.script_id);
+    println!("Status: {}", inspection.script.status);
+    println!("Safety status: {}", inspection.script.safety_status);
+    if let Some(summary) = inspection.script.safety_summary.as_deref() {
+        println!("Safety summary: {summary}");
+    }
+    if let Some(task_id) = inspection.script.created_from_task_id.as_deref() {
+        println!("Created from task: {task_id}");
+    }
+
+    println!("\nSource:\n{}", inspection.script.source_text);
+
+    if !inspection.reviews.is_empty() {
+        println!("\nReviews:");
+        for review in &inspection.reviews {
+            println!(
+                "- {} verdict={} risk={} summary={}",
+                review.review_id, review.verdict, review.risk_level, review.summary_text
+            );
+        }
+    }
+
+    if !inspection.schedules.is_empty() {
+        println!("\nSchedules:");
+        for schedule in &inspection.schedules {
+            println!(
+                "- {} cron={} enabled={} next_run_at={}",
+                schedule.schedule_id,
+                schedule.cron_expr,
+                if schedule.enabled != 0 { "yes" } else { "no" },
+                schedule.next_run_at
+            );
+        }
+    }
+}
+
 async fn verify_openai(args: VerifyOpenAiArgs) -> Result<()> {
     let api_token = std::env::var(&args.openai_api_token_env)
         .with_context(|| format!("missing environment variable {}", args.openai_api_token_env))?;
-    verify_openai_api_token(&api_token, "gpt-5.4", "gpt-5.4-mini", "gpt-5.4-mini").await?;
+    verify_openai_api_token(
+        &api_token,
+        "gpt-5.4",
+        "gpt-5.4-mini",
+        "gpt-5.4-mini",
+        "gpt-5.4-mini",
+    )
+    .await?;
     println!("OpenAI API key verification succeeded.");
     Ok(())
 }
@@ -761,6 +1165,7 @@ async fn show_models(args: ConfigDirArgs) -> Result<()> {
     println!("Planner model: {}", provider.models.planner);
     println!("Executor model: {}", provider.models.executor);
     println!("Summarizer model: {}", provider.models.summarizer);
+    println!("Safety review model: {}", provider.models.safety_review);
 
     Ok(())
 }
@@ -924,6 +1329,9 @@ async fn set_models(args: SetModelsArgs) -> Result<()> {
     let summarizer_model = args
         .summarizer_model
         .unwrap_or_else(|| provider.models.summarizer.clone());
+    let safety_review_model = args
+        .safety_review_model
+        .unwrap_or_else(|| provider.models.safety_review.clone());
 
     if !args.skip_openai_check {
         let api_token = std::env::var(&args.openai_api_token_env).with_context(|| {
@@ -934,6 +1342,7 @@ async fn set_models(args: SetModelsArgs) -> Result<()> {
             &planner_model,
             &executor_model,
             &summarizer_model,
+            &safety_review_model,
         )
         .await?;
     }
@@ -941,15 +1350,18 @@ async fn set_models(args: SetModelsArgs) -> Result<()> {
     provider.models.planner = planner_model;
     provider.models.executor = executor_model;
     provider.models.summarizer = summarizer_model;
+    provider.models.safety_review = safety_review_model;
     let planner = provider.models.planner.clone();
     let executor = provider.models.executor.clone();
     let summarizer = provider.models.summarizer.clone();
+    let safety_review = provider.models.safety_review.clone();
 
     let providers_path = write_providers_config(&config_dir, &config.providers)?;
     println!("Updated provider models in {}", providers_path.display());
     println!("Planner model: {}", planner);
     println!("Executor model: {}", executor);
     println!("Summarizer model: {}", summarizer);
+    println!("Safety review model: {}", safety_review);
 
     Ok(())
 }
@@ -959,6 +1371,7 @@ async fn verify_openai_api_token(
     planner_model: &str,
     executor_model: &str,
     summarizer_model: &str,
+    safety_review_model: &str,
 ) -> Result<()> {
     let provider = OpenAiProvider::from_entry(
         &beaverki_config::ProviderEntry {
@@ -972,6 +1385,7 @@ async fn verify_openai_api_token(
                 planner: planner_model.to_owned(),
                 executor: executor_model.to_owned(),
                 summarizer: summarizer_model.to_owned(),
+                safety_review: safety_review_model.to_owned(),
             },
         },
         api_token.to_owned(),

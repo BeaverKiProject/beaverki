@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+beaverki-automation = { path = "../beaverki-automation" }
 beaverki-agent = { path = "../beaverki-agent" }
 beaverki-config = { path = "../beaverki-config" }
 beaverki-core = { path = "../beaverki-core" }
@@ -15,7 +16,9 @@ beaverki-models = { path = "../beaverki-models" }
 beaverki-policy = { path = "../beaverki-policy" }
 beaverki-tools = { path = "../beaverki-tools" }
 chrono.workspace = true
+cron.workspace = true
 futures-util.workspace = true
+mlua.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
