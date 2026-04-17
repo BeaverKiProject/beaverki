@@ -57,7 +57,8 @@ impl Database {
             .await
             .context("failed to count user roles during owner-role reconciliation")?;
 
-        if user_count == 1 && user_role_count == 0
+        if user_count == 1
+            && user_role_count == 0
             && let Some(user) = self.default_user().await?
         {
             self.assign_role(&user.user_id, "owner").await?;
@@ -1014,7 +1015,10 @@ impl Database {
         Ok(())
     }
 
-    pub async fn create_script_review(&self, input: NewScriptReview<'_>) -> Result<ScriptReviewRow> {
+    pub async fn create_script_review(
+        &self,
+        input: NewScriptReview<'_>,
+    ) -> Result<ScriptReviewRow> {
         let review_id = new_prefixed_id("review");
         let timestamp = now_rfc3339();
         sqlx::query(
@@ -1932,10 +1936,7 @@ mod tests {
         drop(db);
 
         let repaired = Database::connect(&db_path).await.expect("reconnect");
-        let roles = repaired
-            .list_user_roles("user_alex")
-            .await
-            .expect("roles");
+        let roles = repaired.list_user_roles("user_alex").await.expect("roles");
 
         assert_eq!(roles.len(), 1);
         assert_eq!(roles[0].role_id, "owner");

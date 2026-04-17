@@ -327,12 +327,12 @@ fn load_versioned_yaml<T>(
 where
     T: DeserializeOwned + Serialize,
 {
-    let original = fs::read_to_string(path)
-        .with_context(|| format!("failed to read {}", path.display()))?;
+    let original =
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
     let raw: serde_yaml::Value = serde_yaml::from_str(&original)
         .with_context(|| format!("failed to parse {}", path.display()))?;
-    let (migrated, changed) = migrate(raw)
-        .with_context(|| format!("failed to migrate {}", path.display()))?;
+    let (migrated, changed) =
+        migrate(raw).with_context(|| format!("failed to migrate {}", path.display()))?;
     let parsed: T = serde_yaml::from_value(migrated)
         .with_context(|| format!("failed to parse {}", path.display()))?;
 
@@ -343,15 +343,11 @@ where
     Ok(parsed)
 }
 
-fn migrate_runtime_config_value(
-    value: serde_yaml::Value,
-) -> Result<(serde_yaml::Value, bool)> {
+fn migrate_runtime_config_value(value: serde_yaml::Value) -> Result<(serde_yaml::Value, bool)> {
     migrate_root_mapping(value, |_, _| Ok(false))
 }
 
-fn migrate_providers_config_value(
-    value: serde_yaml::Value,
-) -> Result<(serde_yaml::Value, bool)> {
+fn migrate_providers_config_value(value: serde_yaml::Value) -> Result<(serde_yaml::Value, bool)> {
     migrate_root_mapping(value, |mapping, version| {
         let mut changed = false;
         if version < CURRENT_CONFIG_VERSION
@@ -400,7 +396,10 @@ fn migrate_root_mapping(
         .ok_or_else(|| anyhow!("expected YAML mapping at document root"))?;
 
     let version_key = serde_yaml::Value::String("version".to_owned());
-    let version = match mapping.get(&version_key).and_then(serde_yaml::Value::as_u64) {
+    let version = match mapping
+        .get(&version_key)
+        .and_then(serde_yaml::Value::as_u64)
+    {
         Some(version) => u32::try_from(version).context("config version out of range")?,
         None => {
             mapping.insert(
@@ -717,8 +716,7 @@ entries:
         assert_eq!(loaded.integrations.discord.task_wait_timeout_secs, 5);
 
         let runtime_rewritten = fs::read_to_string(&runtime_path).expect("runtime content");
-        let providers_rewritten =
-            fs::read_to_string(&providers_path).expect("providers content");
+        let providers_rewritten = fs::read_to_string(&providers_path).expect("providers content");
         let integrations_rewritten =
             fs::read_to_string(&integrations_path).expect("integrations content");
 

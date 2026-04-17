@@ -1055,7 +1055,10 @@ async fn schedule_add(args: ScheduleAddArgs) -> Result<()> {
     println!("Schedule ID: {}", schedule.schedule_id);
     println!("Target: {}", schedule.target_id);
     println!("Cron: {}", schedule.cron_expr);
-    println!("Enabled: {}", if schedule.enabled != 0 { "yes" } else { "no" });
+    println!(
+        "Enabled: {}",
+        if schedule.enabled != 0 { "yes" } else { "no" }
+    );
     println!("Next run at: {}", schedule.next_run_at);
     Ok(())
 }

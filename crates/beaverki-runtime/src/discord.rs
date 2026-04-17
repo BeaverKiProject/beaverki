@@ -495,8 +495,7 @@ pub(super) async fn maybe_send_task_follow_up(
     {
         warn!(
             "failed to clear Discord working reaction from message {} in channel {}: {error:#}",
-            message_id,
-            channel_id
+            message_id, channel_id
         );
     }
     daemon
@@ -782,8 +781,7 @@ impl RuntimeDaemon {
                 {
                     warn!(
                         "failed to add Discord working reaction to message {} in channel {}: {error:#}",
-                        message.message_id,
-                        message.channel_id
+                        message.message_id, message.channel_id
                     );
                 }
                 None

@@ -2665,7 +2665,9 @@ mod tests {
         assert!(description.contains("ctx.log_info"));
         assert!(description.contains("legacy globals like `run()`, `log()`, or `notify()`"));
         assert!(description.contains("Rewriting an already active script keeps it active"));
-        assert!(prompt.contains("prefer filesystem_list, filesystem_read_text, and filesystem_search over shell_exec"));
+        assert!(prompt.contains(
+            "prefer filesystem_list, filesystem_read_text, and filesystem_search over shell_exec"
+        ));
         assert!(prompt.contains("prefer `return function(ctx) ... end`"));
         assert!(prompt.contains("avoid legacy globals like `run()`, `log()`, or `notify()`"));
     }
