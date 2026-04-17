@@ -12,7 +12,10 @@ use beaverki_models::{ConversationItem, ModelProvider};
 use beaverki_policy::{
     can_request_automation_approval, can_request_shell_approval, can_spawn_subagents,
 };
-use beaverki_tools::{ToolContext, ToolDefinition, ToolError, ToolOutput, ToolRegistry};
+use beaverki_tools::{
+    ToolContext, ToolDefinition, ToolError, ToolOutput, ToolRegistry,
+    validate_openai_tool_definitions,
+};
 use serde_json::{Value, json};
 use tracing::info;
 
@@ -1432,6 +1435,7 @@ fn tool_definitions(tools: &ToolRegistry) -> Vec<ToolDefinition> {
         input_schema: json!({
             "type": "object",
             "properties": {},
+            "required": [],
             "additionalProperties": false
         }),
     });
@@ -1590,6 +1594,7 @@ Current agent kind: {kind}.
 Current role set: {roles}.
 Use tools when needed, but keep the task focused and auditable.
 Only low-risk read-only shell commands are allowed by default. Medium/high/critical shell commands require user approval.
+For exploring allowed roots and locating files, prefer filesystem_list, filesystem_read_text, and filesystem_search over shell_exec.
 Use Lua tools when recurring or structured automation materially helps. Writing a Lua script triggers safety review. New scripts require explicit activation later, while rewrites of already active scripts stay active if the new version passes safety review. Scheduling requires user approval. When writing Lua, prefer `return function(ctx) ... end`, use BeaverKI host APIs such as `ctx.log_info`, `ctx.notify_user`, `ctx.task_defer`, `ctx.memory_read`, `ctx.memory_write`, and `ctx.tool_call`, and avoid legacy globals like `run()`, `log()`, or `notify()`.
 For file writes, prefer filesystem_write_text. Never claim a denied tool succeeded.
 Use agent_spawn_subagent only for a tightly bounded, materially useful child task. Any sub-agent receives only the explicit task slice you provide.
@@ -1633,6 +1638,7 @@ fn roles_label(role_ids: &[String]) -> String {
 
 const SHELL_REVIEW_INSTRUCTIONS: &str = r#"You are BeaverKI's safety review agent.
 Review the provided shell command for necessity, reversibility, blast radius, and mismatch with the stated objective.
+If the task can be completed with built-in filesystem tools such as filesystem_list, filesystem_read_text, or filesystem_search, reject shell commands that only explore directories or locate files.
 Approve only if the command is a coherent way to achieve the stated task and does not introduce avoidable risk.
 Return only JSON with this exact schema:
 {"verdict":"approved|rejected|needs_changes","risk_level":"low|medium|high|critical","findings":["..."],"required_changes":["..."],"summary":"..."}"#;
@@ -2659,8 +2665,17 @@ mod tests {
         assert!(description.contains("ctx.log_info"));
         assert!(description.contains("legacy globals like `run()`, `log()`, or `notify()`"));
         assert!(description.contains("Rewriting an already active script keeps it active"));
+        assert!(prompt.contains("prefer filesystem_list, filesystem_read_text, and filesystem_search over shell_exec"));
         assert!(prompt.contains("prefer `return function(ctx) ... end`"));
         assert!(prompt.contains("avoid legacy globals like `run()`, `log()`, or `notify()`"));
+    }
+
+    #[test]
+    fn exported_tool_schemas_satisfy_openai_requirements() {
+        let registry = builtin_registry();
+        let definitions = tool_definitions(&registry);
+
+        validate_openai_tool_definitions(&definitions).expect("valid tool schemas");
     }
 
     #[tokio::test]

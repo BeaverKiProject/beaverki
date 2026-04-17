@@ -21,6 +21,69 @@ pub struct ToolDefinition {
     pub input_schema: Value,
 }
 
+pub fn validate_openai_tool_definitions(definitions: &[ToolDefinition]) -> Result<()> {
+    for definition in definitions {
+        validate_openai_schema_node(&definition.input_schema, &definition.name)
+            .with_context(|| format!("tool '{}' has invalid input schema", definition.name))?;
+    }
+    Ok(())
+}
+
+fn validate_openai_schema_node(schema: &Value, path: &str) -> Result<()> {
+    if let Some(properties) = schema.get("properties") {
+        let properties = properties
+            .as_object()
+            .ok_or_else(|| anyhow!("schema path '{}' has non-object properties", path))?;
+        let required = schema
+            .get("required")
+            .and_then(Value::as_array)
+            .ok_or_else(|| anyhow!("schema path '{}' must declare required as an array", path))?;
+        let mut property_keys = properties.keys().cloned().collect::<Vec<_>>();
+        property_keys.sort();
+
+        let mut required_keys = required
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| anyhow!("schema path '{}' has non-string required entry", path))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        required_keys.sort();
+
+        if required_keys != property_keys {
+            bail!(
+                "schema path '{}' must declare required keys {:?}, found {:?}",
+                path,
+                property_keys,
+                required_keys
+            );
+        }
+
+        for (name, child_schema) in properties {
+            validate_openai_schema_node(child_schema, &format!("{}.{}", path, name))?;
+        }
+    }
+
+    if let Some(items) = schema.get("items") {
+        validate_openai_schema_node(items, &format!("{}.items", path))?;
+    }
+
+    for keyword in ["anyOf", "allOf", "oneOf"] {
+        if let Some(variants) = schema.get(keyword) {
+            let variants = variants
+                .as_array()
+                .ok_or_else(|| anyhow!("schema path '{}.{}' must be an array", path, keyword))?;
+            for (index, variant) in variants.iter().enumerate() {
+                validate_openai_schema_node(variant, &format!("{}.{}[{}]", path, keyword, index))?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 pub struct ToolContext {
     pub working_dir: PathBuf,
@@ -138,6 +201,7 @@ impl ToolRegistry {
 pub fn builtin_registry() -> ToolRegistry {
     let mut registry = ToolRegistry::new();
     registry.register(ShellExecTool);
+    registry.register(ListFilesTool);
     registry.register(ReadTextTool);
     registry.register(WriteTextTool);
     registry.register(SearchFilesTool);
@@ -265,6 +329,112 @@ impl Tool for ShellExecTool {
                 "exit_code": output.status.code(),
                 "stdout": truncate_text(&String::from_utf8_lossy(&output.stdout), context.max_output_chars),
                 "stderr": truncate_text(&String::from_utf8_lossy(&output.stderr), context.max_output_chars),
+            }),
+        })
+    }
+}
+
+pub struct ListFilesTool;
+
+#[async_trait]
+impl Tool for ListFilesTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "filesystem_list".to_owned(),
+            description: "List files and directories within the allowed workspace roots for safe discovery without shell commands.".to_owned(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" },
+                    "recursive": { "type": ["boolean", "null"] },
+                    "max_depth": { "type": ["integer", "null"], "minimum": 0, "maximum": 8 }
+                },
+                "required": ["path", "recursive", "max_depth"],
+                "additionalProperties": false
+            }),
+        }
+    }
+
+    async fn call(
+        &self,
+        input: Value,
+        context: &ToolContext,
+    ) -> std::result::Result<ToolOutput, ToolError> {
+        let path = input
+            .get("path")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ToolError::Failed(anyhow!("filesystem_list requires path")))?;
+        let recursive = input
+            .get("recursive")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let max_depth = input
+            .get("max_depth")
+            .and_then(Value::as_u64)
+            .map(|value| value as usize)
+            .unwrap_or(if recursive { 3 } else { 1 });
+        let resolved = resolve_allowed_path(path, context, PathAccess::Read)?;
+        let metadata = fs::metadata(&resolved)
+            .with_context(|| format!("failed to read metadata for '{}'", resolved.display()))
+            .map_err(ToolError::Failed)?;
+
+        if metadata.is_file() {
+            return Ok(ToolOutput {
+                payload: json!({
+                    "path": resolved.display().to_string(),
+                    "kind": "file",
+                    "entries": [json!({
+                        "path": resolved.display().to_string(),
+                        "kind": "file",
+                        "size_bytes": metadata.len(),
+                    })],
+                }),
+            });
+        }
+
+        let walk_depth = if recursive { max_depth } else { 1 };
+        let mut entries = Vec::new();
+
+        for entry in WalkDir::new(&resolved)
+            .follow_links(false)
+            .max_depth(walk_depth)
+            .into_iter()
+            .filter_map(std::result::Result::ok)
+        {
+            if entry.path() == resolved {
+                continue;
+            }
+
+            let metadata = match entry.metadata() {
+                Ok(metadata) => metadata,
+                Err(_) => continue,
+            };
+            let kind = if metadata.is_dir() {
+                "directory"
+            } else if metadata.is_file() {
+                "file"
+            } else {
+                "other"
+            };
+
+            entries.push(json!({
+                "path": entry.path().display().to_string(),
+                "kind": kind,
+                "size_bytes": metadata.is_file().then_some(metadata.len()),
+            }));
+
+            if entries.len() >= 250 {
+                break;
+            }
+        }
+
+        Ok(ToolOutput {
+            payload: json!({
+                "path": resolved.display().to_string(),
+                "kind": "directory",
+                "recursive": recursive,
+                "max_depth": walk_depth,
+                "entries": entries,
             }),
         })
     }
@@ -707,6 +877,13 @@ fn resolve_program(program: &str) -> Option<PathBuf> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn builtin_tool_schemas_satisfy_openai_requirements() {
+        let definitions = builtin_registry().definitions();
+
+        validate_openai_tool_definitions(&definitions).expect("valid tool schemas");
+    }
+
     #[tokio::test]
     async fn rejects_writes_outside_allowed_roots() {
         let tempdir = tempfile::tempdir().expect("tempdir");
@@ -724,6 +901,56 @@ mod tests {
                 }),
                 &context,
             )
+            .await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn filesystem_list_returns_directory_entries() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let root = tempdir.path().join("allowed");
+        fs::create_dir_all(root.join("nested")).expect("root dirs");
+        fs::write(root.join("alpha.txt"), "alpha").expect("alpha");
+        fs::write(root.join("nested").join("beta.txt"), "beta").expect("beta");
+        let context = ToolContext::new(root.clone(), vec![root.clone()]);
+
+        let output = ListFilesTool
+            .call(
+                json!({
+                    "path": ".",
+                    "recursive": true,
+                    "max_depth": 2
+                }),
+                &context,
+            )
+            .await
+            .expect("list output");
+
+        let entries = output.payload["entries"].as_array().expect("entries array");
+        assert!(entries.iter().any(|entry| {
+            entry["path"] == json!(root.join("alpha.txt").display().to_string())
+                && entry["kind"] == json!("file")
+        }));
+        assert!(entries.iter().any(|entry| {
+            entry["path"] == json!(root.join("nested").display().to_string())
+                && entry["kind"] == json!("directory")
+        }));
+        assert!(entries.iter().any(|entry| {
+            entry["path"] == json!(root.join("nested").join("beta.txt").display().to_string())
+                && entry["kind"] == json!("file")
+        }));
+    }
+
+    #[tokio::test]
+    async fn filesystem_list_rejects_outside_allowed_roots() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let allowed = tempdir.path().join("allowed");
+        fs::create_dir_all(&allowed).expect("allowed root");
+        let context = ToolContext::new(allowed.clone(), vec![allowed]);
+
+        let result = ListFilesTool
+            .call(json!({ "path": "../outside" }), &context)
             .await;
 
         assert!(result.is_err());
