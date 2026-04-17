@@ -253,12 +253,52 @@ Exit criteria:
 - guests cannot retrieve household brain/memory
 - semantic memory behavior is auditable end to end
 
-## 3.8 Post-V1
+## 3.8 M4.5 Lua-Defined Tools
+
+Goal:
+
+Add reviewed, activatable Lua-defined agent tools on top of the existing Lua automation runtime without yet introducing unrestricted new file or network host APIs.
+
+Status:
+
+- proposed as the next milestone after M4
+
+Implementation notes:
+
+- user-authored or agent-authored Lua-defined tools should be stored in the runtime database with ownership, review metadata, capability profile, activation state, and audit history
+- skill-packaged or repo-packaged Lua-defined tools should remain filesystem assets and load through the same runtime tool interface as database-backed local tools
+- the first iteration should keep Lua-defined tools constrained to Rust-controlled host APIs and composition of existing built-in tools rather than granting raw `fs.*` or `net.*` primitives
+- every active Lua-defined tool should surface as a normal tool definition to the primary agent, with schemas validated through the same tool-definition contract used for built-in tools
+
+Out of scope:
+
+- unrestricted Lua filesystem or network host APIs
+- signed skill distribution or external trust metadata
+- connector-specific packaging or marketplace installation flows
+- broader policy expressions beyond current RBAC and capability-profile enforcement
+
+Stories:
+
+- `M4.5-001` Add persistent storage for database-backed Lua-defined tools, including source text, ownership, input schema, output schema, capability profile, lifecycle status, and originating task metadata.
+- `M4.5-002` Load active filesystem-packaged and database-backed Lua-defined tools through a shared runtime registration path so the agent can discover and invoke them like built-in tools.
+- `M4.5-003` Execute Lua-defined tools through the reviewed Lua runtime with Rust-controlled host APIs, initially limited to safe composition of existing built-in tools and already-approved Lua host functions.
+- `M4.5-004` Add blocking safety review and activation gating for newly created or modified database-backed Lua-defined tools, preserving actionable review findings and denial states.
+- `M4.5-005` Enforce schema validation, capability-profile checks, ownership rules, and fail-closed behavior when a Lua-defined tool requests disallowed operations.
+- `M4.5-006` Add audit coverage and end-to-end tests for tool registration, invocation, denial paths, review and activation flow, and parity between filesystem-packaged versus database-backed tool loading.
+
+Exit criteria:
+
+- a reviewed active Lua-defined tool can be discovered and invoked by the agent through the normal tool interface
+- user-local Lua-defined tools are database-backed and carry ownership, review, activation, and audit metadata
+- packaged Lua-defined tools can load from disk without being treated as mutable runtime state
+- Lua-defined tools remain constrained to Rust-controlled capabilities and fail closed on disallowed operations
+- schema validation, safety review, and auditability work end to end for both storage modes
+
+## 3.9 Post-V1
 
 Candidate follow-up work:
 
 - Better context management and retrieval optimization (including status for context windows and token usage per user)
-- Lua-defined tools
 - additional model providers
 - WhatsApp and Telegram connectors
 - local web UI

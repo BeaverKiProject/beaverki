@@ -577,6 +577,12 @@ Generated scripts should carry metadata such as:
 - safety review status
 - lifecycle status such as `draft`, `active`, `disabled`, or `blocked`
 
+Storage model:
+
+- user-authored and runtime-managed Lua automations or Lua-defined tools should live in the runtime database with ownership, review, approval, and activation metadata
+- skill-packaged or repo-packaged Lua scripts and Lua tools should live on disk and be treated as installed product assets rather than mutable runtime state
+- import/export between the two may exist later, but the source of truth should remain database rows for user-local artifacts and filesystem assets for packaged artifacts
+
 ## 12. Model Provider Abstraction
 
 The system should not depend on a single LLM vendor.

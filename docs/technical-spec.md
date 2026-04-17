@@ -572,6 +572,8 @@ CREATE TABLE scripts (
 );
 ```
 
+For future Lua-defined tools, the recommended model is to keep user-authored local tools in database-backed tables parallel to `scripts`, rather than storing mutable local tool definitions as loose filesystem files. Filesystem-backed definitions remain appropriate for packaged skills and built-in assets.
+
 #### `script_reviews`
 
 ```sql
@@ -1028,6 +1030,13 @@ tools:
 ```
 
 This allows Lua tools to feel powerful while keeping the trust boundary in the Rust runtime rather than inside Lua itself.
+
+Storage recommendation:
+
+- user-authored or agent-authored Lua-defined tools should be stored in the runtime database alongside their source text, schemas, capability profile, ownership, review state, and activation state
+- skill-packaged or repo-packaged Lua-defined tools should be loaded from the filesystem as installed assets
+- packaged assets and database-managed local artifacts may share the same runtime tool interface, but they should not share the same persistence model
+- import/export between filesystem assets and database-managed tools is optional, but runtime-owned mutable artifacts should not depend on ad hoc files as their primary source of truth
 
 ### 14.4 Capability-Gated File and Network Access
 
