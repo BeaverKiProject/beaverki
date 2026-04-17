@@ -101,20 +101,11 @@ impl Default for IntegrationsConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
+#[derive(Default)]
 pub struct BrowserConfig {
     pub interactive_launcher: Option<String>,
     pub headless_browser: Option<String>,
     pub headless_args: Vec<String>,
-}
-
-impl Default for BrowserConfig {
-    fn default() -> Self {
-        Self {
-            interactive_launcher: None,
-            headless_browser: None,
-            headless_args: Vec::new(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
