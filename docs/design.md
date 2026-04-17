@@ -35,6 +35,7 @@ The following product-shaping decisions are now assumed for v1:
 - V1 may rely on RBAC and strict tool restrictions rather than requiring a full OS-level sandbox layer from day one.
 - The first provider implementation should be OpenAI, exposed through a setup-assistant provider selection flow with API-token authentication and an optional Codex-style authenticated account flow when OpenAI is chosen.
 - Per-user memory and household memory should be separate first-class scopes.
+- Agents should be able to create deferred reminders or notifications for other mapped household users, with explicit recipient identity, delivery timing, and policy-gated connector or local delivery.
 - Canonical operational memory should be stored in SQLite, while YAML and Markdown remain useful for configuration, manifests, journals, and exports.
 - Sub-agents should receive only a minimal task slice prepared by the parent agent.
 
@@ -98,6 +99,7 @@ Autonomy is useful only if it is bounded. The system should support background o
 - Browser operator: log into services, collect data, submit forms, and perform repetitive web tasks.
 - Home-lab/VPS steward: monitor services, rotate logs, run health checks, and notify on incidents.
 - Shared family assistant: maintain separate user profiles, permissions, reminders, and message-triggered workflows for different household members.
+- Household coordination assistant: understand requests like "remind my girlfriend to buy kiwis when she goes to the shop this afternoon", turn them into a scheduled follow-up, and deliver the message to the intended household member through their mapped channel.
 
 ## 6. System Overview
 
@@ -227,6 +229,14 @@ Because one runtime serves multiple people, task execution must carry a clear in
 - the approval rules that apply to actions taken on their behalf
 
 This identity context must propagate through sub-agent spawning, scheduled jobs, and deferred tasks so the runtime can answer, at any point, who asked for something and under what authority it is continuing.
+
+For cross-user reminder and notification flows, the runtime must also distinguish between:
+
+- the requesting user on whose behalf the reminder was created
+- the target household user who should receive the delivery
+- the connector identity or local delivery channel used for the eventual notification
+
+That recipient metadata must remain attached to the deferred work item so a restart or agent handoff does not lose who should be notified.
 
 ## 8. Memory and State Model
 
@@ -532,6 +542,7 @@ Host API examples:
 - `log.info(message)`
 - `task.defer(duration)`
 - `user.notify(message)`
+- `user.notify_target(user_id, message, options)`
 
 ### 11.4 Script Safety
 
@@ -576,6 +587,15 @@ Generated scripts should carry metadata such as:
 - approval history
 - safety review status
 - lifecycle status such as `draft`, `active`, `disabled`, or `blocked`
+
+The same automation foundation should support one-shot deferred reminders, not only recurring jobs. An agent should be able to translate a natural-language request into structured reminder state including:
+
+- requesting user
+- target delivery user
+- reminder payload
+- intended delivery window or trigger
+- preferred delivery channel or fallback policy
+- completion and deduplication state
 
 Storage model:
 
@@ -780,6 +800,7 @@ Messaging connectors should support:
 - attaching task context
 - restricting available commands by user role
 - delivering deferred follow-up replies for long-running tasks
+- delivering targeted reminders to a different mapped household user when policy allows
 
 Message-originated tasks must carry an authenticated identity and permission scope.
 
@@ -791,6 +812,8 @@ Because messaging is a primary control surface, connectors should also support:
 - safe rendering of approval prompts and command results
 
 When a message-originated task outlives the connector's synchronous response window, the runtime should preserve enough connector metadata to send later task updates without reconstructing the request from logs or in-memory state. This follow-up mechanism should deduplicate per connector and task state transition so a restart or retry does not produce repeated remote replies.
+
+The same delivery path should support targeted household notifications where the requester and recipient are different users. In that case the runtime should persist the resolved recipient user ID, preferred connector identity, fallback delivery options, and the policy decision that allowed the cross-user delivery.
 
 ## 16. Observability and Auditability
 

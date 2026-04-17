@@ -294,7 +294,42 @@ Exit criteria:
 - Lua-defined tools remain constrained to Rust-controlled capabilities and fail closed on disallowed operations
 - schema validation, safety review, and auditability work end to end for both storage modes
 
-## 3.9 Post-V1
+## 3.9 M5 Household Delivery And Reminders
+
+Goal:
+
+Add first-class targeted household reminders and notifications so one user's agent can understand a request, schedule the follow-up work, and deliver it to another mapped household user through the right channel.
+
+Status:
+
+- proposed after M4.5
+
+Implementation notes:
+
+- reminder creation should capture both the requesting user and the intended recipient user as distinct identities
+- natural-language requests such as "remind my girlfriend to buy kiwis when she goes to the shop this afternoon" should be normalized into structured reminder state with message, timing window, and delivery policy
+- one-shot deferred reminders should reuse the durable scheduling and wake-up machinery rather than introducing a separate best-effort timer path
+- delivery should be connector-agnostic, using the recipient's mapped connector identity or configured local fallback channel
+- cross-user delivery must remain policy-gated and auditable so BeaverKI can explain who asked for the reminder, who received it, and why the delivery was allowed
+- reminders should deduplicate delivery across restart and retry paths so a missed wake-up replay does not spam the recipient
+
+Stories:
+
+- `M5-001` Add persistent reminder records that distinguish requester identity, recipient user, payload, delivery target, timing metadata, and lifecycle state.
+- `M5-002` Implement agent-facing reminder creation flows that can turn natural-language household coordination requests into structured deferred delivery work.
+- `M5-003` Extend the scheduler and wake-up pipeline to materialize one-shot reminder deliveries in addition to recurring Lua schedules.
+- `M5-004` Add connector-agnostic targeted delivery routing that resolves the recipient's preferred mapped identity and fallback channel at send time.
+- `M5-005` Enforce RBAC and policy checks for cross-user reminder creation and delivery, including denial cases for untrusted roles or unmapped recipients.
+- `M5-006` Add audit coverage and end-to-end tests for reminder creation, restart-safe delivery, deduplication, and recipient-versus-requester attribution.
+
+Exit criteria:
+
+- an agent can create a deferred reminder addressed to another mapped household user
+- the reminder survives restart and is delivered once through the selected connector or fallback path
+- cross-user reminder delivery is policy-gated and fully auditable
+- natural-language reminder requests are normalized into structured scheduled work rather than handled as ad hoc connector replies
+
+## 3.10 Post-V1
 
 Candidate follow-up work:
 
