@@ -10,7 +10,7 @@ use beaverki_policy::visible_memory_scopes;
 use beaverki_tools::{ToolContext, builtin_registry};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use cron::Schedule;
-use mlua::{Function, Lua, LuaSerdeExt, Value as LuaValue};
+use mlua::{Lua, LuaSerdeExt, Value as LuaValue};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -180,9 +180,7 @@ pub async fn execute_lua_script(input: LuaExecutionInput) -> Result<LuaExecution
     globals
         .set("loadfile", LuaValue::Nil)
         .map_err(lua_to_anyhow)?;
-    globals
-        .set("debug", LuaValue::Nil)
-        .map_err(lua_to_anyhow)?;
+    globals.set("debug", LuaValue::Nil).map_err(lua_to_anyhow)?;
 
     let ctx = lua.create_table().map_err(lua_to_anyhow)?;
 
@@ -225,11 +223,7 @@ pub async fn execute_lua_script(input: LuaExecutionInput) -> Result<LuaExecution
                 lua.to_value(&payload)
             })
             .map_err(lua_to_anyhow)?;
-        ctx.set(
-            "memory_read",
-            function,
-        )
-        .map_err(lua_to_anyhow)?;
+        ctx.set("memory_read", function).map_err(lua_to_anyhow)?;
     }
 
     {
@@ -242,7 +236,9 @@ pub async fn execute_lua_script(input: LuaExecutionInput) -> Result<LuaExecution
                 let content_text = payload
                     .get("content_text")
                     .and_then(Value::as_str)
-                    .ok_or_else(|| mlua::Error::external(anyhow!("memory_write requires content_text")))?;
+                    .ok_or_else(|| {
+                        mlua::Error::external(anyhow!("memory_write requires content_text"))
+                    })?;
                 let scope = payload
                     .get("scope")
                     .and_then(Value::as_str)
@@ -278,11 +274,7 @@ pub async fn execute_lua_script(input: LuaExecutionInput) -> Result<LuaExecution
                 .map_err(mlua::Error::external)
             })
             .map_err(lua_to_anyhow)?;
-        ctx.set(
-            "memory_write",
-            function,
-        )
-        .map_err(lua_to_anyhow)?;
+        ctx.set("memory_write", function).map_err(lua_to_anyhow)?;
     }
 
     {
@@ -305,25 +297,21 @@ pub async fn execute_lua_script(input: LuaExecutionInput) -> Result<LuaExecution
                 let args_json: Value = lua.from_value(args).map_err(mlua::Error::external)?;
                 let mut tool_context = ToolContext::new(working_dir.clone(), tool_roots.clone());
                 tool_context.max_output_chars = 12_000;
-                tool_context.browser_interactive_launcher =
-                    browser_interactive_launcher.clone();
+                tool_context.browser_interactive_launcher = browser_interactive_launcher.clone();
                 tool_context.browser_headless_program = browser_headless_program.clone();
                 tool_context.browser_headless_args = browser_headless_args.clone();
                 let registry = builtin_registry();
                 let handle = tokio::runtime::Handle::current();
                 let output = tokio::task::block_in_place(|| {
-                    handle
-                        .block_on(async move { registry.invoke(&name, args_json, &tool_context).await })
+                    handle.block_on(async move {
+                        registry.invoke(&name, args_json, &tool_context).await
+                    })
                 })
                 .map_err(|error| mlua::Error::external(anyhow!(error.as_json().to_string())))?;
                 lua.to_value(&output.payload)
             })
             .map_err(lua_to_anyhow)?;
-        ctx.set(
-            "tool_call",
-            function,
-        )
-        .map_err(lua_to_anyhow)?;
+        ctx.set("tool_call", function).map_err(lua_to_anyhow)?;
     }
 
     {
@@ -336,11 +324,7 @@ pub async fn execute_lua_script(input: LuaExecutionInput) -> Result<LuaExecution
                 Ok(())
             })
             .map_err(lua_to_anyhow)?;
-        ctx.set(
-            "log_info",
-            function,
-        )
-        .map_err(lua_to_anyhow)?;
+        ctx.set("log_info", function).map_err(lua_to_anyhow)?;
     }
 
     {
@@ -354,11 +338,7 @@ pub async fn execute_lua_script(input: LuaExecutionInput) -> Result<LuaExecution
                 Ok(())
             })
             .map_err(lua_to_anyhow)?;
-        ctx.set(
-            "notify_user",
-            function,
-        )
-        .map_err(lua_to_anyhow)?;
+        ctx.set("notify_user", function).map_err(lua_to_anyhow)?;
     }
 
     {
@@ -371,26 +351,24 @@ pub async fn execute_lua_script(input: LuaExecutionInput) -> Result<LuaExecution
                     )));
                 }
                 let wake_at = (Utc::now() + ChronoDuration::seconds(seconds)).to_rfc3339();
-                *deferred_until
-                    .lock()
-                    .map_err(|_| mlua::Error::external(anyhow!("failed to lock deferred state")))? =
-                    Some(wake_at.clone());
+                *deferred_until.lock().map_err(|_| {
+                    mlua::Error::external(anyhow!("failed to lock deferred state"))
+                })? = Some(wake_at.clone());
                 Ok(wake_at)
             })
             .map_err(lua_to_anyhow)?;
-        ctx.set(
-            "task_defer",
-            function,
-        )
-        .map_err(lua_to_anyhow)?;
+        ctx.set("task_defer", function).map_err(lua_to_anyhow)?;
     }
 
     globals.set("ctx", ctx.clone()).map_err(lua_to_anyhow)?;
-    let entry: Function = lua
+    let entry = lua
         .load(&input.source_text)
-        .eval()
-        .map_err(|error| anyhow!("Lua script must return a function: {error}"))?;
-    let value = entry.call::<LuaValue>(ctx).map_err(lua_to_anyhow)?;
+        .eval::<LuaValue>()
+        .map_err(|error| anyhow!("failed to evaluate Lua script: {error}"))?;
+    let value = match entry {
+        LuaValue::Function(function) => function.call::<LuaValue>(ctx).map_err(lua_to_anyhow)?,
+        other => other,
+    };
     let result_text = match value {
         LuaValue::Nil => "Lua script completed without returning a value.".to_owned(),
         LuaValue::String(text) => text.to_str().map_err(lua_to_anyhow)?.to_owned(),

@@ -4,8 +4,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
-use beaverki_automation as automation;
 use beaverki_agent::{AgentMemoryMode, AgentRequest, AgentResult, PrimaryAgentRunner};
+use beaverki_automation as automation;
 use beaverki_config::{LoadedConfig, SecretStore};
 use beaverki_core::{MemoryScope, TaskState, now_rfc3339};
 use beaverki_db::{
@@ -316,7 +316,8 @@ impl Runtime {
                 intended_behavior_summary,
             )
             .await?;
-        self.inspect_script(Some(&user.user_id), &script.script_id).await
+        self.inspect_script(Some(&user.user_id), &script.script_id)
+            .await
     }
 
     pub async fn review_lua_script(
@@ -343,7 +344,11 @@ impl Runtime {
             intended_behavior_summary,
         )
         .await?;
-        let next_status = if review.approved() { None } else { Some("blocked") };
+        let next_status = if review.approved() {
+            None
+        } else {
+            Some("blocked")
+        };
         self.db
             .update_script_safety(
                 &script.script_id,
@@ -417,7 +422,11 @@ impl Runtime {
         })
     }
 
-    pub async fn activate_script(&self, user_id: Option<&str>, script_id: &str) -> Result<ScriptRow> {
+    pub async fn activate_script(
+        &self,
+        user_id: Option<&str>,
+        script_id: &str,
+    ) -> Result<ScriptRow> {
         let user = self.resolve_user(user_id).await?;
         let script = self
             .db
@@ -447,7 +456,11 @@ impl Runtime {
             .ok_or_else(|| anyhow!("script '{}' disappeared after activation", script.script_id))
     }
 
-    pub async fn disable_script(&self, user_id: Option<&str>, script_id: &str) -> Result<ScriptRow> {
+    pub async fn disable_script(
+        &self,
+        user_id: Option<&str>,
+        script_id: &str,
+    ) -> Result<ScriptRow> {
         let user = self.resolve_user(user_id).await?;
         let script = self
             .db
@@ -486,7 +499,10 @@ impl Runtime {
             .await?
             .ok_or_else(|| anyhow!("script '{script_id}' not found"))?;
         if script.status != "active" {
-            bail!("script '{}' must be active before scheduling", script.script_id);
+            bail!(
+                "script '{}' must be active before scheduling",
+                script.script_id
+            );
         }
         let next_run_at = automation::next_run_after(cron_expr, &now_rfc3339())?;
         let schedule = self
@@ -565,7 +581,12 @@ impl Runtime {
         self.db
             .fetch_schedule_for_owner(&user.user_id, &schedule.schedule_id)
             .await?
-            .ok_or_else(|| anyhow!("schedule '{}' disappeared after update", schedule.schedule_id))
+            .ok_or_else(|| {
+                anyhow!(
+                    "schedule '{}' disappeared after update",
+                    schedule.schedule_id
+                )
+            })
     }
 
     pub async fn materialize_due_schedules(&self) -> Result<Vec<TaskRow>> {
@@ -580,7 +601,9 @@ impl Runtime {
                 continue;
             }
             let next_run_at = automation::next_run_after(&schedule.cron_expr, &now)?;
-            let primary_agent_id = self.primary_agent_id_for_owner(&schedule.owner_user_id).await?;
+            let primary_agent_id = self
+                .primary_agent_id_for_owner(&schedule.owner_user_id)
+                .await?;
             let initiating_identity_id = format!("schedule:{}", schedule.schedule_id);
             let objective = format!("Run Lua automation {}", script.script_id);
             let task_context = json!({
@@ -677,12 +700,7 @@ impl Runtime {
                 .browser
                 .interactive_launcher
                 .clone(),
-            browser_headless_program: self
-                .config
-                .integrations
-                .browser
-                .headless_browser
-                .clone(),
+            browser_headless_program: self.config.integrations.browser.headless_browser.clone(),
             browser_headless_args: self.config.integrations.browser.headless_args.clone(),
         })
         .await?;
@@ -988,10 +1006,12 @@ impl Runtime {
             .into_iter()
             .filter(|approval| approval.action_type != "shell_command")
             .filter_map(|approval| {
-                approval.target_ref.map(|target_ref| beaverki_agent::ApprovedAutomationAction {
-                    action_type: approval.action_type,
-                    target_ref,
-                })
+                approval
+                    .target_ref
+                    .map(|target_ref| beaverki_agent::ApprovedAutomationAction {
+                        action_type: approval.action_type,
+                        target_ref,
+                    })
             })
             .collect::<Vec<_>>();
 
@@ -2195,10 +2215,77 @@ end"#,
             .inspect_task(None, &result.task.task_id)
             .await
             .expect("inspection");
-        assert!(inspection
-            .events
-            .iter()
-            .any(|event| event.event_type == "lua_log"));
+        assert!(
+            inspection
+                .events
+                .iter()
+                .any(|event| event.event_type == "lua_log")
+        );
+    }
+
+    #[tokio::test]
+    async fn scheduled_lua_script_can_run_top_level_chunk() {
+        let (_tempdir, runtime) = test_runtime(vec![ModelTurnResponse {
+            output_items: vec![json!({
+                "type": "message",
+                "content": [{
+                    "type": "output_text",
+                    "text": "{\"verdict\":\"approved\",\"risk_level\":\"low\",\"findings\":[],\"required_changes\":[],\"summary\":\"The Lua automation matches the stated intent.\"}"
+                }]
+            })],
+            tool_calls: vec![],
+            output_text: "{\"verdict\":\"approved\",\"risk_level\":\"low\",\"findings\":[],\"required_changes\":[],\"summary\":\"The Lua automation matches the stated intent.\"}".to_owned(),
+        }])
+        .await;
+        let db = runtime.db.clone();
+        let script = runtime
+            .create_lua_script(
+                None,
+                Some("script_schedule_top_level"),
+                r#"ctx.log_info("top level lua ran")
+return "top level ok""#,
+                json!({}),
+                None,
+                "Return a confirmation string for the schedule test.",
+            )
+            .await
+            .expect("create script")
+            .script;
+        runtime
+            .activate_script(None, &script.script_id)
+            .await
+            .expect("activate script");
+        db.create_schedule(NewSchedule {
+            schedule_id: Some("sched_schedule_top_level"),
+            owner_user_id: &script.owner_user_id,
+            target_type: "lua_script",
+            target_id: &script.script_id,
+            cron_expr: "0/1 * * * * * *",
+            enabled: true,
+            next_run_at: &now_rfc3339(),
+        })
+        .await
+        .expect("create schedule");
+
+        let result = runtime
+            .execute_next_runnable_task()
+            .await
+            .expect("execute next")
+            .expect("task");
+        assert_eq!(result.task.kind, "scheduled_lua");
+        assert_eq!(result.task.state, TaskState::Completed.as_str());
+        assert_eq!(result.task.result_text.as_deref(), Some("top level ok"));
+
+        let inspection = runtime
+            .inspect_task(None, &result.task.task_id)
+            .await
+            .expect("inspection");
+        assert!(
+            inspection
+                .events
+                .iter()
+                .any(|event| event.event_type == "lua_log")
+        );
     }
 
     #[tokio::test]
@@ -2331,7 +2418,9 @@ end"#,
             .as_deref()
             .expect("context summary");
         assert!(context.contains("Conversation history is shared across this BeaverKI user"));
-        assert!(context.contains("[Discord channel | channel channel-1] User (Torlenor): First channel message"));
+        assert!(context.contains(
+            "[Discord channel | channel channel-1] User (Torlenor): First channel message"
+        ));
         assert!(context.contains("[Discord channel | channel channel-1] Assistant: channel reply"));
 
         client.shutdown().await.expect("shutdown request");
