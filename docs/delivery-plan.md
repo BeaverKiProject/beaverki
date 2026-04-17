@@ -198,11 +198,18 @@ Stories:
 - `M3-006` Implement schedule persistence and recurring execution.
 - `M3-007` Implement CLI flows for creating, reviewing, and enabling automations.
 - `M3-008` Add audit and replay coverage for script creation and execution.
+- `M3-009` Implement first-class semantic memory promotion so a primary agent can decide that stable facts should be remembered and persist them into the requesting user's durable private brain/memory by default.
+- `M3-010` Add role-aware household semantic memory writes so higher-trust users can promote shared facts into household brain/memory, with explicit policy enforcement for who may write and who may later retrieve that scope.
+- `M3-011` Distinguish semantic memory from episodic task summaries by adding memory classification, deduplication, correction, and source attribution for user facts such as names, preferences, identities, and durable household facts.
+- `M3-012` Add audit coverage and end-to-end tests for agent-driven remembering, private-versus-household promotion, correction flows, and denial cases proving that guests cannot retrieve household brain/memory.
 
 Exit criteria:
 
 - agent-authored Lua scripts can be reviewed, stored, activated, and scheduled
 - shell review path is functioning for risky commands
+- the primary agent can automatically persist durable user facts into per-user private brain/memory when they should be remembered
+- higher-trust household users can store shared durable facts into household brain/memory under policy control
+- guests cannot retrieve household brain/memory
 - automation behavior is auditable end to end
 
 ## 3.7 Post-V1
