@@ -5,17 +5,14 @@ use anyhow::{Context, Result, anyhow};
 use beaverki_automation as automation;
 use beaverki_core::{MemoryScope, ShellRisk, TaskState, ToolInvocationStatus};
 use beaverki_db::{
-    Database, NewSchedule, NewScript, NewScriptReview, NewTask, TaskRow, UpdateScript,
+    Database, NewApproval, NewSchedule, NewScript, NewScriptReview, NewTask, TaskRow, UpdateScript,
 };
 use beaverki_memory::{MemoryStore, RetrievalScope};
 use beaverki_models::{ConversationItem, ModelProvider};
 use beaverki_policy::{
     can_request_automation_approval, can_request_shell_approval, can_spawn_subagents,
 };
-use beaverki_tools::{
-    ToolContext, ToolDefinition, ToolError, ToolOutput, ToolRegistry,
-    validate_openai_tool_definitions,
-};
+use beaverki_tools::{ToolContext, ToolDefinition, ToolError, ToolOutput, ToolRegistry};
 use serde_json::{Value, json};
 use tracing::info;
 
@@ -510,16 +507,21 @@ impl PrimaryAgentRunner {
                     risk.as_str(),
                     review.summary
                 );
+                let action_summary = format!("Run shell command '{command}'");
                 let approval = self
                     .db
-                    .create_approval(
-                        &task.task_id,
-                        "shell_command",
-                        Some(command),
-                        &request.assigned_agent_id,
-                        &request.owner_user_id,
-                        &rationale,
-                    )
+                    .create_approval(NewApproval {
+                        task_id: &task.task_id,
+                        action_type: "shell_command",
+                        target_ref: Some(command),
+                        requested_by_agent_id: &request.assigned_agent_id,
+                        requested_from_user_id: &request.owner_user_id,
+                        rationale_text: &rationale,
+                        risk_level: Some(risk.as_str()),
+                        action_summary: Some(&action_summary),
+                        requester_display_name: Some(&request.assigned_agent_id),
+                        target_details: Some(command),
+                    })
                     .await?;
                 let message = format!(
                     "Approval required to run shell command: {} (risk: {}). Approval ID: {}",
@@ -594,16 +596,21 @@ impl PrimaryAgentRunner {
             && let Some(rationale) = detail.get("rationale").and_then(Value::as_str)
         {
             if can_request_automation_approval(&request.role_ids) {
+                let action_summary = format!("Approve {} for {}", action_type, target_ref);
                 let approval = self
                     .db
-                    .create_approval(
-                        &task.task_id,
+                    .create_approval(NewApproval {
+                        task_id: &task.task_id,
                         action_type,
-                        Some(target_ref),
-                        &request.assigned_agent_id,
-                        &request.owner_user_id,
-                        rationale,
-                    )
+                        target_ref: Some(target_ref),
+                        requested_by_agent_id: &request.assigned_agent_id,
+                        requested_from_user_id: &request.owner_user_id,
+                        rationale_text: rationale,
+                        risk_level: Some("high"),
+                        action_summary: Some(&action_summary),
+                        requester_display_name: Some(&request.assigned_agent_id),
+                        target_details: Some(target_ref),
+                    })
                     .await?;
                 let message = format!(
                     "Approval required for {}: {}. Approval ID: {}",
@@ -1655,7 +1662,7 @@ mod tests {
     use beaverki_db::Database;
     use beaverki_models::ModelTurnResponse;
     use beaverki_policy::visible_memory_scopes;
-    use beaverki_tools::builtin_registry;
+    use beaverki_tools::{builtin_registry, validate_openai_tool_definitions};
     use serde_json::json;
 
     use super::*;

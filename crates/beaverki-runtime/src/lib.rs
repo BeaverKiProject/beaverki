@@ -9,14 +9,16 @@ use beaverki_automation as automation;
 use beaverki_config::{LoadedConfig, SecretStore};
 use beaverki_core::{MemoryScope, TaskState, now_rfc3339};
 use beaverki_db::{
-    ApprovalRow, BootstrapState, ConnectorIdentityRow, Database, NewSchedule, NewScript,
-    NewScriptReview, NewTask, RoleRow, RuntimeHeartbeatRow, RuntimeSessionRow, ScheduleRow,
-    ScriptReviewRow, ScriptRow, TaskEventRow, TaskRow, ToolInvocationRow, UserRoleRow, UserRow,
+    ApprovalActionRow, ApprovalActionSet, ApprovalRow, BootstrapState, ConnectorIdentityRow,
+    Database, IssueApprovalActions, NewSchedule, NewScript, NewScriptReview, NewTask, RoleRow,
+    RuntimeHeartbeatRow, RuntimeSessionRow, ScheduleRow, ScriptReviewRow, ScriptRow, TaskEventRow,
+    TaskRow, ToolInvocationRow, UserRoleRow, UserRow,
 };
 use beaverki_memory::MemoryStore;
 use beaverki_models::{ModelProvider, OpenAiProvider};
 use beaverki_policy::{can_grant_approvals, visible_memory_scopes};
 use beaverki_tools::{ToolContext, builtin_registry};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -44,6 +46,23 @@ pub struct ScriptInspection {
     pub script: ScriptRow,
     pub reviews: Vec<ScriptReviewRow>,
     pub schedules: Vec<ScheduleRow>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum RemoteApprovalActionOutcome {
+    Inspection {
+        action: ApprovalActionRow,
+        approval: ApprovalRow,
+    },
+    StepUpRequired {
+        action: ApprovalActionRow,
+        approval: ApprovalRow,
+        confirm_action: ApprovalActionRow,
+    },
+    Resolved {
+        action: ApprovalActionRow,
+        task: TaskRow,
+    },
 }
 
 pub struct Runtime {
@@ -893,6 +912,178 @@ impl Runtime {
         Ok(result.task)
     }
 
+    pub async fn issue_approval_actions(
+        &self,
+        user_id: Option<&str>,
+        approval_id: &str,
+        connector_type: Option<&str>,
+        connector_identity_id: Option<&str>,
+        channel: Option<&str>,
+        ttl_secs: i64,
+        include_confirm: bool,
+    ) -> Result<ApprovalActionSet> {
+        let user = self.resolve_user(user_id).await?;
+        let approval = self
+            .db
+            .fetch_approval_for_user(&user.user_id, approval_id)
+            .await?
+            .ok_or_else(|| anyhow!("approval '{approval_id}' not found"))?;
+        if approval.status != "pending" {
+            bail!(
+                "approval '{}' is already {}",
+                approval.approval_id,
+                approval.status
+            );
+        }
+
+        self.db
+            .issue_approval_action_set(
+                &approval.approval_id,
+                IssueApprovalActions {
+                    connector_type,
+                    connector_identity_id,
+                    channel,
+                    ttl_secs,
+                    include_confirm,
+                },
+            )
+            .await
+    }
+
+    pub async fn resolve_approval_action(
+        &self,
+        approver_user_id: Option<&str>,
+        action_token: &str,
+        requested_action_kind: &str,
+        connector_type: Option<&str>,
+        connector_identity_id: Option<&str>,
+        channel_id: Option<&str>,
+        confirmation_ttl_secs: i64,
+    ) -> Result<RemoteApprovalActionOutcome> {
+        let approver = self.resolve_user(approver_user_id).await?;
+        let approver_roles = self.user_role_ids(&approver.user_id).await?;
+        if !can_grant_approvals(&approver_roles) {
+            bail!(
+                "user '{}' is not allowed to grant approvals",
+                approver.user_id
+            );
+        }
+
+        let action = self
+            .db
+            .fetch_approval_action_by_token(action_token)
+            .await?
+            .ok_or_else(|| anyhow!("approval action token not found"))?;
+        if action.status != "pending" {
+            bail!(
+                "approval action '{}' is already {}",
+                action.action_id,
+                action.status
+            );
+        }
+        if action.action_kind != requested_action_kind {
+            bail!(
+                "approval action token is for '{}' not '{}'",
+                action.action_kind,
+                requested_action_kind
+            );
+        }
+        if let Some(expected_connector_type) = action.issued_to_connector_type.as_deref()
+            && Some(expected_connector_type) != connector_type
+        {
+            bail!("approval action token is not valid for this connector");
+        }
+        if let Some(expected_identity_id) = action.issued_to_connector_identity_id.as_deref()
+            && Some(expected_identity_id) != connector_identity_id
+        {
+            bail!("approval action token is not valid for this mapped identity");
+        }
+        if let Some(expected_channel_id) = action.issued_to_channel.as_deref()
+            && Some(expected_channel_id) != channel_id
+        {
+            bail!("approval action token is not valid in this channel");
+        }
+        if approval_action_is_expired(&action) {
+            self.db.expire_approval_action(&action.action_id).await?;
+            bail!("approval action token has expired");
+        }
+
+        let approval = self
+            .db
+            .fetch_approval_for_user(&approver.user_id, &action.approval_id)
+            .await?
+            .ok_or_else(|| anyhow!("approval '{}' not found", action.approval_id))?;
+        if approval.status != "pending" {
+            bail!(
+                "approval '{}' is already {}",
+                approval.approval_id,
+                approval.status
+            );
+        }
+
+        let consumed = self
+            .db
+            .consume_approval_action(action_token)
+            .await?
+            .ok_or_else(|| anyhow!("approval action token is expired or already used"))?;
+
+        match consumed.action_kind.as_str() {
+            "inspect" => Ok(RemoteApprovalActionOutcome::Inspection {
+                action: consumed,
+                approval,
+            }),
+            "deny" => {
+                let task = self
+                    .resolve_approval(Some(&approver.user_id), &approval.approval_id, false)
+                    .await?;
+                Ok(RemoteApprovalActionOutcome::Resolved {
+                    action: consumed,
+                    task,
+                })
+            }
+            "approve" => {
+                if approval.risk_level.as_deref() == Some("critical") {
+                    self.db
+                        .supersede_pending_approval_actions(&approval.approval_id)
+                        .await?;
+                    let confirm_action = self
+                        .db
+                        .issue_approval_action(
+                            &approval.approval_id,
+                            "confirm",
+                            connector_type,
+                            connector_identity_id,
+                            channel_id,
+                            confirmation_ttl_secs,
+                        )
+                        .await?;
+                    return Ok(RemoteApprovalActionOutcome::StepUpRequired {
+                        action: consumed,
+                        approval,
+                        confirm_action,
+                    });
+                }
+                let task = self
+                    .resolve_approval(Some(&approver.user_id), &approval.approval_id, true)
+                    .await?;
+                Ok(RemoteApprovalActionOutcome::Resolved {
+                    action: consumed,
+                    task,
+                })
+            }
+            "confirm" => {
+                let task = self
+                    .resolve_approval(Some(&approver.user_id), &approval.approval_id, true)
+                    .await?;
+                Ok(RemoteApprovalActionOutcome::Resolved {
+                    action: consumed,
+                    task,
+                })
+            }
+            other => bail!("unsupported approval action kind '{other}'"),
+        }
+    }
+
     pub async fn upsert_connector_identity(
         &self,
         connector_type: &str,
@@ -1061,6 +1252,12 @@ impl Runtime {
         }
         allowed_roots
     }
+}
+
+fn approval_action_is_expired(action: &ApprovalActionRow) -> bool {
+    DateTime::parse_from_rfc3339(&action.expires_at)
+        .map(|expires_at| expires_at.with_timezone(&Utc) <= Utc::now())
+        .unwrap_or(false)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2076,6 +2273,30 @@ mod tests {
         }
     }
 
+    fn extract_token_for_command(reply: &str, command: &str) -> String {
+        reply
+            .lines()
+            .find_map(|line| {
+                if line
+                    .to_ascii_lowercase()
+                    .starts_with(&format!("{command}:"))
+                {
+                    line.split_whitespace()
+                        .find(|word| word.starts_with("approval_token_"))
+                        .map(ToOwned::to_owned)
+                } else {
+                    None
+                }
+            })
+            .or_else(|| {
+                reply
+                    .split_whitespace()
+                    .find(|word| word.starts_with("approval_token_"))
+                    .map(ToOwned::to_owned)
+            })
+            .unwrap_or_else(|| panic!("missing token for command '{command}' in reply: {reply}"))
+    }
+
     #[tokio::test]
     async fn daemon_records_session_start_and_stop() {
         let (_tempdir, runtime) = test_runtime(vec![]).await;
@@ -2464,7 +2685,7 @@ return "top level ok""#,
     }
 
     #[tokio::test]
-    async fn discord_approval_message_resolves_pending_task() {
+    async fn discord_tokenized_approval_message_resolves_pending_task() {
         let (_tempdir, runtime) = test_runtime(vec![
             ModelTurnResponse {
                 output_items: vec![json!({
@@ -2547,13 +2768,9 @@ return "top level ok""#,
             .expect("connector message");
 
         assert!(pending_reply.accepted);
-        assert!(
-            pending_reply
-                .reply
-                .as_deref()
-                .expect("reply")
-                .contains("waiting for approval")
-        );
+        let pending_reply_text = pending_reply.reply.as_deref().expect("reply");
+        assert!(pending_reply_text.contains("Approval required"));
+        let approve_token = extract_token_for_command(pending_reply_text, "Approve");
 
         let approval = db
             .list_approvals_for_user("user_alex", Some("pending"))
@@ -2570,7 +2787,7 @@ return "top level ok""#,
                 external_display_name: Some("Torlenor".to_owned()),
                 channel_id: "dm-1".to_owned(),
                 message_id: "msg-approval-2".to_owned(),
-                content: format!("approve {}", approval.approval_id),
+                content: format!("approve {approve_token}"),
                 is_direct_message: true,
             })
             .await
@@ -2591,6 +2808,497 @@ return "top level ok""#,
             .expect("task fetch")
             .expect("task");
         assert_eq!(completed_task.state, TaskState::Completed.as_str());
+
+        client.shutdown().await.expect("shutdown request");
+        handle.await.expect("join").expect("daemon result");
+    }
+
+    #[tokio::test]
+    async fn discord_approval_from_channel_redirects_to_dm_and_dm_inbox_resolves() {
+        let (_tempdir, mut runtime) = test_runtime(vec![
+            ModelTurnResponse {
+                output_items: vec![json!({
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "shell_exec",
+                    "arguments": "{\"command\":\"mkdir approved-dir\"}"
+                })],
+                tool_calls: vec![beaverki_models::ModelToolCall {
+                    call_id: "call_1".to_owned(),
+                    name: "shell_exec".to_owned(),
+                    arguments: json!({ "command": "mkdir approved-dir" }),
+                }],
+                output_text: String::new(),
+            },
+            ModelTurnResponse {
+                output_items: vec![json!({
+                    "type": "message",
+                    "content": [{
+                        "type": "output_text",
+                        "text": "{\"verdict\":\"approved\",\"risk_level\":\"high\",\"findings\":[],\"required_changes\":[],\"summary\":\"The command matches the task and is acceptable with explicit approval.\"}"
+                    }]
+                })],
+                tool_calls: vec![],
+                output_text: "{\"verdict\":\"approved\",\"risk_level\":\"high\",\"findings\":[],\"required_changes\":[],\"summary\":\"The command matches the task and is acceptable with explicit approval.\"}".to_owned(),
+            },
+            ModelTurnResponse {
+                output_items: vec![json!({
+                    "type": "function_call",
+                    "call_id": "call_2",
+                    "name": "shell_exec",
+                    "arguments": "{\"command\":\"mkdir approved-dir\"}"
+                })],
+                tool_calls: vec![beaverki_models::ModelToolCall {
+                    call_id: "call_2".to_owned(),
+                    name: "shell_exec".to_owned(),
+                    arguments: json!({ "command": "mkdir approved-dir" }),
+                }],
+                output_text: String::new(),
+            },
+            ModelTurnResponse {
+                output_items: vec![json!({
+                    "type": "message",
+                    "content": [{ "type": "output_text", "text": "approved from dm inbox" }]
+                })],
+                tool_calls: vec![],
+                output_text: "approved from dm inbox".to_owned(),
+            },
+        ])
+        .await;
+        runtime.config.integrations.discord.allowed_channel_ids = vec!["channel-1".to_owned()];
+        runtime
+            .db
+            .upsert_connector_identity(
+                "discord",
+                "discord-user-4",
+                Some("channel-1"),
+                "user_alex",
+                "authenticated_message",
+            )
+            .await
+            .expect("mapping");
+
+        let db = runtime.db.clone();
+        let socket_path = runtime.daemon_socket_path();
+        let daemon = RuntimeDaemon::new(runtime);
+        let mut handle = tokio::spawn(async move { daemon.run_until(pending()).await });
+        let client = wait_for_ready_or_report(socket_path, &mut handle).await;
+
+        let channel_reply = client
+            .submit_connector_message(ConnectorMessageRequest {
+                connector_type: "discord".to_owned(),
+                external_user_id: "discord-user-4".to_owned(),
+                external_display_name: Some("Torlenor".to_owned()),
+                channel_id: "channel-1".to_owned(),
+                message_id: "msg-approval-channel-1".to_owned(),
+                content: "!bk Create a directory that needs approval".to_owned(),
+                is_direct_message: false,
+            })
+            .await
+            .expect("channel approval message");
+        assert!(channel_reply.accepted);
+        assert!(
+            channel_reply
+                .reply
+                .as_deref()
+                .expect("channel reply")
+                .contains("open a Discord DM")
+        );
+
+        let inbox_reply = client
+            .submit_connector_message(ConnectorMessageRequest {
+                connector_type: "discord".to_owned(),
+                external_user_id: "discord-user-4".to_owned(),
+                external_display_name: Some("Torlenor".to_owned()),
+                channel_id: "dm-4".to_owned(),
+                message_id: "msg-approval-dm-1".to_owned(),
+                content: "approvals".to_owned(),
+                is_direct_message: true,
+            })
+            .await
+            .expect("dm inbox");
+        let inbox_text = inbox_reply.reply.as_deref().expect("inbox reply");
+        assert!(inbox_text.contains("Pending approvals"));
+        let approve_token = extract_token_for_command(inbox_text, "Approve");
+
+        let approval_reply = client
+            .submit_connector_message(ConnectorMessageRequest {
+                connector_type: "discord".to_owned(),
+                external_user_id: "discord-user-4".to_owned(),
+                external_display_name: Some("Torlenor".to_owned()),
+                channel_id: "dm-4".to_owned(),
+                message_id: "msg-approval-dm-2".to_owned(),
+                content: format!("approve {approve_token}"),
+                is_direct_message: true,
+            })
+            .await
+            .expect("approval from inbox");
+        assert_eq!(
+            approval_reply.reply.as_deref(),
+            Some("approved from dm inbox")
+        );
+
+        let approval = db
+            .list_approvals_for_user("user_alex", Some("approved"))
+            .await
+            .expect("approved approvals")
+            .into_iter()
+            .next()
+            .expect("approved approval");
+        let completed_task = db
+            .fetch_task(&approval.task_id)
+            .await
+            .expect("task fetch")
+            .expect("task");
+        assert_eq!(completed_task.state, TaskState::Completed.as_str());
+
+        client.shutdown().await.expect("shutdown request");
+        handle.await.expect("join").expect("daemon result");
+    }
+
+    #[tokio::test]
+    async fn discord_approval_token_cannot_be_replayed() {
+        let (_tempdir, runtime) = test_runtime(vec![
+            ModelTurnResponse {
+                output_items: vec![json!({
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "shell_exec",
+                    "arguments": "{\"command\":\"mkdir approved-dir\"}"
+                })],
+                tool_calls: vec![beaverki_models::ModelToolCall {
+                    call_id: "call_1".to_owned(),
+                    name: "shell_exec".to_owned(),
+                    arguments: json!({ "command": "mkdir approved-dir" }),
+                }],
+                output_text: String::new(),
+            },
+            ModelTurnResponse {
+                output_items: vec![json!({
+                    "type": "message",
+                    "content": [{
+                        "type": "output_text",
+                        "text": "{\"verdict\":\"approved\",\"risk_level\":\"high\",\"findings\":[],\"required_changes\":[],\"summary\":\"The command matches the task and is acceptable with explicit approval.\"}"
+                    }]
+                })],
+                tool_calls: vec![],
+                output_text: "{\"verdict\":\"approved\",\"risk_level\":\"high\",\"findings\":[],\"required_changes\":[],\"summary\":\"The command matches the task and is acceptable with explicit approval.\"}".to_owned(),
+            },
+            ModelTurnResponse {
+                output_items: vec![json!({
+                    "type": "function_call",
+                    "call_id": "call_2",
+                    "name": "shell_exec",
+                    "arguments": "{\"command\":\"mkdir approved-dir\"}"
+                })],
+                tool_calls: vec![beaverki_models::ModelToolCall {
+                    call_id: "call_2".to_owned(),
+                    name: "shell_exec".to_owned(),
+                    arguments: json!({ "command": "mkdir approved-dir" }),
+                }],
+                output_text: String::new(),
+            },
+            ModelTurnResponse {
+                output_items: vec![json!({
+                    "type": "message",
+                    "content": [{ "type": "output_text", "text": "approved through discord" }]
+                })],
+                tool_calls: vec![],
+                output_text: "approved through discord".to_owned(),
+            },
+        ])
+        .await;
+        runtime
+            .db
+            .upsert_connector_identity(
+                "discord",
+                "discord-user-5",
+                None,
+                "user_alex",
+                "authenticated_message",
+            )
+            .await
+            .expect("mapping");
+
+        let socket_path = runtime.daemon_socket_path();
+        let daemon = RuntimeDaemon::new(runtime);
+        let mut handle = tokio::spawn(async move { daemon.run_until(pending()).await });
+        let client = wait_for_ready_or_report(socket_path, &mut handle).await;
+
+        let pending_reply = client
+            .submit_connector_message(ConnectorMessageRequest {
+                connector_type: "discord".to_owned(),
+                external_user_id: "discord-user-5".to_owned(),
+                external_display_name: Some("Torlenor".to_owned()),
+                channel_id: "dm-5".to_owned(),
+                message_id: "msg-replay-1".to_owned(),
+                content: "Create a directory that needs approval".to_owned(),
+                is_direct_message: true,
+            })
+            .await
+            .expect("connector message");
+        let approve_token =
+            extract_token_for_command(pending_reply.reply.as_deref().expect("reply"), "Approve");
+
+        let approval_reply = client
+            .submit_connector_message(ConnectorMessageRequest {
+                connector_type: "discord".to_owned(),
+                external_user_id: "discord-user-5".to_owned(),
+                external_display_name: Some("Torlenor".to_owned()),
+                channel_id: "dm-5".to_owned(),
+                message_id: "msg-replay-2".to_owned(),
+                content: format!("approve {approve_token}"),
+                is_direct_message: true,
+            })
+            .await
+            .expect("approve once");
+        assert_eq!(
+            approval_reply.reply.as_deref(),
+            Some("approved through discord")
+        );
+
+        let replay_reply = client
+            .submit_connector_message(ConnectorMessageRequest {
+                connector_type: "discord".to_owned(),
+                external_user_id: "discord-user-5".to_owned(),
+                external_display_name: Some("Torlenor".to_owned()),
+                channel_id: "dm-5".to_owned(),
+                message_id: "msg-replay-3".to_owned(),
+                content: format!("approve {approve_token}"),
+                is_direct_message: true,
+            })
+            .await
+            .expect("replay");
+        assert!(
+            replay_reply
+                .reply
+                .as_deref()
+                .expect("replay reply")
+                .contains("Could not approve that approval token")
+        );
+
+        client.shutdown().await.expect("shutdown request");
+        handle.await.expect("join").expect("daemon result");
+    }
+
+    #[tokio::test]
+    async fn discord_approval_token_rejects_mismatched_identity() {
+        let (_tempdir, runtime) = test_runtime(vec![
+            ModelTurnResponse {
+                output_items: vec![json!({
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "shell_exec",
+                    "arguments": "{\"command\":\"mkdir approved-dir\"}"
+                })],
+                tool_calls: vec![beaverki_models::ModelToolCall {
+                    call_id: "call_1".to_owned(),
+                    name: "shell_exec".to_owned(),
+                    arguments: json!({ "command": "mkdir approved-dir" }),
+                }],
+                output_text: String::new(),
+            },
+            ModelTurnResponse {
+                output_items: vec![json!({
+                    "type": "message",
+                    "content": [{
+                        "type": "output_text",
+                        "text": "{\"verdict\":\"approved\",\"risk_level\":\"high\",\"findings\":[],\"required_changes\":[],\"summary\":\"The command matches the task and is acceptable with explicit approval.\"}"
+                    }]
+                })],
+                tool_calls: vec![],
+                output_text: "{\"verdict\":\"approved\",\"risk_level\":\"high\",\"findings\":[],\"required_changes\":[],\"summary\":\"The command matches the task and is acceptable with explicit approval.\"}".to_owned(),
+            },
+        ])
+        .await;
+        runtime
+            .db
+            .upsert_connector_identity(
+                "discord",
+                "discord-user-6",
+                None,
+                "user_alex",
+                "authenticated_message",
+            )
+            .await
+            .expect("mapping one");
+        let second_user = runtime
+            .db
+            .create_user("Casey", &["adult".to_owned()])
+            .await
+            .expect("second user");
+        runtime
+            .db
+            .upsert_connector_identity(
+                "discord",
+                "discord-user-7",
+                None,
+                &second_user.user_id,
+                "authenticated_message",
+            )
+            .await
+            .expect("mapping two");
+
+        let socket_path = runtime.daemon_socket_path();
+        let daemon = RuntimeDaemon::new(runtime);
+        let mut handle = tokio::spawn(async move { daemon.run_until(pending()).await });
+        let client = wait_for_ready_or_report(socket_path, &mut handle).await;
+
+        let pending_reply = client
+            .submit_connector_message(ConnectorMessageRequest {
+                connector_type: "discord".to_owned(),
+                external_user_id: "discord-user-6".to_owned(),
+                external_display_name: Some("Torlenor".to_owned()),
+                channel_id: "dm-6".to_owned(),
+                message_id: "msg-mismatch-1".to_owned(),
+                content: "Create a directory that needs approval".to_owned(),
+                is_direct_message: true,
+            })
+            .await
+            .expect("first request");
+        let approve_token =
+            extract_token_for_command(pending_reply.reply.as_deref().expect("reply"), "Approve");
+
+        let mismatch_reply = client
+            .submit_connector_message(ConnectorMessageRequest {
+                connector_type: "discord".to_owned(),
+                external_user_id: "discord-user-7".to_owned(),
+                external_display_name: Some("Casey".to_owned()),
+                channel_id: "dm-7".to_owned(),
+                message_id: "msg-mismatch-2".to_owned(),
+                content: format!("approve {approve_token}"),
+                is_direct_message: true,
+            })
+            .await
+            .expect("mismatch reply");
+        assert!(
+            mismatch_reply
+                .reply
+                .as_deref()
+                .expect("reply")
+                .contains("mapped identity")
+        );
+
+        client.shutdown().await.expect("shutdown request");
+        handle.await.expect("join").expect("daemon result");
+    }
+
+    #[tokio::test]
+    async fn discord_critical_approval_requires_confirm_token() {
+        let (_tempdir, runtime) = test_runtime(vec![
+            ModelTurnResponse {
+                output_items: vec![json!({
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "shell_exec",
+                    "arguments": "{\"command\":\"rm critical-dir\"}"
+                })],
+                tool_calls: vec![beaverki_models::ModelToolCall {
+                    call_id: "call_1".to_owned(),
+                    name: "shell_exec".to_owned(),
+                    arguments: json!({ "command": "rm critical-dir" }),
+                }],
+                output_text: String::new(),
+            },
+            ModelTurnResponse {
+                output_items: vec![json!({
+                    "type": "message",
+                    "content": [{
+                        "type": "output_text",
+                        "text": "{\"verdict\":\"approved\",\"risk_level\":\"critical\",\"findings\":[],\"required_changes\":[],\"summary\":\"The command is acceptable only with explicit confirmation.\"}"
+                    }]
+                })],
+                tool_calls: vec![],
+                output_text: "{\"verdict\":\"approved\",\"risk_level\":\"critical\",\"findings\":[],\"required_changes\":[],\"summary\":\"The command is acceptable only with explicit confirmation.\"}".to_owned(),
+            },
+            ModelTurnResponse {
+                output_items: vec![json!({
+                    "type": "function_call",
+                    "call_id": "call_2",
+                    "name": "shell_exec",
+                    "arguments": "{\"command\":\"rm critical-dir\"}"
+                })],
+                tool_calls: vec![beaverki_models::ModelToolCall {
+                    call_id: "call_2".to_owned(),
+                    name: "shell_exec".to_owned(),
+                    arguments: json!({ "command": "rm critical-dir" }),
+                }],
+                output_text: String::new(),
+            },
+            ModelTurnResponse {
+                output_items: vec![json!({
+                    "type": "message",
+                    "content": [{ "type": "output_text", "text": "critical approval completed" }]
+                })],
+                tool_calls: vec![],
+                output_text: "critical approval completed".to_owned(),
+            },
+        ])
+        .await;
+        runtime
+            .db
+            .upsert_connector_identity(
+                "discord",
+                "discord-user-8",
+                None,
+                "user_alex",
+                "authenticated_message",
+            )
+            .await
+            .expect("mapping");
+
+        let socket_path = runtime.daemon_socket_path();
+        let daemon = RuntimeDaemon::new(runtime);
+        let mut handle = tokio::spawn(async move { daemon.run_until(pending()).await });
+        let client = wait_for_ready_or_report(socket_path, &mut handle).await;
+
+        let pending_reply = client
+            .submit_connector_message(ConnectorMessageRequest {
+                connector_type: "discord".to_owned(),
+                external_user_id: "discord-user-8".to_owned(),
+                external_display_name: Some("Torlenor".to_owned()),
+                channel_id: "dm-8".to_owned(),
+                message_id: "msg-critical-1".to_owned(),
+                content: "Remove a critical directory".to_owned(),
+                is_direct_message: true,
+            })
+            .await
+            .expect("critical request");
+        let approve_token =
+            extract_token_for_command(pending_reply.reply.as_deref().expect("reply"), "Approve");
+
+        let step_up_reply = client
+            .submit_connector_message(ConnectorMessageRequest {
+                connector_type: "discord".to_owned(),
+                external_user_id: "discord-user-8".to_owned(),
+                external_display_name: Some("Torlenor".to_owned()),
+                channel_id: "dm-8".to_owned(),
+                message_id: "msg-critical-2".to_owned(),
+                content: format!("approve {approve_token}"),
+                is_direct_message: true,
+            })
+            .await
+            .expect("step up");
+        let step_up_text = step_up_reply.reply.as_deref().expect("step up reply");
+        assert!(step_up_text.contains("second confirmation"));
+        let confirm_token = extract_token_for_command(step_up_text, "Confirm");
+
+        let confirm_reply = client
+            .submit_connector_message(ConnectorMessageRequest {
+                connector_type: "discord".to_owned(),
+                external_user_id: "discord-user-8".to_owned(),
+                external_display_name: Some("Torlenor".to_owned()),
+                channel_id: "dm-8".to_owned(),
+                message_id: "msg-critical-3".to_owned(),
+                content: format!("confirm {confirm_token}"),
+                is_direct_message: true,
+            })
+            .await
+            .expect("confirm critical");
+        assert_eq!(
+            confirm_reply.reply.as_deref(),
+            Some("critical approval completed")
+        );
 
         client.shutdown().await.expect("shutdown request");
         handle.await.expect("join").expect("daemon result");

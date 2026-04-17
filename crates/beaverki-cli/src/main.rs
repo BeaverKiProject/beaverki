@@ -851,11 +851,15 @@ async fn approval_list(args: ApprovalListArgs) -> Result<()> {
 
     for approval in approvals {
         println!(
-            "- {} task={} status={} action={} target={}",
+            "- {} task={} status={} action={} risk={} summary={} target={}",
             approval.approval_id,
             approval.task_id,
             approval.status,
             approval.action_type,
+            approval.risk_level.unwrap_or_else(|| "<none>".to_owned()),
+            approval
+                .action_summary
+                .unwrap_or_else(|| "<none>".to_owned()),
             approval.target_ref.unwrap_or_else(|| "<none>".to_owned())
         );
     }

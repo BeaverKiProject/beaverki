@@ -158,13 +158,20 @@ Harden approvals for non-technical users across chat-facing control surfaces so 
 
 Status:
 
-- planned
+- implemented in the repository
 
 Why this stage exists:
 
 - the repository already supports CLI approvals and a basic Discord approval flow
 - the current remote pattern is functional but too technical for mainstream users
 - approval UX is a security boundary, so it should be tightened before broader connector and automation expansion relies on it
+
+Implementation notes:
+
+- remote approvals now use single-use opaque approval action tokens rather than raw approval IDs over Discord
+- Discord approvals are DM-first by default, while channel-originated requests that need approval are redirected to the DM inbox flow
+- critical remote approvals require a second confirmation token before the task is resumed
+- the CLI approval path remains available as the fallback administrative surface
 
 Stories:
 

@@ -3,7 +3,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
-use beaverki_db::{Database, TaskEventRow, TaskRow};
+use beaverki_db::{
+    ApprovalActionRow, ApprovalActionSet, ApprovalRow, ConnectorIdentityRow, Database,
+    TaskEventRow, TaskRow,
+};
+use beaverki_policy::can_grant_approvals;
 use chrono::{DateTime, Utc};
 use futures_util::{SinkExt, StreamExt};
 use reqwest::StatusCode;
@@ -14,7 +18,9 @@ use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::warn;
 
-use crate::{ConnectorMessageReply, ConnectorMessageRequest, RuntimeDaemon};
+use crate::{
+    ConnectorMessageReply, ConnectorMessageRequest, RemoteApprovalActionOutcome, RuntimeDaemon,
+};
 use beaverki_core::{MemoryScope, TaskState};
 
 const DISCORD_GATEWAY_URL: &str = "https://discord.com/api/v10/gateway/bot";
@@ -28,6 +34,7 @@ const DISCORD_REACTION_WORKING: &str = "%E2%8F%B3";
 const CONNECTOR_MESSAGE_CONTEXT_EVENT: &str = "connector_message_context";
 const CONNECTOR_FOLLOW_UP_REQUESTED_EVENT: &str = "connector_follow_up_requested";
 const CONNECTOR_FOLLOW_UP_SENT_EVENT: &str = "connector_follow_up_sent";
+const APPROVAL_ACTION_TOKEN_PREFIX: &str = "approval_token_";
 
 #[derive(Debug, Deserialize)]
 struct DiscordGatewayInfo {
@@ -632,43 +639,69 @@ impl RuntimeDaemon {
             });
         };
 
-        if let Some((approve, approval_id)) = parse_approval_command(&command_text) {
-            let task = match self
-                .runtime
-                .resolve_approval(Some(&identity.mapped_user_id), approval_id, approve)
-                .await
-            {
-                Ok(task) => task,
-                Err(error) => {
-                    return Ok(ConnectorMessageReply {
-                        accepted: true,
-                        reply: Some(format!(
-                            "Could not {} approval {}: {}",
-                            if approve { "approve" } else { "deny" },
-                            approval_id,
-                            error
-                        )),
-                    });
-                }
-            };
-            self.runtime
-                .db
-                .record_audit_event(
-                    "connector",
-                    &identity.identity_id,
-                    "connector_approval_resolved",
-                    json!({
-                        "approval_id": approval_id,
-                        "approve": approve,
-                        "task_id": task.task_id,
-                        "task_state": task.state,
-                    }),
+        let role_ids = self
+            .runtime
+            .db
+            .list_user_roles(&identity.mapped_user_id)
+            .await?
+            .into_iter()
+            .map(|row| row.role_id)
+            .collect::<Vec<_>>();
+
+        if let Some(approval_command) = parse_approval_command(&command_text) {
+            if discord_config.approval_dm_only && !message.is_direct_message {
+                self.runtime
+                    .db
+                    .record_audit_event(
+                        "connector",
+                        &identity.identity_id,
+                        "connector_approval_redirected_to_dm",
+                        json!({
+                            "channel_id": message.channel_id,
+                            "command": command_text,
+                        }),
+                    )
+                    .await?;
+                return Ok(ConnectorMessageReply {
+                    accepted: true,
+                    reply: Some(
+                        "Approvals can only be handled in a Discord DM. Open a DM with the bot and send approvals."
+                            .to_owned(),
+                    ),
+                });
+            }
+
+            if !can_grant_approvals(&role_ids) {
+                self.runtime
+                    .db
+                    .record_audit_event(
+                        "connector",
+                        &identity.identity_id,
+                        "connector_approval_denied",
+                        json!({
+                            "reason": "missing_approval_authority",
+                            "channel_id": message.channel_id,
+                        }),
+                    )
+                    .await?;
+                return Ok(ConnectorMessageReply {
+                    accepted: true,
+                    reply: Some(
+                        "This mapped account can submit tasks, but it is not allowed to approve requests."
+                            .to_owned(),
+                    ),
+                });
+            }
+
+            return self
+                .handle_discord_approval_command(
+                    &identity,
+                    &message,
+                    approval_command,
+                    discord_config.approval_action_ttl_secs as i64,
+                    discord_config.critical_confirmation_ttl_secs as i64,
                 )
-                .await?;
-            return Ok(ConnectorMessageReply {
-                accepted: true,
-                reply: Some(format_task_reply(&task)),
-            });
+                .await;
         }
 
         let scope = if message.is_direct_message {
@@ -753,7 +786,20 @@ impl RuntimeDaemon {
         .await?;
 
         let reply = if let Some(waited_task) = waited_task {
-            Some(format_task_reply(&waited_task))
+            if waited_task.state == TaskState::WaitingApproval.as_str() {
+                Some(
+                    render_waiting_approval_reply(
+                        self,
+                        &identity,
+                        &message,
+                        &waited_task,
+                        discord_config.approval_action_ttl_secs as i64,
+                    )
+                    .await?,
+                )
+            } else {
+                Some(format_task_reply(&waited_task))
+            }
         } else {
             self.runtime
                 .db
@@ -809,6 +855,446 @@ impl RuntimeDaemon {
             reply,
         })
     }
+
+    async fn handle_discord_approval_command(
+        &self,
+        identity: &ConnectorIdentityRow,
+        message: &ConnectorMessageRequest,
+        command: ApprovalCommand<'_>,
+        action_ttl_secs: i64,
+        confirmation_ttl_secs: i64,
+    ) -> Result<ConnectorMessageReply> {
+        match command {
+            ApprovalCommand::Inbox => {
+                let approvals = self
+                    .runtime
+                    .db
+                    .list_approvals_for_user(&identity.mapped_user_id, Some("pending"))
+                    .await?;
+                if approvals.is_empty() {
+                    return Ok(ConnectorMessageReply {
+                        accepted: true,
+                        reply: Some(
+                            "You have no pending approvals in BeaverKI right now.".to_owned(),
+                        ),
+                    });
+                }
+
+                let mut sections = Vec::with_capacity(approvals.len());
+                for approval in approvals {
+                    let action_set = issue_connector_approval_actions(
+                        self,
+                        identity,
+                        message,
+                        &approval,
+                        action_ttl_secs,
+                    )
+                    .await?;
+                    sections.push(render_approval_overview(&approval, &action_set));
+                }
+                let reply = format!("Pending approvals:\n\n{}", sections.join("\n\n"));
+                self.runtime
+                    .db
+                    .record_audit_event(
+                        "connector",
+                        &identity.identity_id,
+                        "approval_prompt_rendered",
+                        json!({
+                            "kind": "approval_inbox",
+                            "approval_count": sections.len(),
+                            "channel_id": message.channel_id,
+                        }),
+                    )
+                    .await?;
+                Ok(ConnectorMessageReply {
+                    accepted: true,
+                    reply: Some(truncate_reply(&reply)),
+                })
+            }
+            ApprovalCommand::Inspect(token) => {
+                let outcome = self
+                    .runtime
+                    .resolve_approval_action(
+                        Some(&identity.mapped_user_id),
+                        token,
+                        "inspect",
+                        Some("discord"),
+                        Some(&identity.identity_id),
+                        Some(&message.channel_id),
+                        confirmation_ttl_secs,
+                    )
+                    .await;
+                match outcome {
+                    Ok(RemoteApprovalActionOutcome::Inspection { approval, .. }) => {
+                        let action_set = issue_connector_approval_actions(
+                            self,
+                            identity,
+                            message,
+                            &approval,
+                            action_ttl_secs,
+                        )
+                        .await?;
+                        let reply = render_approval_detail(&approval, &action_set);
+                        self.runtime
+                            .db
+                            .record_audit_event(
+                                "connector",
+                                &identity.identity_id,
+                                "approval_prompt_rendered",
+                                json!({
+                                    "kind": "approval_detail",
+                                    "approval_id": approval.approval_id,
+                                    "channel_id": message.channel_id,
+                                }),
+                            )
+                            .await?;
+                        Ok(ConnectorMessageReply {
+                            accepted: true,
+                            reply: Some(truncate_reply(&reply)),
+                        })
+                    }
+                    Ok(_) => bail!("unexpected approval inspect outcome"),
+                    Err(error) => {
+                        self.runtime
+                            .db
+                            .record_audit_event(
+                                "connector",
+                                &identity.identity_id,
+                                "connector_approval_resolution_failed",
+                                json!({
+                                    "requested_action": "inspect",
+                                    "channel_id": message.channel_id,
+                                    "error": error.to_string(),
+                                }),
+                            )
+                            .await?;
+                        Ok(ConnectorMessageReply {
+                            accepted: true,
+                            reply: Some(format!("Could not inspect that approval token: {error}")),
+                        })
+                    }
+                }
+            }
+            ApprovalCommand::Approve(token)
+            | ApprovalCommand::Deny(token)
+            | ApprovalCommand::Confirm(token) => {
+                let requested_action = match command {
+                    ApprovalCommand::Approve(_) => "approve",
+                    ApprovalCommand::Deny(_) => "deny",
+                    ApprovalCommand::Confirm(_) => "confirm",
+                    ApprovalCommand::Inbox | ApprovalCommand::Inspect(_) => unreachable!(),
+                };
+                let outcome = self
+                    .runtime
+                    .resolve_approval_action(
+                        Some(&identity.mapped_user_id),
+                        token,
+                        requested_action,
+                        Some("discord"),
+                        Some(&identity.identity_id),
+                        Some(&message.channel_id),
+                        confirmation_ttl_secs,
+                    )
+                    .await;
+                match outcome {
+                    Ok(RemoteApprovalActionOutcome::Resolved { action, task }) => {
+                        self.runtime
+                            .db
+                            .record_audit_event(
+                                "connector",
+                                &identity.identity_id,
+                                "connector_approval_resolved",
+                                json!({
+                                    "approval_id": action.approval_id,
+                                    "action_kind": action.action_kind,
+                                    "resolution_channel": message.channel_id,
+                                    "task_id": task.task_id,
+                                    "task_state": task.state,
+                                }),
+                            )
+                            .await?;
+                        Ok(ConnectorMessageReply {
+                            accepted: true,
+                            reply: Some(format_task_reply(&task)),
+                        })
+                    }
+                    Ok(RemoteApprovalActionOutcome::StepUpRequired {
+                        approval,
+                        confirm_action,
+                        ..
+                    }) => {
+                        self.runtime
+                            .db
+                            .record_audit_event(
+                                "connector",
+                                &identity.identity_id,
+                                "connector_approval_step_up_required",
+                                json!({
+                                    "approval_id": approval.approval_id,
+                                    "resolution_channel": message.channel_id,
+                                    "confirm_action_id": confirm_action.action_id,
+                                }),
+                            )
+                            .await?;
+                        let reply = render_critical_confirmation_prompt(&approval, &confirm_action);
+                        Ok(ConnectorMessageReply {
+                            accepted: true,
+                            reply: Some(truncate_reply(&reply)),
+                        })
+                    }
+                    Ok(RemoteApprovalActionOutcome::Inspection { .. }) => {
+                        bail!("unexpected approval resolution inspect outcome")
+                    }
+                    Err(error) => {
+                        self.runtime
+                            .db
+                            .record_audit_event(
+                                "connector",
+                                &identity.identity_id,
+                                "connector_approval_resolution_failed",
+                                json!({
+                                    "requested_action": requested_action,
+                                    "channel_id": message.channel_id,
+                                    "error": error.to_string(),
+                                }),
+                            )
+                            .await?;
+                        Ok(ConnectorMessageReply {
+                            accepted: true,
+                            reply: Some(format!(
+                                "Could not {} that approval token: {}",
+                                requested_action, error
+                            )),
+                        })
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApprovalCommand<'a> {
+    Inbox,
+    Inspect(&'a str),
+    Approve(&'a str),
+    Deny(&'a str),
+    Confirm(&'a str),
+}
+
+async fn render_waiting_approval_reply(
+    daemon: &RuntimeDaemon,
+    identity: &ConnectorIdentityRow,
+    message: &ConnectorMessageRequest,
+    task: &TaskRow,
+    action_ttl_secs: i64,
+) -> Result<String> {
+    if daemon.runtime.config.integrations.discord.approval_dm_only && !message.is_direct_message {
+        daemon
+            .runtime
+            .db
+            .record_audit_event(
+                "connector",
+                &identity.identity_id,
+                "approval_prompt_redirected_to_dm",
+                json!({
+                    "task_id": task.task_id,
+                    "channel_id": message.channel_id,
+                }),
+            )
+            .await?;
+        return Ok(
+            "Approval required for this request. For safety, open a Discord DM with the bot and send approvals."
+                .to_owned(),
+        );
+    }
+
+    let Some(approval) = daemon
+        .runtime
+        .db
+        .pending_approval_for_task(&identity.mapped_user_id, &task.task_id)
+        .await?
+    else {
+        return Ok(format_task_reply(task));
+    };
+
+    let action_set =
+        issue_connector_approval_actions(daemon, identity, message, &approval, action_ttl_secs)
+            .await?;
+    daemon
+        .runtime
+        .db
+        .record_audit_event(
+            "connector",
+            &identity.identity_id,
+            "approval_prompt_rendered",
+            json!({
+                "kind": "task_waiting_approval",
+                "approval_id": approval.approval_id,
+                "task_id": task.task_id,
+                "channel_id": message.channel_id,
+            }),
+        )
+        .await?;
+    Ok(render_approval_detail(&approval, &action_set))
+}
+
+async fn issue_connector_approval_actions(
+    daemon: &RuntimeDaemon,
+    identity: &ConnectorIdentityRow,
+    message: &ConnectorMessageRequest,
+    approval: &ApprovalRow,
+    action_ttl_secs: i64,
+) -> Result<ApprovalActionSet> {
+    let action_set = daemon
+        .runtime
+        .issue_approval_actions(
+            Some(&identity.mapped_user_id),
+            &approval.approval_id,
+            Some("discord"),
+            Some(&identity.identity_id),
+            Some(&message.channel_id),
+            action_ttl_secs,
+            false,
+        )
+        .await?;
+    daemon
+        .runtime
+        .db
+        .record_audit_event(
+            "connector",
+            &identity.identity_id,
+            "approval_token_issued",
+            json!({
+                "approval_id": approval.approval_id,
+                "channel_id": message.channel_id,
+                "connector_type": "discord",
+                "actions": [
+                    {"action_id": action_set.approve.action_id, "action_kind": action_set.approve.action_kind, "expires_at": action_set.approve.expires_at},
+                    {"action_id": action_set.deny.action_id, "action_kind": action_set.deny.action_kind, "expires_at": action_set.deny.expires_at},
+                    {"action_id": action_set.inspect.action_id, "action_kind": action_set.inspect.action_kind, "expires_at": action_set.inspect.expires_at}
+                ],
+            }),
+        )
+        .await?;
+    Ok(action_set)
+}
+
+fn parse_approval_command(command_text: &str) -> Option<ApprovalCommand<'_>> {
+    let mut parts = command_text.split_whitespace();
+    let command = parts.next()?;
+    match command {
+        "approvals" => {
+            if parts.next().is_some() {
+                return None;
+            }
+            Some(ApprovalCommand::Inbox)
+        }
+        "inspect" | "approve" | "deny" | "confirm" => {
+            let token = parts.next()?;
+            if parts.next().is_some() || !token.starts_with(APPROVAL_ACTION_TOKEN_PREFIX) {
+                return None;
+            }
+            match command {
+                "inspect" => Some(ApprovalCommand::Inspect(token)),
+                "approve" => Some(ApprovalCommand::Approve(token)),
+                "deny" => Some(ApprovalCommand::Deny(token)),
+                "confirm" => Some(ApprovalCommand::Confirm(token)),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn render_approval_overview(approval: &ApprovalRow, action_set: &ApprovalActionSet) -> String {
+    format!(
+        "{}\nRisk: {}\nRequester: {}\nApprove: approve {}\nDeny: deny {}\nInspect: inspect {}",
+        approval_title(approval),
+        approval_risk_label(approval),
+        approval_requester_label(approval),
+        action_set.approve.action_token,
+        action_set.deny.action_token,
+        action_set.inspect.action_token,
+    )
+}
+
+fn render_approval_detail(approval: &ApprovalRow, action_set: &ApprovalActionSet) -> String {
+    let mut lines = vec![
+        "Approval required".to_owned(),
+        format!("Action: {}", approval_title(approval)),
+        format!("Risk: {}", approval_risk_label(approval)),
+        format!("Requester: {}", approval_requester_label(approval)),
+    ];
+    if let Some(target_details) = approval_target_label(approval) {
+        lines.push(format!("Target: {}", target_details));
+    }
+    if let Some(rationale) = approval.rationale_text.as_deref() {
+        lines.push(format!("Why: {}", rationale));
+    }
+    lines.push(format!(
+        "Approve: approve {}",
+        action_set.approve.action_token
+    ));
+    lines.push(format!("Deny: deny {}", action_set.deny.action_token));
+    lines.push(format!(
+        "Inspect again: inspect {}",
+        action_set.inspect.action_token
+    ));
+    lines.join("\n")
+}
+
+fn render_critical_confirmation_prompt(
+    approval: &ApprovalRow,
+    confirm_action: &ApprovalActionRow,
+) -> String {
+    let expires_at = format_expiry_label(&confirm_action.expires_at);
+    format!(
+        "Critical approval needs a second confirmation.\nAction: {}\nRisk: {}\nConfirm: confirm {}\nExpires: {}",
+        approval_title(approval),
+        approval_risk_label(approval),
+        confirm_action.action_token,
+        expires_at,
+    )
+}
+
+fn approval_title(approval: &ApprovalRow) -> String {
+    approval
+        .action_summary
+        .clone()
+        .or_else(|| approval.target_details.clone())
+        .or_else(|| approval.target_ref.clone())
+        .unwrap_or_else(|| approval.action_type.clone())
+}
+
+fn approval_requester_label(approval: &ApprovalRow) -> String {
+    approval
+        .requester_display_name
+        .clone()
+        .unwrap_or_else(|| approval.requested_by_agent_id.clone())
+}
+
+fn approval_target_label(approval: &ApprovalRow) -> Option<String> {
+    approval
+        .target_details
+        .clone()
+        .or_else(|| approval.target_ref.clone())
+}
+
+fn approval_risk_label(approval: &ApprovalRow) -> &'static str {
+    match approval.risk_level.as_deref() {
+        Some("critical") => "Critical",
+        Some("high") => "High",
+        Some("medium") => "Medium",
+        Some("low") => "Low",
+        _ => "Unspecified",
+    }
+}
+
+fn format_expiry_label(expires_at: &str) -> String {
+    DateTime::parse_from_rfc3339(expires_at)
+        .map(|value| value.with_timezone(&Utc).to_rfc3339())
+        .unwrap_or_else(|_| expires_at.to_owned())
 }
 
 fn normalize_message_text(
@@ -1160,20 +1646,6 @@ fn connector_follow_up_channel(
     Some(context.channel_id)
 }
 
-fn parse_approval_command(command_text: &str) -> Option<(bool, &str)> {
-    let mut parts = command_text.split_whitespace();
-    let command = parts.next()?;
-    let approval_id = parts.next()?;
-    if parts.next().is_some() {
-        return None;
-    }
-    match command {
-        "approve" => Some((true, approval_id)),
-        "deny" => Some((false, approval_id)),
-        _ => None,
-    }
-}
-
 fn format_task_reply(task: &beaverki_db::TaskRow) -> String {
     match task.state.parse::<TaskState>() {
         Ok(TaskState::Completed) => task
@@ -1512,5 +1984,43 @@ mod tests {
 
         let context = connector_context_from_events(&events).expect("context");
         assert_eq!(context.message_id.as_deref(), Some("msg-42"));
+    }
+
+    #[test]
+    fn approval_parser_accepts_exact_token_commands_and_inbox() {
+        assert_eq!(
+            parse_approval_command("approvals"),
+            Some(ApprovalCommand::Inbox)
+        );
+        assert_eq!(
+            parse_approval_command("approve approval_token_123"),
+            Some(ApprovalCommand::Approve("approval_token_123"))
+        );
+        assert_eq!(
+            parse_approval_command("deny approval_token_123"),
+            Some(ApprovalCommand::Deny("approval_token_123"))
+        );
+        assert_eq!(
+            parse_approval_command("inspect approval_token_123"),
+            Some(ApprovalCommand::Inspect("approval_token_123"))
+        );
+        assert_eq!(
+            parse_approval_command("confirm approval_token_123"),
+            Some(ApprovalCommand::Confirm("approval_token_123"))
+        );
+    }
+
+    #[test]
+    fn approval_parser_rejects_ambiguous_or_non_token_messages() {
+        assert_eq!(
+            parse_approval_command("please approve approval_token_123"),
+            None
+        );
+        assert_eq!(parse_approval_command("approve approval_123"), None);
+        assert_eq!(
+            parse_approval_command("approve approval_token_123 now"),
+            None
+        );
+        assert_eq!(parse_approval_command("inspect the folder"), None);
     }
 }

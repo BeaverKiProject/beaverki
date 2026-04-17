@@ -125,6 +125,9 @@ pub struct DiscordConfig {
     pub command_prefix: String,
     pub allowed_channel_ids: Vec<String>,
     pub task_wait_timeout_secs: u64,
+    pub approval_action_ttl_secs: u64,
+    pub approval_dm_only: bool,
+    pub critical_confirmation_ttl_secs: u64,
 }
 
 impl Default for DiscordConfig {
@@ -135,6 +138,9 @@ impl Default for DiscordConfig {
             command_prefix: "!bk".to_owned(),
             allowed_channel_ids: Vec::new(),
             task_wait_timeout_secs: 5,
+            approval_action_ttl_secs: 15 * 60,
+            approval_dm_only: true,
+            critical_confirmation_ttl_secs: 5 * 60,
         }
     }
 }
@@ -714,6 +720,15 @@ entries:
             default_safety_review_model()
         );
         assert_eq!(loaded.integrations.discord.task_wait_timeout_secs, 5);
+        assert_eq!(
+            loaded.integrations.discord.approval_action_ttl_secs,
+            15 * 60
+        );
+        assert!(loaded.integrations.discord.approval_dm_only);
+        assert_eq!(
+            loaded.integrations.discord.critical_confirmation_ttl_secs,
+            5 * 60
+        );
 
         let runtime_rewritten = fs::read_to_string(&runtime_path).expect("runtime content");
         let providers_rewritten = fs::read_to_string(&providers_path).expect("providers content");

@@ -2,6 +2,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result, anyhow};
 use beaverki_core::{MemoryScope, TaskState, ToolInvocationStatus, new_prefixed_id, now_rfc3339};
+use chrono::{Duration as ChronoDuration, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
@@ -739,36 +740,297 @@ impl Database {
         Ok(rows)
     }
 
-    pub async fn create_approval(
-        &self,
-        task_id: &str,
-        action_type: &str,
-        target_ref: Option<&str>,
-        requested_by_agent_id: &str,
-        requested_from_user_id: &str,
-        rationale_text: &str,
-    ) -> Result<ApprovalRow> {
+    pub async fn create_approval(&self, input: NewApproval<'_>) -> Result<ApprovalRow> {
         let approval_id = new_prefixed_id("approval");
         let created_at = now_rfc3339();
         sqlx::query(
             "INSERT INTO approvals
-             (approval_id, task_id, action_type, target_ref, requested_by_agent_id, requested_from_user_id, status, rationale_text, decided_at, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, NULL, ?)",
+             (approval_id, task_id, action_type, target_ref, requested_by_agent_id, requested_from_user_id, status, rationale_text, risk_level, action_summary, requester_display_name, target_details, decided_at, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, NULL, ?)",
         )
         .bind(&approval_id)
-        .bind(task_id)
-        .bind(action_type)
-        .bind(target_ref)
-        .bind(requested_by_agent_id)
-        .bind(requested_from_user_id)
-        .bind(rationale_text)
+        .bind(input.task_id)
+        .bind(input.action_type)
+        .bind(input.target_ref)
+        .bind(input.requested_by_agent_id)
+        .bind(input.requested_from_user_id)
+        .bind(input.rationale_text)
+        .bind(input.risk_level)
+        .bind(input.action_summary)
+        .bind(input.requester_display_name)
+        .bind(input.target_details)
         .bind(&created_at)
         .execute(&self.pool)
         .await
         .context("failed to create approval")?;
-        self.fetch_approval_for_user(requested_from_user_id, &approval_id)
+        self.fetch_approval_for_user(input.requested_from_user_id, &approval_id)
             .await?
             .context("approval missing after insert")
+    }
+
+    pub async fn issue_approval_action_set(
+        &self,
+        approval_id: &str,
+        input: IssueApprovalActions<'_>,
+    ) -> Result<ApprovalActionSet> {
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .context("failed to start approval action transaction")?;
+        sqlx::query(
+            "UPDATE approval_actions
+             SET status = 'superseded'
+             WHERE approval_id = ? AND status = 'pending'",
+        )
+        .bind(approval_id)
+        .execute(&mut *transaction)
+        .await
+        .context("failed to supersede prior approval actions")?;
+        let approve = insert_approval_action(
+            &mut transaction,
+            approval_id,
+            "approve",
+            input.connector_type,
+            input.connector_identity_id,
+            input.channel,
+            input.ttl_secs,
+        )
+        .await?;
+        let deny = insert_approval_action(
+            &mut transaction,
+            approval_id,
+            "deny",
+            input.connector_type,
+            input.connector_identity_id,
+            input.channel,
+            input.ttl_secs,
+        )
+        .await?;
+        let inspect = insert_approval_action(
+            &mut transaction,
+            approval_id,
+            "inspect",
+            input.connector_type,
+            input.connector_identity_id,
+            input.channel,
+            input.ttl_secs,
+        )
+        .await?;
+        let confirm = if input.include_confirm {
+            Some(
+                insert_approval_action(
+                    &mut transaction,
+                    approval_id,
+                    "confirm",
+                    input.connector_type,
+                    input.connector_identity_id,
+                    input.channel,
+                    input.ttl_secs,
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+        transaction
+            .commit()
+            .await
+            .context("failed to commit approval action transaction")?;
+        Ok(ApprovalActionSet {
+            approve,
+            deny,
+            inspect,
+            confirm,
+        })
+    }
+
+    pub async fn issue_approval_action(
+        &self,
+        approval_id: &str,
+        action_kind: &str,
+        connector_type: Option<&str>,
+        connector_identity_id: Option<&str>,
+        channel: Option<&str>,
+        ttl_secs: i64,
+    ) -> Result<ApprovalActionRow> {
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .context("failed to start single approval action transaction")?;
+        let action = insert_approval_action(
+            &mut transaction,
+            approval_id,
+            action_kind,
+            connector_type,
+            connector_identity_id,
+            channel,
+            ttl_secs,
+        )
+        .await?;
+        transaction
+            .commit()
+            .await
+            .context("failed to commit single approval action transaction")?;
+        Ok(action)
+    }
+
+    pub async fn fetch_approval_action_by_token(
+        &self,
+        action_token: &str,
+    ) -> Result<Option<ApprovalActionRow>> {
+        let row = sqlx::query_as::<_, ApprovalActionRow>(
+            "SELECT action_id, approval_id, action_kind, action_token, status, issued_to_connector_type, issued_to_connector_identity_id, issued_to_channel, expires_at, consumed_at, created_at
+             FROM approval_actions
+             WHERE action_token = ?",
+        )
+        .bind(action_token)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to fetch approval action by token")?;
+        Ok(row)
+    }
+
+    pub async fn list_approval_actions(&self, approval_id: &str) -> Result<Vec<ApprovalActionRow>> {
+        let rows = sqlx::query_as::<_, ApprovalActionRow>(
+            "SELECT action_id, approval_id, action_kind, action_token, status, issued_to_connector_type, issued_to_connector_identity_id, issued_to_channel, expires_at, consumed_at, created_at
+             FROM approval_actions
+             WHERE approval_id = ?
+             ORDER BY created_at ASC",
+        )
+        .bind(approval_id)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list approval actions")?;
+        Ok(rows)
+    }
+
+    pub async fn supersede_pending_approval_actions(&self, approval_id: &str) -> Result<()> {
+        sqlx::query(
+            "UPDATE approval_actions
+             SET status = 'superseded'
+             WHERE approval_id = ? AND status = 'pending'",
+        )
+        .bind(approval_id)
+        .execute(&self.pool)
+        .await
+        .context("failed to supersede pending approval actions")?;
+        Ok(())
+    }
+
+    pub async fn expire_approval_action(&self, action_id: &str) -> Result<()> {
+        sqlx::query(
+            "UPDATE approval_actions
+             SET status = 'expired'
+             WHERE action_id = ? AND status = 'pending'",
+        )
+        .bind(action_id)
+        .execute(&self.pool)
+        .await
+        .context("failed to mark approval action expired")?;
+        Ok(())
+    }
+
+    pub async fn pending_approval_for_task(
+        &self,
+        requested_from_user_id: &str,
+        task_id: &str,
+    ) -> Result<Option<ApprovalRow>> {
+        let row = sqlx::query_as::<_, ApprovalRow>(
+            "SELECT approval_id, task_id, action_type, target_ref, requested_by_agent_id, requested_from_user_id, status, rationale_text, risk_level, action_summary, requester_display_name, target_details, decided_at, created_at
+             FROM approvals
+             WHERE requested_from_user_id = ?
+               AND task_id = ?
+               AND status = 'pending'
+             ORDER BY created_at DESC
+             LIMIT 1",
+        )
+        .bind(requested_from_user_id)
+        .bind(task_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to fetch pending approval for task")?;
+        Ok(row)
+    }
+
+    pub async fn consume_approval_action(
+        &self,
+        action_token: &str,
+    ) -> Result<Option<ApprovalActionRow>> {
+        let now = now_rfc3339();
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .context("failed to start approval action consume transaction")?;
+        let Some(mut row) = sqlx::query_as::<_, ApprovalActionRow>(
+            "SELECT action_id, approval_id, action_kind, action_token, status, issued_to_connector_type, issued_to_connector_identity_id, issued_to_channel, expires_at, consumed_at, created_at
+             FROM approval_actions
+             WHERE action_token = ?",
+        )
+        .bind(action_token)
+        .fetch_optional(&mut *transaction)
+        .await
+        .context("failed to fetch approval action for consume")?
+        else {
+            transaction
+                .commit()
+                .await
+                .context("failed to finalize empty approval action consume")?;
+            return Ok(None);
+        };
+
+        if row.status != "pending" {
+            transaction
+                .commit()
+                .await
+                .context("failed to finalize already-resolved approval action consume")?;
+            return Ok(None);
+        }
+
+        if row.expires_at <= now {
+            sqlx::query(
+                "UPDATE approval_actions
+                 SET status = 'expired'
+                 WHERE action_id = ? AND status = 'pending'",
+            )
+            .bind(&row.action_id)
+            .execute(&mut *transaction)
+            .await
+            .context("failed to expire approval action")?;
+            transaction
+                .commit()
+                .await
+                .context("failed to finalize expired approval action consume")?;
+            return Ok(None);
+        }
+
+        let result = sqlx::query(
+            "UPDATE approval_actions
+             SET status = 'consumed', consumed_at = ?
+             WHERE action_id = ? AND status = 'pending'",
+        )
+        .bind(&now)
+        .bind(&row.action_id)
+        .execute(&mut *transaction)
+        .await
+        .context("failed to consume approval action")?;
+        if result.rows_affected() == 0 {
+            transaction
+                .commit()
+                .await
+                .context("failed to finalize raced approval action consume")?;
+            return Ok(None);
+        }
+
+        row.status = "consumed".to_owned();
+        row.consumed_at = Some(now);
+        transaction
+            .commit()
+            .await
+            .context("failed to commit approval action consume")?;
+        Ok(Some(row))
     }
 
     pub async fn fetch_approval_for_user(
@@ -777,7 +1039,7 @@ impl Database {
         approval_id: &str,
     ) -> Result<Option<ApprovalRow>> {
         let row = sqlx::query_as::<_, ApprovalRow>(
-            "SELECT approval_id, task_id, action_type, target_ref, requested_by_agent_id, requested_from_user_id, status, rationale_text, decided_at, created_at
+            "SELECT approval_id, task_id, action_type, target_ref, requested_by_agent_id, requested_from_user_id, status, rationale_text, risk_level, action_summary, requester_display_name, target_details, decided_at, created_at
              FROM approvals
              WHERE requested_from_user_id = ? AND approval_id = ?",
         )
@@ -796,7 +1058,7 @@ impl Database {
     ) -> Result<Vec<ApprovalRow>> {
         let approvals = if let Some(status) = status {
             sqlx::query_as::<_, ApprovalRow>(
-                "SELECT approval_id, task_id, action_type, target_ref, requested_by_agent_id, requested_from_user_id, status, rationale_text, decided_at, created_at
+                "SELECT approval_id, task_id, action_type, target_ref, requested_by_agent_id, requested_from_user_id, status, rationale_text, risk_level, action_summary, requester_display_name, target_details, decided_at, created_at
                  FROM approvals
                  WHERE requested_from_user_id = ? AND status = ?
                  ORDER BY created_at DESC",
@@ -808,7 +1070,7 @@ impl Database {
             .context("failed to list approvals")?
         } else {
             sqlx::query_as::<_, ApprovalRow>(
-                "SELECT approval_id, task_id, action_type, target_ref, requested_by_agent_id, requested_from_user_id, status, rationale_text, decided_at, created_at
+                "SELECT approval_id, task_id, action_type, target_ref, requested_by_agent_id, requested_from_user_id, status, rationale_text, risk_level, action_summary, requester_display_name, target_details, decided_at, created_at
                  FROM approvals
                  WHERE requested_from_user_id = ?
                  ORDER BY created_at DESC",
@@ -865,7 +1127,7 @@ impl Database {
         requested_from_user_id: &str,
     ) -> Result<Vec<ApprovalRow>> {
         let approvals = sqlx::query_as::<_, ApprovalRow>(
-            "SELECT approval_id, task_id, action_type, target_ref, requested_by_agent_id, requested_from_user_id, status, rationale_text, decided_at, created_at
+                        "SELECT approval_id, task_id, action_type, target_ref, requested_by_agent_id, requested_from_user_id, status, rationale_text, risk_level, action_summary, requester_display_name, target_details, decided_at, created_at
              FROM approvals
              WHERE task_id = ?
                AND requested_from_user_id = ?
@@ -1490,6 +1752,29 @@ pub struct NewScript<'a> {
     pub safety_summary: Option<&'a str>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct NewApproval<'a> {
+    pub task_id: &'a str,
+    pub action_type: &'a str,
+    pub target_ref: Option<&'a str>,
+    pub requested_by_agent_id: &'a str,
+    pub requested_from_user_id: &'a str,
+    pub rationale_text: &'a str,
+    pub risk_level: Option<&'a str>,
+    pub action_summary: Option<&'a str>,
+    pub requester_display_name: Option<&'a str>,
+    pub target_details: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct IssueApprovalActions<'a> {
+    pub connector_type: Option<&'a str>,
+    pub connector_identity_id: Option<&'a str>,
+    pub channel: Option<&'a str>,
+    pub ttl_secs: i64,
+    pub include_confirm: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct UpdateScript<'a> {
     pub script_id: &'a str,
@@ -1634,8 +1919,35 @@ pub struct ApprovalRow {
     pub requested_from_user_id: String,
     pub status: String,
     pub rationale_text: Option<String>,
+    pub risk_level: Option<String>,
+    pub action_summary: Option<String>,
+    pub requester_display_name: Option<String>,
+    pub target_details: Option<String>,
     pub decided_at: Option<String>,
     pub created_at: String,
+}
+
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct ApprovalActionRow {
+    pub action_id: String,
+    pub approval_id: String,
+    pub action_kind: String,
+    pub action_token: String,
+    pub status: String,
+    pub issued_to_connector_type: Option<String>,
+    pub issued_to_connector_identity_id: Option<String>,
+    pub issued_to_channel: Option<String>,
+    pub expires_at: String,
+    pub consumed_at: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApprovalActionSet {
+    pub approve: ApprovalActionRow,
+    pub deny: ApprovalActionRow,
+    pub inspect: ApprovalActionRow,
+    pub confirm: Option<ApprovalActionRow>,
 }
 
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
@@ -1718,6 +2030,52 @@ pub struct RuntimeHeartbeatRow {
     pub active_task_id: Option<String>,
     pub automation_planning_enabled: i64,
     pub observed_at: String,
+}
+
+async fn insert_approval_action(
+    transaction: &mut sqlx::Transaction<'_, Sqlite>,
+    approval_id: &str,
+    action_kind: &str,
+    connector_type: Option<&str>,
+    connector_identity_id: Option<&str>,
+    channel: Option<&str>,
+    ttl_secs: i64,
+) -> Result<ApprovalActionRow> {
+    let action_id = new_prefixed_id("approval_action");
+    let action_token = new_prefixed_id("approval_token");
+    let created_at = now_rfc3339();
+    let expires_at = (Utc::now() + ChronoDuration::seconds(ttl_secs)).to_rfc3339();
+    sqlx::query(
+        "INSERT INTO approval_actions
+         (action_id, approval_id, action_kind, action_token, status, issued_to_connector_type, issued_to_connector_identity_id, issued_to_channel, expires_at, consumed_at, created_at)
+         VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?, NULL, ?)",
+    )
+    .bind(&action_id)
+    .bind(approval_id)
+    .bind(action_kind)
+    .bind(&action_token)
+    .bind(connector_type)
+    .bind(connector_identity_id)
+    .bind(channel)
+    .bind(&expires_at)
+    .bind(&created_at)
+    .execute(&mut **transaction)
+    .await
+    .context("failed to insert approval action")?;
+
+    Ok(ApprovalActionRow {
+        action_id,
+        approval_id: approval_id.to_owned(),
+        action_kind: action_kind.to_owned(),
+        action_token,
+        status: "pending".to_owned(),
+        issued_to_connector_type: connector_type.map(ToOwned::to_owned),
+        issued_to_connector_identity_id: connector_identity_id.map(ToOwned::to_owned),
+        issued_to_channel: channel.map(ToOwned::to_owned),
+        expires_at,
+        consumed_at: None,
+        created_at,
+    })
 }
 
 fn slugify(input: &str) -> String {
@@ -1982,5 +2340,208 @@ mod tests {
         assert_eq!(bootstrap.primary_agent_id, "agent_alex");
         assert_eq!(roles.len(), 1);
         assert_eq!(roles[0].role_id, "owner");
+    }
+
+    #[tokio::test]
+    async fn approval_actions_are_issued_and_consumed_once() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("test.db");
+        let db = Database::connect(&db_path).await.expect("connect");
+        let bootstrap = db.bootstrap_single_user("Alex").await.expect("bootstrap");
+        let task = db
+            .create_task(
+                &bootstrap.user_id,
+                &bootstrap.primary_agent_id,
+                "Need approval",
+                MemoryScope::Private,
+            )
+            .await
+            .expect("task");
+        let approval = db
+            .create_approval(NewApproval {
+                task_id: &task.task_id,
+                action_type: "shell_command",
+                target_ref: Some("mkdir approved-dir"),
+                requested_by_agent_id: &bootstrap.primary_agent_id,
+                requested_from_user_id: &bootstrap.user_id,
+                rationale_text: "Need permission to create a directory.",
+                risk_level: Some("high"),
+                action_summary: Some("Run shell command 'mkdir approved-dir'"),
+                requester_display_name: Some("Primary agent for Alex"),
+                target_details: Some("mkdir approved-dir"),
+            })
+            .await
+            .expect("approval");
+
+        let action_set = db
+            .issue_approval_action_set(
+                &approval.approval_id,
+                IssueApprovalActions {
+                    connector_type: Some("discord"),
+                    connector_identity_id: Some("identity_1"),
+                    channel: Some("dm-1"),
+                    ttl_secs: 600,
+                    include_confirm: false,
+                },
+            )
+            .await
+            .expect("issue actions");
+
+        assert_eq!(action_set.approve.action_kind, "approve");
+        assert_eq!(action_set.deny.action_kind, "deny");
+        assert_eq!(action_set.inspect.action_kind, "inspect");
+        assert!(action_set.confirm.is_none());
+
+        let listed = db
+            .list_approval_actions(&approval.approval_id)
+            .await
+            .expect("list actions");
+        assert_eq!(listed.len(), 3);
+
+        let consumed = db
+            .consume_approval_action(&action_set.approve.action_token)
+            .await
+            .expect("consume action")
+            .expect("consumed action");
+        assert_eq!(consumed.status, "consumed");
+        assert!(consumed.consumed_at.is_some());
+
+        let second_consume = db
+            .consume_approval_action(&action_set.approve.action_token)
+            .await
+            .expect("second consume");
+        assert!(second_consume.is_none());
+    }
+
+    #[tokio::test]
+    async fn issuing_new_approval_actions_supersedes_prior_pending_tokens() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("test.db");
+        let db = Database::connect(&db_path).await.expect("connect");
+        let bootstrap = db.bootstrap_single_user("Alex").await.expect("bootstrap");
+        let task = db
+            .create_task(
+                &bootstrap.user_id,
+                &bootstrap.primary_agent_id,
+                "Need approval",
+                MemoryScope::Private,
+            )
+            .await
+            .expect("task");
+        let approval = db
+            .create_approval(NewApproval {
+                task_id: &task.task_id,
+                action_type: "shell_command",
+                target_ref: Some("mkdir approved-dir"),
+                requested_by_agent_id: &bootstrap.primary_agent_id,
+                requested_from_user_id: &bootstrap.user_id,
+                rationale_text: "Need permission to create a directory.",
+                risk_level: Some("high"),
+                action_summary: Some("Run shell command 'mkdir approved-dir'"),
+                requester_display_name: Some("Primary agent for Alex"),
+                target_details: Some("mkdir approved-dir"),
+            })
+            .await
+            .expect("approval");
+
+        let first = db
+            .issue_approval_action_set(
+                &approval.approval_id,
+                IssueApprovalActions {
+                    connector_type: Some("discord"),
+                    connector_identity_id: Some("identity_1"),
+                    channel: Some("dm-1"),
+                    ttl_secs: 600,
+                    include_confirm: false,
+                },
+            )
+            .await
+            .expect("first issue");
+        let second = db
+            .issue_approval_action_set(
+                &approval.approval_id,
+                IssueApprovalActions {
+                    connector_type: Some("discord"),
+                    connector_identity_id: Some("identity_1"),
+                    channel: Some("dm-1"),
+                    ttl_secs: 600,
+                    include_confirm: false,
+                },
+            )
+            .await
+            .expect("second issue");
+
+        let first_row = db
+            .fetch_approval_action_by_token(&first.approve.action_token)
+            .await
+            .expect("fetch first")
+            .expect("first row");
+        let second_row = db
+            .fetch_approval_action_by_token(&second.approve.action_token)
+            .await
+            .expect("fetch second")
+            .expect("second row");
+
+        assert_eq!(first_row.status, "superseded");
+        assert_eq!(second_row.status, "pending");
+    }
+
+    #[tokio::test]
+    async fn expired_approval_actions_are_marked_unusable() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("test.db");
+        let db = Database::connect(&db_path).await.expect("connect");
+        let bootstrap = db.bootstrap_single_user("Alex").await.expect("bootstrap");
+        let task = db
+            .create_task(
+                &bootstrap.user_id,
+                &bootstrap.primary_agent_id,
+                "Need approval",
+                MemoryScope::Private,
+            )
+            .await
+            .expect("task");
+        let approval = db
+            .create_approval(NewApproval {
+                task_id: &task.task_id,
+                action_type: "shell_command",
+                target_ref: Some("mkdir approved-dir"),
+                requested_by_agent_id: &bootstrap.primary_agent_id,
+                requested_from_user_id: &bootstrap.user_id,
+                rationale_text: "Need permission to create a directory.",
+                risk_level: Some("high"),
+                action_summary: Some("Run shell command 'mkdir approved-dir'"),
+                requester_display_name: Some("Primary agent for Alex"),
+                target_details: Some("mkdir approved-dir"),
+            })
+            .await
+            .expect("approval");
+
+        let action_set = db
+            .issue_approval_action_set(
+                &approval.approval_id,
+                IssueApprovalActions {
+                    connector_type: Some("discord"),
+                    connector_identity_id: Some("identity_1"),
+                    channel: Some("dm-1"),
+                    ttl_secs: -1,
+                    include_confirm: false,
+                },
+            )
+            .await
+            .expect("issue actions");
+
+        let consumed = db
+            .consume_approval_action(&action_set.approve.action_token)
+            .await
+            .expect("consume expired action");
+        assert!(consumed.is_none());
+
+        let expired = db
+            .fetch_approval_action_by_token(&action_set.approve.action_token)
+            .await
+            .expect("fetch action")
+            .expect("action row");
+        assert_eq!(expired.status, "expired");
     }
 }
