@@ -148,7 +148,41 @@ Exit criteria:
 - approvals can be handled through Discord where policy allows
 - browser automation works in desktop and VPS headless modes
 
-## 3.5 M3 Automation
+## 3.5 M2.5 Approval UX And Remote Safety
+
+Goal:
+
+Harden approvals for non-technical users across chat-facing control surfaces so BeaverKI can safely request and resolve sensitive actions without depending on CLI-only workflows or brittle free-form chat commands.
+
+Status:
+
+- planned
+
+Why this stage exists:
+
+- the repository already supports CLI approvals and a basic Discord approval flow
+- the current remote pattern is functional but too technical for mainstream users
+- approval UX is a security boundary, so it should be tightened before broader connector and automation expansion relies on it
+
+Stories:
+
+- `M2.5-001` Introduce a first-class approval presentation model with concise human-readable action summaries, risk labels, requester identity, and target details.
+- `M2.5-002` Add connector-safe approval actions using single-use opaque approval tokens or signed interaction payloads instead of relying on free-form text parsing alone.
+- `M2.5-003` Add an approval inbox surface over supported connectors so users can list, inspect, approve, or deny pending requests without switching to the CLI.
+- `M2.5-004` Restrict remote approvals to trusted contexts by default, such as mapped identities, DMs, or explicitly allowlisted channels, with replay protection and expiry.
+- `M2.5-005` Add step-up confirmation for higher-risk approvals, such as requiring a second confirmation gesture, short-lived confirmation code, or local-device confirmation policy.
+- `M2.5-006` Distinguish approval authority from task-submission authority in connector UX so a user cannot silently self-elevate through a loosely trusted chat path.
+- `M2.5-007` Add audit coverage for approval prompt rendering, token issuance, expiry, denial, resolution channel, and connector identity used for the decision.
+- `M2.5-008` Add end-to-end tests for approval flows over connectors, including replay attempts, stale approvals, mismatched identities, and ambiguous user replies.
+
+Exit criteria:
+
+- non-technical users can safely approve or deny pending actions from a chat interface without memorizing internal IDs
+- remote approvals are bound to authenticated mapped identities and trusted channels
+- approval interactions are resistant to replay, ambiguity, and accidental approval from plain conversational text
+- the CLI remains available as the administrative fallback path
+
+## 3.6 M3 Automation
 
 Goal:
 
@@ -171,7 +205,7 @@ Exit criteria:
 - shell review path is functioning for risky commands
 - automation behavior is auditable end to end
 
-## 3.6 Post-V1
+## 3.7 Post-V1
 
 Candidate follow-up work:
 
