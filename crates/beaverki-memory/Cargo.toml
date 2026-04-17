@@ -9,6 +9,11 @@ anyhow.workspace = true
 beaverki-core = { path = "../beaverki-core" }
 beaverki-db = { path = "../beaverki-db" }
 serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio.workspace = true
 
 [lints]
 workspace = true

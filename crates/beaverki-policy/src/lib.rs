@@ -24,6 +24,7 @@ pub const BUILTIN_ROLES: &[(&str, &str)] = &[
 ];
 
 const HOUSEHOLD_VISIBLE_ROLES: &[&str] = &["owner", "adult", "service"];
+const HOUSEHOLD_WRITE_ROLES: &[&str] = &["owner", "adult", "service"];
 const APPROVER_ROLES: &[&str] = &["owner", "adult"];
 const SUBAGENT_ROLES: &[&str] = &["owner", "adult", "service"];
 const APPROVAL_ELIGIBLE_ROLES: &[&str] = &["owner", "adult"];
@@ -40,6 +41,12 @@ pub fn can_view_household_memory(role_ids: &[String]) -> bool {
     role_ids
         .iter()
         .any(|role| HOUSEHOLD_VISIBLE_ROLES.contains(&role.as_str()))
+}
+
+pub fn can_write_household_memory(role_ids: &[String]) -> bool {
+    role_ids
+        .iter()
+        .any(|role| HOUSEHOLD_WRITE_ROLES.contains(&role.as_str()))
 }
 
 pub fn can_grant_approvals(role_ids: &[String]) -> bool {
@@ -207,6 +214,7 @@ mod tests {
     fn owner_sees_household_and_can_approve() {
         let roles = roles(&["owner"]);
         assert!(can_view_household_memory(&roles));
+        assert!(can_write_household_memory(&roles));
         assert!(can_grant_approvals(&roles));
         assert_eq!(
             visible_memory_scopes(&roles),
@@ -218,6 +226,7 @@ mod tests {
     fn child_is_private_only_and_cannot_approve() {
         let roles = roles(&["child"]);
         assert!(!can_view_household_memory(&roles));
+        assert!(!can_write_household_memory(&roles));
         assert!(!can_grant_approvals(&roles));
         assert_eq!(visible_memory_scopes(&roles), vec![MemoryScope::Private]);
         assert!(!can_request_shell_approval(&roles, ShellRisk::High));

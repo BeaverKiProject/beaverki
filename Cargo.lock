@@ -308,6 +308,9 @@ dependencies = [
  "beaverki-core",
  "beaverki-db",
  "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]

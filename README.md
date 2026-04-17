@@ -86,6 +86,7 @@ This keeps the README short while letting the delivery plan evolve separately fr
 - [Product Design](docs/design.md)
 - [V1 Technical Spec](docs/technical-spec.md)
 - [Delivery Plan](docs/delivery-plan.md)
+- [Memory Design](docs/memory_design.md)
 - [Developer Workflow](docs/developer-workflow.md)
 - [Contributing Guide](CONTRIBUTING.md)
 
@@ -143,6 +144,10 @@ cargo run -p beaverki-cli -- user add --display-name Casey --role adult
 cargo run -p beaverki-cli -- task run --objective "Inspect the repository and summarize it."
 cargo run -p beaverki-cli -- task run --user user_casey --objective "Inspect the repository and summarize it."
 cargo run -p beaverki-cli -- task show --task-id <task-id>
+cargo run -p beaverki-cli -- memory list
+cargo run -p beaverki-cli -- memory show --memory-id <memory-id>
+cargo run -p beaverki-cli -- memory history --subject-key profile.preferred_name
+cargo run -p beaverki-cli -- memory forget --memory-id <memory-id> --reason "Wrong fact"
 cargo run -p beaverki-cli -- approval list
 cargo run -p beaverki-cli -- approval approve --approval-id <approval-id>
 ```

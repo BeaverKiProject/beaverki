@@ -7,9 +7,10 @@ use beaverki_config::{
     LoadedConfig, SetupAnswers, default_app_paths, prompt_passphrase_from_env,
     write_integrations_config, write_providers_config, write_setup_files,
 };
-use beaverki_db::{Database, UserRow};
+use beaverki_core::{MemoryKind, MemoryScope};
+use beaverki_db::{Database, MemoryRow, UserRow};
 use beaverki_models::OpenAiProvider;
-use beaverki_policy::is_builtin_role;
+use beaverki_policy::{is_builtin_role, visible_memory_scopes};
 use beaverki_runtime::{DaemonClient, Runtime, RuntimeDaemon, latest_daemon_status};
 use clap::{Args, Parser, Subcommand};
 use dialoguer::{Input, Password};
@@ -45,6 +46,10 @@ enum Commands {
     Task {
         #[command(subcommand)]
         command: Box<TaskCommand>,
+    },
+    Memory {
+        #[command(subcommand)]
+        command: Box<MemoryCommand>,
     },
     User {
         #[command(subcommand)]
@@ -131,6 +136,14 @@ enum TaskCommand {
 }
 
 #[derive(Subcommand)]
+enum MemoryCommand {
+    List(MemoryListArgs),
+    Show(MemoryShowArgs),
+    History(MemoryHistoryArgs),
+    Forget(MemoryForgetArgs),
+}
+
+#[derive(Subcommand)]
 enum UserCommand {
     Add(UserAddArgs),
     List(ConfigDirArgs),
@@ -204,6 +217,62 @@ struct TaskShowArgs {
     user: Option<String>,
     #[arg(long)]
     task_id: String,
+}
+
+#[derive(Args, Clone)]
+struct MemoryListArgs {
+    #[arg(long)]
+    config_dir: Option<PathBuf>,
+    #[arg(long)]
+    user: Option<String>,
+    #[arg(long)]
+    scope: Option<String>,
+    #[arg(long)]
+    kind: Option<String>,
+    #[arg(long, default_value_t = false)]
+    include_superseded: bool,
+    #[arg(long, default_value_t = false)]
+    include_forgotten: bool,
+    #[arg(long, default_value_t = 20)]
+    limit: i64,
+}
+
+#[derive(Args, Clone)]
+struct MemoryShowArgs {
+    #[arg(long)]
+    config_dir: Option<PathBuf>,
+    #[arg(long)]
+    user: Option<String>,
+    #[arg(long)]
+    memory_id: String,
+}
+
+#[derive(Args, Clone)]
+struct MemoryHistoryArgs {
+    #[arg(long)]
+    config_dir: Option<PathBuf>,
+    #[arg(long)]
+    user: Option<String>,
+    #[arg(long)]
+    subject_key: String,
+    #[arg(long)]
+    scope: Option<String>,
+    #[arg(long)]
+    subject_type: Option<String>,
+    #[arg(long, default_value_t = 20)]
+    limit: i64,
+}
+
+#[derive(Args, Clone)]
+struct MemoryForgetArgs {
+    #[arg(long)]
+    config_dir: Option<PathBuf>,
+    #[arg(long)]
+    user: Option<String>,
+    #[arg(long)]
+    memory_id: String,
+    #[arg(long)]
+    reason: String,
 }
 
 #[derive(Args, Clone)]
@@ -474,6 +543,12 @@ async fn main() -> Result<()> {
         Commands::Task { command } => match *command {
             TaskCommand::Run(args) => task_run(args).await,
             TaskCommand::Show(args) => task_show(args).await,
+        },
+        Commands::Memory { command } => match *command {
+            MemoryCommand::List(args) => memory_list(args).await,
+            MemoryCommand::Show(args) => memory_show(args).await,
+            MemoryCommand::History(args) => memory_history(args).await,
+            MemoryCommand::Forget(args) => memory_forget(args).await,
         },
         Commands::User { command } => match *command {
             UserCommand::Add(args) => user_add(args).await,
@@ -791,6 +866,124 @@ async fn task_show(args: TaskShowArgs) -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+async fn memory_list(args: MemoryListArgs) -> Result<()> {
+    let config_dir = resolve_config_dir(args.config_dir)?;
+    let memories = if let Ok(client) = try_daemon_client(&config_dir).await {
+        client
+            .list_memories(
+                args.user.clone(),
+                args.scope.clone(),
+                args.kind.clone(),
+                args.include_superseded,
+                args.include_forgotten,
+                args.limit,
+            )
+            .await?
+    } else {
+        let (_, db) = load_db(&config_dir).await?;
+        let user = resolve_user_for_db(&db, args.user.as_deref()).await?;
+        visible_memories_for_user(
+            &db,
+            &user,
+            args.scope.as_deref(),
+            args.kind.as_deref(),
+            args.include_superseded,
+            args.include_forgotten,
+            None,
+            None,
+            args.limit,
+        )
+        .await?
+    };
+
+    if memories.is_empty() {
+        println!("No memories matched the requested filters.");
+        return Ok(());
+    }
+
+    for memory in memories {
+        print_memory_summary(&memory);
+    }
+
+    Ok(())
+}
+
+async fn memory_show(args: MemoryShowArgs) -> Result<()> {
+    let config_dir = resolve_config_dir(args.config_dir)?;
+    let memory = if let Ok(client) = try_daemon_client(&config_dir).await {
+        client
+            .show_memory(args.user.clone(), args.memory_id.clone())
+            .await?
+            .memory
+    } else {
+        let (_, db) = load_db(&config_dir).await?;
+        let user = resolve_user_for_db(&db, args.user.as_deref()).await?;
+        visible_memory_by_id(&db, &user, &args.memory_id).await?
+    };
+
+    print_memory_detail(&memory);
+    Ok(())
+}
+
+async fn memory_history(args: MemoryHistoryArgs) -> Result<()> {
+    let config_dir = resolve_config_dir(args.config_dir)?;
+    let memories = if let Ok(client) = try_daemon_client(&config_dir).await {
+        client
+            .memory_history(
+                args.user.clone(),
+                args.subject_key.clone(),
+                args.scope.clone(),
+                args.subject_type.clone(),
+                args.limit,
+            )
+            .await?
+    } else {
+        let (_, db) = load_db(&config_dir).await?;
+        let user = resolve_user_for_db(&db, args.user.as_deref()).await?;
+        visible_memories_for_user(
+            &db,
+            &user,
+            args.scope.as_deref(),
+            None,
+            true,
+            true,
+            args.subject_type.as_deref(),
+            Some(&args.subject_key),
+            args.limit,
+        )
+        .await?
+    };
+
+    if memories.is_empty() {
+        println!("No memory history found for subject key '{}'.", args.subject_key);
+        return Ok(());
+    }
+
+    for memory in memories {
+        print_memory_summary(&memory);
+    }
+
+    Ok(())
+}
+
+async fn memory_forget(args: MemoryForgetArgs) -> Result<()> {
+    let config_dir = resolve_config_dir(args.config_dir)?;
+    let memory = if let Ok(client) = try_daemon_client(&config_dir).await {
+        client
+            .forget_memory(args.user.clone(), args.memory_id.clone(), args.reason.clone())
+            .await?
+            .memory
+    } else {
+        let (_, db) = load_db(&config_dir).await?;
+        let user = resolve_user_for_db(&db, args.user.as_deref()).await?;
+        forget_memory_for_user(&db, &user, &args.memory_id, &args.reason).await?
+    };
+
+    println!("Forgot memory {}.", memory.memory_id);
+    print_memory_detail(&memory);
     Ok(())
 }
 
@@ -1433,6 +1626,212 @@ async fn load_db(config_dir: &PathBuf) -> Result<(LoadedConfig, Database)> {
     let config = LoadedConfig::load_from_dir(config_dir)?;
     let db = Database::connect(&config.runtime.database_path).await?;
     Ok((config, db))
+}
+
+async fn visible_memories_for_user(
+    db: &Database,
+    user: &UserRow,
+    scope: Option<&str>,
+    kind: Option<&str>,
+    include_superseded: bool,
+    include_forgotten: bool,
+    subject_type: Option<&str>,
+    subject_key: Option<&str>,
+    limit: i64,
+) -> Result<Vec<MemoryRow>> {
+    let role_ids = db
+        .list_user_roles(&user.user_id)
+        .await?
+        .into_iter()
+        .map(|row| row.role_id)
+        .collect::<Vec<_>>();
+    let scopes = resolve_visible_scope_filter(&role_ids, scope)?;
+    let kind = parse_memory_kind_filter(kind)?;
+    db.query_memories(
+        Some(&user.user_id),
+        &scopes,
+        kind,
+        subject_type,
+        subject_key,
+        include_superseded,
+        include_forgotten,
+        limit,
+    )
+    .await
+}
+
+async fn visible_memory_by_id(db: &Database, user: &UserRow, memory_id: &str) -> Result<MemoryRow> {
+    let role_ids = db
+        .list_user_roles(&user.user_id)
+        .await?
+        .into_iter()
+        .map(|row| row.role_id)
+        .collect::<Vec<_>>();
+    let visible_scopes = visible_memory_scopes(&role_ids);
+    let memory = db
+        .fetch_memory(memory_id)
+        .await?
+        .ok_or_else(|| anyhow!("memory '{memory_id}' not found"))?;
+    ensure_memory_visible_to_user(&memory, &user.user_id, &visible_scopes)?;
+    Ok(memory)
+}
+
+async fn forget_memory_for_user(
+    db: &Database,
+    user: &UserRow,
+    memory_id: &str,
+    reason: &str,
+) -> Result<MemoryRow> {
+    let role_ids = db
+        .list_user_roles(&user.user_id)
+        .await?
+        .into_iter()
+        .map(|row| row.role_id)
+        .collect::<Vec<_>>();
+    let visible_scopes = visible_memory_scopes(&role_ids);
+    let memory = db
+        .fetch_memory(memory_id)
+        .await?
+        .ok_or_else(|| anyhow!("memory '{memory_id}' not found"))?;
+    ensure_memory_visible_to_user(&memory, &user.user_id, &visible_scopes)?;
+    let scope = memory
+        .scope
+        .parse::<MemoryScope>()
+        .map_err(|_| anyhow!("memory '{}' has unsupported scope '{}'", memory.memory_id, memory.scope))?;
+    if matches!(scope, MemoryScope::Household) && !beaverki_policy::can_write_household_memory(&role_ids) {
+        bail!(
+            "user '{}' is not allowed to forget household memory",
+            user.user_id
+        );
+    }
+    if memory.forgotten_at.is_some() {
+        bail!("memory '{memory_id}' is already forgotten");
+    }
+
+    db.forget_memory(memory_id, reason).await?;
+    db.record_audit_event(
+        "user",
+        &user.user_id,
+        "memory_forgotten",
+        serde_json::json!({
+            "memory_id": memory_id,
+            "scope": memory.scope,
+            "memory_kind": memory.memory_kind,
+            "subject_type": memory.subject_type,
+            "subject_key": memory.subject_key,
+            "reason": reason,
+        }),
+    )
+    .await?;
+    db.fetch_memory(memory_id)
+        .await?
+        .ok_or_else(|| anyhow!("memory '{memory_id}' disappeared after forget"))
+}
+
+fn resolve_visible_scope_filter(role_ids: &[String], scope: Option<&str>) -> Result<Vec<MemoryScope>> {
+    let visible_scopes = visible_memory_scopes(role_ids);
+    match scope {
+        None | Some("all") => Ok(visible_scopes),
+        Some(scope_value) => {
+            let scope = scope_value
+                .parse::<MemoryScope>()
+                .map_err(|_| anyhow!("unsupported scope '{scope_value}', expected private or household"))?;
+            if !visible_scopes.contains(&scope) {
+                bail!("scope '{scope}' is not visible to the selected user");
+            }
+            Ok(vec![scope])
+        }
+    }
+}
+
+fn parse_memory_kind_filter(kind: Option<&str>) -> Result<Option<MemoryKind>> {
+    match kind {
+        None | Some("all") => Ok(None),
+        Some(kind_value) => kind_value
+            .parse::<MemoryKind>()
+            .map(Some)
+            .map_err(|_| anyhow!("unsupported memory kind '{kind_value}', expected semantic or episodic")),
+    }
+}
+
+fn ensure_memory_visible_to_user(
+    memory: &MemoryRow,
+    user_id: &str,
+    visible_scopes: &[MemoryScope],
+) -> Result<()> {
+    let scope = memory
+        .scope
+        .parse::<MemoryScope>()
+        .map_err(|_| anyhow!("memory '{}' has unsupported scope '{}'", memory.memory_id, memory.scope))?;
+    if !visible_scopes.contains(&scope) {
+        bail!("memory '{}' is not visible to the selected user", memory.memory_id);
+    }
+    match memory.owner_user_id.as_deref() {
+        Some(owner_user_id) if owner_user_id == user_id => Ok(()),
+        None => Ok(()),
+        _ => bail!("memory '{}' is not visible to the selected user", memory.memory_id),
+    }
+}
+
+fn print_memory_summary(memory: &MemoryRow) {
+    println!(
+        "- {} scope={} kind={} subject={} key={} owner={} updated={} superseded_by={} forgotten_at={} value={}",
+        memory.memory_id,
+        memory.scope,
+        memory.memory_kind,
+        memory.subject_type,
+        memory.subject_key.as_deref().unwrap_or("<none>"),
+        memory.owner_user_id.as_deref().unwrap_or("<shared>"),
+        memory.updated_at,
+        memory.superseded_by_memory_id.as_deref().unwrap_or("<active>"),
+        memory.forgotten_at.as_deref().unwrap_or("<active>"),
+        memory.content_text
+    );
+}
+
+fn print_memory_detail(memory: &MemoryRow) {
+    println!("Memory: {}", memory.memory_id);
+    println!("Owner: {}", memory.owner_user_id.as_deref().unwrap_or("<shared>"));
+    println!("Scope: {}", memory.scope);
+    println!("Kind: {}", memory.memory_kind);
+    println!("Subject Type: {}", memory.subject_type);
+    println!(
+        "Subject Key: {}",
+        memory.subject_key.as_deref().unwrap_or("<none>")
+    );
+    println!("Source Type: {}", memory.source_type);
+    println!(
+        "Source Ref: {}",
+        memory.source_ref.as_deref().unwrap_or("<none>")
+    );
+    println!("Sensitivity: {}", memory.sensitivity);
+    println!("Task ID: {}", memory.task_id.as_deref().unwrap_or("<none>"));
+    println!("Created At: {}", memory.created_at);
+    println!("Updated At: {}", memory.updated_at);
+    println!(
+        "Last Accessed: {}",
+        memory.last_accessed_at.as_deref().unwrap_or("<none>")
+    );
+    println!(
+        "Superseded By: {}",
+        memory
+            .superseded_by_memory_id
+            .as_deref()
+            .unwrap_or("<active>")
+    );
+    println!(
+        "Forgotten At: {}",
+        memory.forgotten_at.as_deref().unwrap_or("<active>")
+    );
+    println!(
+        "Forgotten Reason: {}",
+        memory.forgotten_reason.as_deref().unwrap_or("<none>")
+    );
+    println!("Content: {}", memory.content_text);
+    println!(
+        "Content JSON: {}",
+        memory.content_json.as_deref().unwrap_or("<none>")
+    );
 }
 
 async fn try_daemon_client(config_dir: &PathBuf) -> Result<DaemonClient> {

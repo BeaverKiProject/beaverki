@@ -7,16 +7,16 @@ use anyhow::{Context, Result, anyhow, bail};
 use beaverki_agent::{AgentMemoryMode, AgentRequest, AgentResult, PrimaryAgentRunner};
 use beaverki_automation as automation;
 use beaverki_config::{LoadedConfig, SecretStore};
-use beaverki_core::{MemoryScope, TaskState, now_rfc3339};
+use beaverki_core::{MemoryKind, MemoryScope, TaskState, now_rfc3339};
 use beaverki_db::{
     ApprovalActionRow, ApprovalActionSet, ApprovalRow, BootstrapState, ConnectorIdentityRow,
-    Database, IssueApprovalActions, NewSchedule, NewScript, NewScriptReview, NewTask, RoleRow,
-    RuntimeHeartbeatRow, RuntimeSessionRow, ScheduleRow, ScriptReviewRow, ScriptRow, TaskEventRow,
-    TaskRow, ToolInvocationRow, UserRoleRow, UserRow,
+    Database, IssueApprovalActions, MemoryRow, NewSchedule, NewScript, NewScriptReview, NewTask,
+    RoleRow, RuntimeHeartbeatRow, RuntimeSessionRow, ScheduleRow, ScriptReviewRow, ScriptRow,
+    TaskEventRow, TaskRow, ToolInvocationRow, UserRoleRow, UserRow,
 };
 use beaverki_memory::MemoryStore;
 use beaverki_models::{ModelProvider, OpenAiProvider};
-use beaverki_policy::{can_grant_approvals, visible_memory_scopes};
+use beaverki_policy::{can_grant_approvals, can_write_household_memory, visible_memory_scopes};
 use beaverki_tools::{ToolContext, builtin_registry};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -46,6 +46,11 @@ pub struct ScriptInspection {
     pub script: ScriptRow,
     pub reviews: Vec<ScriptReviewRow>,
     pub schedules: Vec<ScheduleRow>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryInspection {
+    pub memory: MemoryRow,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -291,6 +296,128 @@ impl Runtime {
             events,
             tool_invocations,
         })
+    }
+
+    pub async fn list_memories(
+        &self,
+        user_id: Option<&str>,
+        scope: Option<&str>,
+        kind: Option<&str>,
+        include_superseded: bool,
+        include_forgotten: bool,
+        limit: i64,
+    ) -> Result<Vec<MemoryRow>> {
+        let user = self.resolve_user(user_id).await?;
+        let role_ids = self.user_role_ids(&user.user_id).await?;
+        let scopes = resolve_visible_memory_scopes(&role_ids, scope)?;
+        let memory_kind = parse_memory_kind_filter(kind)?;
+        self.db
+            .query_memories(
+                Some(&user.user_id),
+                &scopes,
+                memory_kind,
+                None,
+                None,
+                include_superseded,
+                include_forgotten,
+                limit,
+            )
+            .await
+    }
+
+    pub async fn inspect_memory(
+        &self,
+        user_id: Option<&str>,
+        memory_id: &str,
+    ) -> Result<MemoryInspection> {
+        let user = self.resolve_user(user_id).await?;
+        let role_ids = self.user_role_ids(&user.user_id).await?;
+        let visible_scopes = visible_memory_scopes(&role_ids);
+        let memory = self
+            .db
+            .fetch_memory(memory_id)
+            .await?
+            .ok_or_else(|| anyhow!("memory '{memory_id}' not found"))?;
+        ensure_memory_visible_to_user(&memory, &user.user_id, &visible_scopes)?;
+        Ok(MemoryInspection { memory })
+    }
+
+    pub async fn memory_history(
+        &self,
+        user_id: Option<&str>,
+        subject_key: &str,
+        scope: Option<&str>,
+        subject_type: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<MemoryRow>> {
+        let user = self.resolve_user(user_id).await?;
+        let role_ids = self.user_role_ids(&user.user_id).await?;
+        let scopes = resolve_visible_memory_scopes(&role_ids, scope)?;
+        self.db
+            .query_memories(
+                Some(&user.user_id),
+                &scopes,
+                None,
+                subject_type,
+                Some(subject_key),
+                true,
+                true,
+                limit,
+            )
+            .await
+    }
+
+    pub async fn forget_memory(
+        &self,
+        user_id: Option<&str>,
+        memory_id: &str,
+        reason: &str,
+    ) -> Result<MemoryInspection> {
+        let user = self.resolve_user(user_id).await?;
+        let role_ids = self.user_role_ids(&user.user_id).await?;
+        let visible_scopes = visible_memory_scopes(&role_ids);
+        let memory = self
+            .db
+            .fetch_memory(memory_id)
+            .await?
+            .ok_or_else(|| anyhow!("memory '{memory_id}' not found"))?;
+        ensure_memory_visible_to_user(&memory, &user.user_id, &visible_scopes)?;
+        let memory_scope = memory
+            .scope
+            .parse::<MemoryScope>()
+            .map_err(|_| anyhow!("memory '{memory_id}' has unsupported scope '{}'", memory.scope))?;
+        if matches!(memory_scope, MemoryScope::Household) && !can_write_household_memory(&role_ids) {
+            bail!(
+                "user '{}' is not allowed to forget household memory",
+                user.user_id
+            );
+        }
+        if memory.forgotten_at.is_some() {
+            bail!("memory '{memory_id}' is already forgotten");
+        }
+
+        self.db.forget_memory(memory_id, reason).await?;
+        self.db
+            .record_audit_event(
+                "user",
+                &user.user_id,
+                "memory_forgotten",
+                json!({
+                    "memory_id": memory_id,
+                    "scope": memory.scope,
+                    "memory_kind": memory.memory_kind,
+                    "subject_type": memory.subject_type,
+                    "subject_key": memory.subject_key,
+                    "reason": reason,
+                }),
+            )
+            .await?;
+        let updated = self
+            .db
+            .fetch_memory(memory_id)
+            .await?
+            .ok_or_else(|| anyhow!("memory '{memory_id}' disappeared after forget"))?;
+        Ok(MemoryInspection { memory: updated })
     }
 
     pub async fn create_lua_script(
@@ -1404,6 +1531,30 @@ pub enum DaemonRequest {
         user_id: Option<String>,
         task_id: String,
     },
+    ListMemories {
+        user_id: Option<String>,
+        scope: Option<String>,
+        kind: Option<String>,
+        include_superseded: bool,
+        include_forgotten: bool,
+        limit: i64,
+    },
+    ShowMemory {
+        user_id: Option<String>,
+        memory_id: String,
+    },
+    MemoryHistory {
+        user_id: Option<String>,
+        subject_key: String,
+        scope: Option<String>,
+        subject_type: Option<String>,
+        limit: i64,
+    },
+    ForgetMemory {
+        user_id: Option<String>,
+        memory_id: String,
+        reason: String,
+    },
     ListApprovals {
         user_id: Option<String>,
         status: Option<String>,
@@ -1426,6 +1577,8 @@ pub enum DaemonResponse {
     Status { status: DaemonStatus },
     Task { task: TaskRow },
     Inspection { inspection: TaskInspection },
+    Memory { memory: MemoryInspection },
+    Memories { memories: Vec<MemoryRow> },
     Approvals { approvals: Vec<ApprovalRow> },
     ConnectorReply { reply: ConnectorMessageReply },
     ShutdownAck { status: DaemonStatus },
@@ -1517,6 +1670,87 @@ impl DaemonClient {
         {
             DaemonResponse::Inspection { inspection } => Ok(inspection),
             other => Err(anyhow!("unexpected daemon inspection response: {other:?}")),
+        }
+    }
+
+    pub async fn list_memories(
+        &self,
+        user_id: Option<String>,
+        scope: Option<String>,
+        kind: Option<String>,
+        include_superseded: bool,
+        include_forgotten: bool,
+        limit: i64,
+    ) -> Result<Vec<MemoryRow>> {
+        match self
+            .request(DaemonRequest::ListMemories {
+                user_id,
+                scope,
+                kind,
+                include_superseded,
+                include_forgotten,
+                limit,
+            })
+            .await?
+        {
+            DaemonResponse::Memories { memories } => Ok(memories),
+            other => Err(anyhow!("unexpected daemon memories response: {other:?}")),
+        }
+    }
+
+    pub async fn show_memory(
+        &self,
+        user_id: Option<String>,
+        memory_id: String,
+    ) -> Result<MemoryInspection> {
+        match self
+            .request(DaemonRequest::ShowMemory { user_id, memory_id })
+            .await?
+        {
+            DaemonResponse::Memory { memory } => Ok(memory),
+            other => Err(anyhow!("unexpected daemon memory response: {other:?}")),
+        }
+    }
+
+    pub async fn memory_history(
+        &self,
+        user_id: Option<String>,
+        subject_key: String,
+        scope: Option<String>,
+        subject_type: Option<String>,
+        limit: i64,
+    ) -> Result<Vec<MemoryRow>> {
+        match self
+            .request(DaemonRequest::MemoryHistory {
+                user_id,
+                subject_key,
+                scope,
+                subject_type,
+                limit,
+            })
+            .await?
+        {
+            DaemonResponse::Memories { memories } => Ok(memories),
+            other => Err(anyhow!("unexpected daemon memory history response: {other:?}")),
+        }
+    }
+
+    pub async fn forget_memory(
+        &self,
+        user_id: Option<String>,
+        memory_id: String,
+        reason: String,
+    ) -> Result<MemoryInspection> {
+        match self
+            .request(DaemonRequest::ForgetMemory {
+                user_id,
+                memory_id,
+                reason,
+            })
+            .await?
+        {
+            DaemonResponse::Memory { memory } => Ok(memory),
+            other => Err(anyhow!("unexpected daemon forget memory response: {other:?}")),
         }
     }
 
@@ -1950,6 +2184,72 @@ impl RuntimeDaemon {
                 },
                 false,
             )),
+            DaemonRequest::ListMemories {
+                user_id,
+                scope,
+                kind,
+                include_superseded,
+                include_forgotten,
+                limit,
+            } => Ok((
+                DaemonResponse::Memories {
+                    memories: self
+                        .runtime
+                        .list_memories(
+                            user_id.as_deref(),
+                            scope.as_deref(),
+                            kind.as_deref(),
+                            include_superseded,
+                            include_forgotten,
+                            limit,
+                        )
+                        .await?,
+                },
+                false,
+            )),
+            DaemonRequest::ShowMemory { user_id, memory_id } => Ok((
+                DaemonResponse::Memory {
+                    memory: self
+                        .runtime
+                        .inspect_memory(user_id.as_deref(), &memory_id)
+                        .await?,
+                },
+                false,
+            )),
+            DaemonRequest::MemoryHistory {
+                user_id,
+                subject_key,
+                scope,
+                subject_type,
+                limit,
+            } => Ok((
+                DaemonResponse::Memories {
+                    memories: self
+                        .runtime
+                        .memory_history(
+                            user_id.as_deref(),
+                            &subject_key,
+                            scope.as_deref(),
+                            subject_type.as_deref(),
+                            limit,
+                        )
+                        .await?,
+                },
+                false,
+            )),
+            DaemonRequest::ForgetMemory {
+                user_id,
+                memory_id,
+                reason,
+            } => Ok((
+                DaemonResponse::Memory {
+                    memory: self
+                        .runtime
+                        .forget_memory(user_id.as_deref(), &memory_id, &reason)
+                        .await?,
+                },
+                false,
+            )),
             DaemonRequest::ListApprovals { user_id, status } => Ok((
                 DaemonResponse::Approvals {
                     approvals: self
@@ -2217,6 +2517,54 @@ fn parse_scope(value: &str) -> Result<MemoryScope> {
     value
         .parse::<MemoryScope>()
         .map_err(|_| anyhow!("unsupported scope '{value}', expected private or household"))
+}
+
+fn parse_memory_kind_filter(value: Option<&str>) -> Result<Option<MemoryKind>> {
+    match value {
+        None => Ok(None),
+        Some("all") => Ok(None),
+        Some(value) => value
+            .parse::<MemoryKind>()
+            .map(Some)
+            .map_err(|_| anyhow!("unsupported memory kind '{value}', expected semantic or episodic")),
+    }
+}
+
+fn resolve_visible_memory_scopes(
+    role_ids: &[String],
+    requested_scope: Option<&str>,
+) -> Result<Vec<MemoryScope>> {
+    let visible_scopes = visible_memory_scopes(role_ids);
+    match requested_scope {
+        None | Some("all") => Ok(visible_scopes),
+        Some(scope_value) => {
+            let scope = parse_scope(scope_value)?;
+            if !visible_scopes.contains(&scope) {
+                bail!("scope '{scope}' is not visible to the selected user");
+            }
+            Ok(vec![scope])
+        }
+    }
+}
+
+fn ensure_memory_visible_to_user(
+    memory: &MemoryRow,
+    user_id: &str,
+    visible_scopes: &[MemoryScope],
+) -> Result<()> {
+    let memory_scope = memory
+        .scope
+        .parse::<MemoryScope>()
+        .map_err(|_| anyhow!("memory '{}' has unsupported scope '{}'", memory.memory_id, memory.scope))?;
+    if !visible_scopes.contains(&memory_scope) {
+        bail!("memory '{}' is not visible to the selected user", memory.memory_id);
+    }
+
+    match memory.owner_user_id.as_deref() {
+        Some(owner_user_id) if owner_user_id == user_id => Ok(()),
+        None => Ok(()),
+        _ => bail!("memory '{}' is not visible to the selected user", memory.memory_id),
+    }
 }
 
 fn connector_type_from_events(events: &[TaskEventRow]) -> Option<String> {
@@ -3640,5 +3988,204 @@ end"#,
 
         client.shutdown().await.expect("shutdown request");
         handle.await.expect("join").expect("daemon result");
+    }
+
+    #[tokio::test]
+    async fn memory_list_respects_visibility_filters() {
+        let (_tempdir, runtime) = test_runtime(vec![]).await;
+        let private_metadata = json!({ "source_summary": "Alex likes tea." });
+        let household_metadata = json!({ "source_summary": "Household Wi-Fi is beaverki-net." });
+        runtime
+            .db
+            .insert_memory(beaverki_db::NewMemory {
+                owner_user_id: Some("user_alex"),
+                scope: MemoryScope::Private,
+                memory_kind: MemoryKind::Semantic,
+                subject_type: "preference",
+                subject_key: Some("profile.favorite_drink"),
+                content_text: "Tea",
+                content_json: Some(&private_metadata),
+                sensitivity: "normal",
+                source_type: "user_statement",
+                source_ref: Some("turn-private"),
+                task_id: Some("task_private"),
+            })
+            .await
+            .expect("insert private");
+        runtime
+            .db
+            .insert_memory(beaverki_db::NewMemory {
+                owner_user_id: None,
+                scope: MemoryScope::Household,
+                memory_kind: MemoryKind::Semantic,
+                subject_type: "fact",
+                subject_key: Some("household.wifi_name"),
+                content_text: "beaverki-net",
+                content_json: Some(&household_metadata),
+                sensitivity: "normal",
+                source_type: "user_statement",
+                source_ref: Some("turn-household"),
+                task_id: Some("task_household"),
+            })
+            .await
+            .expect("insert household");
+
+        let guest = runtime
+            .db
+            .create_user("Guesty", &[])
+            .await
+            .expect("guest user");
+        let guest_memories = runtime
+            .list_memories(Some(&guest.user_id), None, None, false, false, 10)
+            .await
+            .expect("guest memories");
+        assert_eq!(guest_memories.len(), 0);
+
+        let owner_memories = runtime
+            .list_memories(Some("user_alex"), None, None, false, false, 10)
+            .await
+            .expect("owner memories");
+        assert_eq!(owner_memories.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn memory_history_includes_superseded_versions() {
+        let (_tempdir, runtime) = test_runtime(vec![]).await;
+        let old_metadata = json!({ "source_summary": "User first said coffee." });
+        let new_metadata = json!({ "source_summary": "User corrected to tea." });
+        let old_id = runtime
+            .db
+            .insert_memory(beaverki_db::NewMemory {
+                owner_user_id: Some("user_alex"),
+                scope: MemoryScope::Private,
+                memory_kind: MemoryKind::Semantic,
+                subject_type: "preference",
+                subject_key: Some("profile.favorite_drink"),
+                content_text: "Coffee",
+                content_json: Some(&old_metadata),
+                sensitivity: "normal",
+                source_type: "user_statement",
+                source_ref: Some("turn-1"),
+                task_id: Some("task_1"),
+            })
+            .await
+            .expect("insert old memory");
+        let new_id = runtime
+            .db
+            .insert_memory(beaverki_db::NewMemory {
+                owner_user_id: Some("user_alex"),
+                scope: MemoryScope::Private,
+                memory_kind: MemoryKind::Semantic,
+                subject_type: "preference",
+                subject_key: Some("profile.favorite_drink"),
+                content_text: "Tea",
+                content_json: Some(&new_metadata),
+                sensitivity: "normal",
+                source_type: "user_statement",
+                source_ref: Some("turn-2"),
+                task_id: Some("task_2"),
+            })
+            .await
+            .expect("insert new memory");
+        runtime
+            .db
+            .mark_memory_superseded(&old_id, &new_id)
+            .await
+            .expect("mark superseded");
+
+        let history = runtime
+            .memory_history(
+                Some("user_alex"),
+                "profile.favorite_drink",
+                Some("private"),
+                Some("preference"),
+                10,
+            )
+            .await
+            .expect("history");
+        assert_eq!(history.len(), 2);
+        assert!(history.iter().any(|memory| memory.memory_id == old_id));
+        assert!(history.iter().any(|memory| memory.memory_id == new_id));
+    }
+
+    #[tokio::test]
+    async fn inspect_memory_rejects_household_memory_for_guest() {
+        let (_tempdir, runtime) = test_runtime(vec![]).await;
+        let household_metadata = json!({ "source_summary": "Owner shared the alarm code." });
+        let household_memory_id = runtime
+            .db
+            .insert_memory(beaverki_db::NewMemory {
+                owner_user_id: None,
+                scope: MemoryScope::Household,
+                memory_kind: MemoryKind::Semantic,
+                subject_type: "fact",
+                subject_key: Some("household.alarm_code"),
+                content_text: "2468",
+                content_json: Some(&household_metadata),
+                sensitivity: "normal",
+                source_type: "user_statement",
+                source_ref: Some("turn-1"),
+                task_id: Some("task_household"),
+            })
+            .await
+            .expect("insert household memory");
+        let guest = runtime
+            .db
+            .create_user("Guesty", &[])
+            .await
+            .expect("guest user");
+
+        let error = runtime
+            .inspect_memory(Some(&guest.user_id), &household_memory_id)
+            .await
+            .expect_err("guest should not inspect household memory");
+        assert!(error.to_string().contains("not visible"));
+    }
+
+    #[tokio::test]
+    async fn forget_memory_hides_entry_from_active_retrieval() {
+        let (_tempdir, runtime) = test_runtime(vec![]).await;
+        let metadata = json!({ "source_summary": "User first gave the wrong Wi-Fi password." });
+        let memory_id = runtime
+            .db
+            .insert_memory(beaverki_db::NewMemory {
+                owner_user_id: Some("user_alex"),
+                scope: MemoryScope::Private,
+                memory_kind: MemoryKind::Semantic,
+                subject_type: "fact",
+                subject_key: Some("profile.wifi_password"),
+                content_text: "wrong-password",
+                content_json: Some(&metadata),
+                sensitivity: "normal",
+                source_type: "user_statement",
+                source_ref: Some("turn-1"),
+                task_id: Some("task_wrong"),
+            })
+            .await
+            .expect("insert memory");
+
+        let forgotten = runtime
+            .forget_memory(
+                Some("user_alex"),
+                &memory_id,
+                "User clarified that this was not the password.",
+            )
+            .await
+            .expect("forget memory");
+        assert!(forgotten.memory.forgotten_at.is_some());
+
+        let active = runtime
+            .list_memories(Some("user_alex"), None, None, false, false, 10)
+            .await
+            .expect("list active memories");
+        assert!(!active.iter().any(|memory| memory.memory_id == memory_id));
+
+        let history = runtime
+            .memory_history(Some("user_alex"), "profile.wifi_password", Some("private"), Some("fact"), 10)
+            .await
+            .expect("memory history");
+        assert!(history.iter().any(|memory| memory.memory_id == memory_id));
+        let audit_events = runtime.db.list_audit_events(8).await.expect("audit events");
+        assert!(audit_events.iter().any(|event| event.event_type == "memory_forgotten"));
     }
 }

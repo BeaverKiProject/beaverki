@@ -1,7 +1,9 @@
 use std::path::Path;
 
 use anyhow::{Context, Result, anyhow};
-use beaverki_core::{MemoryScope, TaskState, ToolInvocationStatus, new_prefixed_id, now_rfc3339};
+use beaverki_core::{
+    MemoryKind, MemoryScope, TaskState, ToolInvocationStatus, new_prefixed_id, now_rfc3339,
+};
 use chrono::{Duration as ChronoDuration, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -494,17 +496,20 @@ impl Database {
     pub async fn insert_memory(&self, input: NewMemory<'_>) -> Result<String> {
         let memory_id = new_prefixed_id("mem");
         let timestamp = now_rfc3339();
+        let content_json = input.content_json.map(Value::to_string);
         sqlx::query(
             "INSERT INTO memories
-             (memory_id, owner_user_id, scope, subject_type, subject_key, content_text, content_json, sensitivity, source_type, source_ref, task_id, created_at, updated_at, last_accessed_at)
-             VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?)",
+             (memory_id, owner_user_id, scope, memory_kind, subject_type, subject_key, content_text, content_json, sensitivity, source_type, source_ref, task_id, created_at, updated_at, last_accessed_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&memory_id)
         .bind(input.owner_user_id)
         .bind(input.scope.as_str())
+        .bind(input.memory_kind.as_str())
         .bind(input.subject_type)
         .bind(input.subject_key)
         .bind(input.content_text)
+        .bind(content_json)
         .bind(input.sensitivity)
         .bind(input.source_type)
         .bind(input.source_ref)
@@ -525,8 +530,9 @@ impl Database {
         limit: i64,
     ) -> Result<Vec<MemoryRow>> {
         let mut builder = QueryBuilder::<Sqlite>::new(
-            "SELECT memory_id, owner_user_id, scope, subject_type, subject_key, content_text, content_json, sensitivity, source_type, source_ref, task_id, created_at, updated_at, last_accessed_at
-             FROM memories WHERE ",
+            "SELECT memory_id, owner_user_id, scope, memory_kind, subject_type, subject_key, content_text, content_json, sensitivity, source_type, source_ref, task_id, created_at, updated_at, last_accessed_at, superseded_by_memory_id
+             , forgotten_at, forgotten_reason
+             FROM memories WHERE superseded_by_memory_id IS NULL AND forgotten_at IS NULL AND ",
         );
 
         builder.push("scope IN (");
@@ -549,7 +555,9 @@ impl Database {
             }
         }
 
-        builder.push(" ORDER BY updated_at DESC LIMIT ");
+        builder.push(
+            " ORDER BY CASE memory_kind WHEN 'semantic' THEN 0 ELSE 1 END, updated_at DESC LIMIT ",
+        );
         builder.push_bind(limit);
 
         let query = builder.build_query_as::<MemoryRow>();
@@ -559,6 +567,183 @@ impl Database {
             .context("failed to retrieve memories")?;
 
         Ok(memories)
+    }
+
+    pub async fn query_memories(
+        &self,
+        owner_user_id: Option<&str>,
+        visible_scopes: &[MemoryScope],
+        memory_kind: Option<MemoryKind>,
+        subject_type: Option<&str>,
+        subject_key: Option<&str>,
+        include_superseded: bool,
+        include_forgotten: bool,
+        limit: i64,
+    ) -> Result<Vec<MemoryRow>> {
+        let mut builder = QueryBuilder::<Sqlite>::new(
+            "SELECT memory_id, owner_user_id, scope, memory_kind, subject_type, subject_key, content_text, content_json, sensitivity, source_type, source_ref, task_id, created_at, updated_at, last_accessed_at, superseded_by_memory_id, forgotten_at, forgotten_reason
+             FROM memories WHERE ",
+        );
+
+        if !include_superseded {
+            builder.push("superseded_by_memory_id IS NULL AND ");
+        }
+        if !include_forgotten {
+            builder.push("forgotten_at IS NULL AND ");
+        }
+
+        builder.push("scope IN (");
+        {
+            let mut separated = builder.separated(", ");
+            for scope in visible_scopes {
+                separated.push_bind(scope.as_str());
+            }
+        }
+        builder.push(")");
+
+        match owner_user_id {
+            Some(user_id) => {
+                builder.push(" AND (owner_user_id = ");
+                builder.push_bind(user_id);
+                builder.push(" OR owner_user_id IS NULL)");
+            }
+            None => {
+                builder.push(" AND owner_user_id IS NULL");
+            }
+        }
+
+        if let Some(memory_kind) = memory_kind {
+            builder.push(" AND memory_kind = ");
+            builder.push_bind(memory_kind.as_str());
+        }
+
+        if let Some(subject_type) = subject_type {
+            builder.push(" AND subject_type = ");
+            builder.push_bind(subject_type);
+        }
+
+        if let Some(subject_key) = subject_key {
+            builder.push(" AND subject_key = ");
+            builder.push_bind(subject_key);
+        }
+
+        builder.push(
+            " ORDER BY CASE memory_kind WHEN 'semantic' THEN 0 ELSE 1 END, updated_at DESC LIMIT ",
+        );
+        builder.push_bind(limit);
+
+        let query = builder.build_query_as::<MemoryRow>();
+        let memories = query
+            .fetch_all(&self.pool)
+            .await
+            .context("failed to query memories")?;
+        Ok(memories)
+    }
+
+    pub async fn find_active_memory_by_subject(
+        &self,
+        owner_user_id: Option<&str>,
+        scope: MemoryScope,
+        memory_kind: MemoryKind,
+        subject_type: &str,
+        subject_key: &str,
+    ) -> Result<Option<MemoryRow>> {
+        let row = match owner_user_id {
+            Some(owner_user_id) => {
+                sqlx::query_as::<_, MemoryRow>(
+                    "SELECT memory_id, owner_user_id, scope, memory_kind, subject_type, subject_key, content_text, content_json, sensitivity, source_type, source_ref, task_id, created_at, updated_at, last_accessed_at, superseded_by_memory_id, forgotten_at, forgotten_reason
+                     FROM memories
+                     WHERE owner_user_id = ?
+                       AND scope = ?
+                       AND memory_kind = ?
+                       AND subject_type = ?
+                       AND subject_key = ?
+                       AND superseded_by_memory_id IS NULL
+                       AND forgotten_at IS NULL
+                     ORDER BY updated_at DESC
+                     LIMIT 1",
+                )
+                .bind(owner_user_id)
+                .bind(scope.as_str())
+                .bind(memory_kind.as_str())
+                .bind(subject_type)
+                .bind(subject_key)
+                .fetch_optional(&self.pool)
+                .await
+            }
+            None => {
+                sqlx::query_as::<_, MemoryRow>(
+                    "SELECT memory_id, owner_user_id, scope, memory_kind, subject_type, subject_key, content_text, content_json, sensitivity, source_type, source_ref, task_id, created_at, updated_at, last_accessed_at, superseded_by_memory_id, forgotten_at, forgotten_reason
+                     FROM memories
+                     WHERE owner_user_id IS NULL
+                       AND scope = ?
+                       AND memory_kind = ?
+                       AND subject_type = ?
+                       AND subject_key = ?
+                       AND superseded_by_memory_id IS NULL
+                       AND forgotten_at IS NULL
+                     ORDER BY updated_at DESC
+                     LIMIT 1",
+                )
+                .bind(scope.as_str())
+                .bind(memory_kind.as_str())
+                .bind(subject_type)
+                .bind(subject_key)
+                .fetch_optional(&self.pool)
+                .await
+            }
+        }
+        .context("failed to fetch active memory by subject")?;
+
+        Ok(row)
+    }
+
+    pub async fn fetch_memory(&self, memory_id: &str) -> Result<Option<MemoryRow>> {
+        let row = sqlx::query_as::<_, MemoryRow>(
+            "SELECT memory_id, owner_user_id, scope, memory_kind, subject_type, subject_key, content_text, content_json, sensitivity, source_type, source_ref, task_id, created_at, updated_at, last_accessed_at, superseded_by_memory_id, forgotten_at, forgotten_reason
+             FROM memories
+             WHERE memory_id = ?",
+        )
+        .bind(memory_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to fetch memory")?;
+        Ok(row)
+    }
+
+    pub async fn mark_memory_superseded(
+        &self,
+        memory_id: &str,
+        replacement_memory_id: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE memories
+             SET superseded_by_memory_id = ?, updated_at = ?
+             WHERE memory_id = ?",
+        )
+        .bind(replacement_memory_id)
+        .bind(now_rfc3339())
+        .bind(memory_id)
+        .execute(&self.pool)
+        .await
+        .context("failed to mark memory superseded")?;
+        Ok(())
+    }
+
+    pub async fn forget_memory(&self, memory_id: &str, reason: &str) -> Result<()> {
+        sqlx::query(
+            "UPDATE memories
+             SET forgotten_at = ?, forgotten_reason = ?, updated_at = ?
+             WHERE memory_id = ?",
+        )
+        .bind(now_rfc3339())
+        .bind(reason)
+        .bind(now_rfc3339())
+        .bind(memory_id)
+        .execute(&self.pool)
+        .await
+        .context("failed to mark memory forgotten")?;
+        Ok(())
     }
 
     pub async fn record_audit_event(
@@ -1744,9 +1929,11 @@ pub struct NewTask<'a> {
 pub struct NewMemory<'a> {
     pub owner_user_id: Option<&'a str>,
     pub scope: MemoryScope,
+    pub memory_kind: MemoryKind,
     pub subject_type: &'a str,
     pub subject_key: Option<&'a str>,
     pub content_text: &'a str,
+    pub content_json: Option<&'a Value>,
     pub sensitivity: &'a str,
     pub source_type: &'a str,
     pub source_ref: Option<&'a str>,
@@ -1907,6 +2094,7 @@ pub struct MemoryRow {
     pub memory_id: String,
     pub owner_user_id: Option<String>,
     pub scope: String,
+    pub memory_kind: String,
     pub subject_type: String,
     pub subject_key: Option<String>,
     pub content_text: String,
@@ -1918,6 +2106,9 @@ pub struct MemoryRow {
     pub created_at: String,
     pub updated_at: String,
     pub last_accessed_at: Option<String>,
+    pub superseded_by_memory_id: Option<String>,
+    pub forgotten_at: Option<String>,
+    pub forgotten_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
@@ -2161,9 +2352,11 @@ mod tests {
         db.insert_memory(NewMemory {
             owner_user_id: Some("user_alex"),
             scope: MemoryScope::Private,
+            memory_kind: MemoryKind::Episodic,
             subject_type: "summary",
             subject_key: None,
             content_text: "private memory",
+            content_json: None,
             sensitivity: "normal",
             source_type: "tool",
             source_ref: None,
@@ -2174,9 +2367,11 @@ mod tests {
         db.insert_memory(NewMemory {
             owner_user_id: Some("user_alex"),
             scope: MemoryScope::Household,
+            memory_kind: MemoryKind::Episodic,
             subject_type: "summary",
             subject_key: None,
             content_text: "household memory",
+            content_json: None,
             sensitivity: "normal",
             source_type: "tool",
             source_ref: None,

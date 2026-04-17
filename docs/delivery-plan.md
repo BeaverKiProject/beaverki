@@ -234,6 +234,10 @@ Goal:
 
 Add first-class durable semantic memory behavior on top of the multi-user runtime and automation foundation.
 
+Status:
+
+- implemented in the repository
+
 Stories:
 
 - `M4-001` Implement first-class semantic memory promotion so a primary agent can decide that stable facts should be remembered and persist them into the requesting user's durable private brain/memory by default.

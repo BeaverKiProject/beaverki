@@ -3,10 +3,10 @@ use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, anyhow, bail};
-use beaverki_core::MemoryScope;
+use beaverki_core::{MemoryKind, MemoryScope};
 use beaverki_db::{Database, NewMemory, ScheduleRow};
 use beaverki_models::{ConversationItem, ModelProvider};
-use beaverki_policy::visible_memory_scopes;
+use beaverki_policy::{can_write_household_memory, visible_memory_scopes};
 use beaverki_tools::{ToolContext, builtin_registry};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use cron::Schedule;
@@ -289,6 +289,7 @@ pub async fn execute_lua_script(input: LuaExecutionInput) -> Result<LuaExecution
                         json!({
                             "memory_id": row.memory_id,
                             "scope": row.scope,
+                            "memory_kind": row.memory_kind,
                             "subject_type": row.subject_type,
                             "subject_key": row.subject_key,
                             "content_text": row.content_text,
@@ -308,6 +309,7 @@ pub async fn execute_lua_script(input: LuaExecutionInput) -> Result<LuaExecution
         let db = db.clone();
         let owner_user_id = owner_user_id.clone();
         let task_id = task_id.clone();
+        let role_ids = role_ids.clone();
         let function = lua
             .create_function(move |lua, value: LuaValue| {
                 let payload: Value = lua.from_value(value).map_err(mlua::Error::external)?;
@@ -323,11 +325,25 @@ pub async fn execute_lua_script(input: LuaExecutionInput) -> Result<LuaExecution
                     .unwrap_or("private")
                     .parse::<MemoryScope>()
                     .map_err(mlua::Error::external)?;
+                if matches!(scope, MemoryScope::Household)
+                    && !can_write_household_memory(&role_ids)
+                {
+                    return Err(mlua::Error::external(anyhow!(
+                        "household memory writes are not allowed for this user"
+                    )));
+                }
+                let memory_kind = payload
+                    .get("memory_kind")
+                    .and_then(Value::as_str)
+                    .unwrap_or("episodic")
+                    .parse::<MemoryKind>()
+                    .map_err(mlua::Error::external)?;
                 let subject_type = payload
                     .get("subject_type")
                     .and_then(Value::as_str)
                     .unwrap_or("procedure");
                 let subject_key = payload.get("subject_key").and_then(Value::as_str);
+                let content_json = payload.get("content_json").cloned();
                 let handle = tokio::runtime::Handle::current();
                 let db = db.clone();
                 let owner_user_id = owner_user_id.clone();
@@ -336,11 +352,17 @@ pub async fn execute_lua_script(input: LuaExecutionInput) -> Result<LuaExecution
                 tokio::task::block_in_place(|| {
                     handle.block_on(async move {
                         db.insert_memory(NewMemory {
-                            owner_user_id: Some(&owner_user_id),
+                            owner_user_id: if matches!(scope, MemoryScope::Household) {
+                                None
+                            } else {
+                                Some(&owner_user_id)
+                            },
                             scope,
+                            memory_kind,
                             subject_type,
                             subject_key,
                             content_text,
+                            content_json: content_json.as_ref(),
                             sensitivity: "normal",
                             source_type: "tool",
                             source_ref: Some(&script_id),
