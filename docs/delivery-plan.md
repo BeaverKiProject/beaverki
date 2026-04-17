@@ -225,6 +225,7 @@ Exit criteria:
 
 Candidate follow-up work:
 
+- Better context management and retrieval optimization (including status for context windows and token usage per user)
 - Lua-defined tools
 - additional model providers
 - WhatsApp and Telegram connectors
