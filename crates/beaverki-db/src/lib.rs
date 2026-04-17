@@ -232,6 +232,7 @@ impl Database {
     ) -> Result<TaskRow> {
         self.create_task_with_params(NewTask {
             owner_user_id,
+            initiating_identity_id: &format!("cli:{owner_user_id}"),
             primary_agent_id,
             assigned_agent_id: primary_agent_id,
             parent_task_id: None,
@@ -254,7 +255,7 @@ impl Database {
         )
         .bind(&task_id)
         .bind(input.owner_user_id)
-        .bind(format!("cli:{}", input.owner_user_id))
+        .bind(input.initiating_identity_id)
         .bind(input.primary_agent_id)
         .bind(input.assigned_agent_id)
         .bind(input.parent_task_id)
@@ -914,6 +915,34 @@ impl Database {
         Ok(row)
     }
 
+    pub async fn list_connector_identities(
+        &self,
+        connector_type: Option<&str>,
+    ) -> Result<Vec<ConnectorIdentityRow>> {
+        let rows = if let Some(connector_type) = connector_type {
+            sqlx::query_as::<_, ConnectorIdentityRow>(
+                "SELECT identity_id, connector_type, external_user_id, external_channel_id, mapped_user_id, trust_level, created_at, updated_at
+                 FROM connector_identities
+                 WHERE connector_type = ?
+                 ORDER BY connector_type ASC, external_user_id ASC",
+            )
+            .bind(connector_type)
+            .fetch_all(&self.pool)
+            .await
+            .context("failed to list connector identities")?
+        } else {
+            sqlx::query_as::<_, ConnectorIdentityRow>(
+                "SELECT identity_id, connector_type, external_user_id, external_channel_id, mapped_user_id, trust_level, created_at, updated_at
+                 FROM connector_identities
+                 ORDER BY connector_type ASC, external_user_id ASC",
+            )
+            .fetch_all(&self.pool)
+            .await
+            .context("failed to list connector identities")?
+        };
+        Ok(rows)
+    }
+
     pub async fn fetch_task_for_owner(
         &self,
         owner_user_id: &str,
@@ -1032,6 +1061,7 @@ pub struct BootstrapState {
 #[derive(Debug, Clone, Copy)]
 pub struct NewTask<'a> {
     pub owner_user_id: &'a str,
+    pub initiating_identity_id: &'a str,
     pub primary_agent_id: &'a str,
     pub assigned_agent_id: &'a str,
     pub parent_task_id: Option<&'a str>,

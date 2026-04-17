@@ -128,6 +128,10 @@ Goal:
 
 Add the first external control surface and remote execution environment support on top of the daemonized runtime.
 
+Status:
+
+- implemented in the repository
+
 Stories:
 
 - `M2-001` Implement browser tooling with interactive and headless modes.
@@ -178,19 +182,7 @@ Candidate follow-up work:
 - richer policy expressions beyond RBAC
 - signed skills and trust metadata
 
-## 4. Immediate Next Stories
-
-These are the first stories to execute before moving backlog management fully into GitHub:
-
-1. `M2-001` Implement browser tooling with interactive and headless modes.
-2. `M2-002` Implement Discord connector configuration and token handling.
-3. `M2-003` Implement Discord identity mapping to BeaverKI users.
-4. `M2-004` Support command intake from DMs and allowlisted channels.
-5. `M2-005` Support approval interactions through Discord.
-6. `M2-006` Add audit coverage for connector events and approval responses.
-7. `M2-007` Add end-to-end tests for Discord task submission and approval routing.
-
-## 5. Migration To GitHub Issues
+## 4. Migration To GitHub Issues
 
 When the workspace is scaffolded enough to support normal development flow:
 

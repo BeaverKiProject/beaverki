@@ -20,6 +20,7 @@ pub enum AgentMemoryMode {
 #[derive(Debug, Clone)]
 pub struct AgentRequest {
     pub owner_user_id: String,
+    pub initiating_identity_id: String,
     pub primary_agent_id: String,
     pub assigned_agent_id: String,
     pub role_ids: Vec<String>,
@@ -76,6 +77,7 @@ impl PrimaryAgentRunner {
             .db
             .create_task_with_params(NewTask {
                 owner_user_id: &request.owner_user_id,
+                initiating_identity_id: &request.initiating_identity_id,
                 primary_agent_id: &request.primary_agent_id,
                 assigned_agent_id: &request.assigned_agent_id,
                 parent_task_id: request.parent_task_id.as_deref(),
@@ -514,6 +516,7 @@ impl PrimaryAgentRunner {
             .db
             .create_task_with_params(NewTask {
                 owner_user_id: &parent_request.owner_user_id,
+                initiating_identity_id: &parent_request.initiating_identity_id,
                 primary_agent_id: &parent_request.primary_agent_id,
                 assigned_agent_id: &subagent.agent_id,
                 parent_task_id: Some(&parent_task.task_id),
@@ -551,6 +554,7 @@ impl PrimaryAgentRunner {
 
         let child_request = AgentRequest {
             owner_user_id: parent_request.owner_user_id.clone(),
+            initiating_identity_id: parent_request.initiating_identity_id.clone(),
             primary_agent_id: parent_request.primary_agent_id.clone(),
             assigned_agent_id: subagent.agent_id.clone(),
             role_ids: parent_request.role_ids.clone(),
@@ -789,6 +793,7 @@ mod tests {
         let first = runner
             .run_task(AgentRequest {
                 owner_user_id: default_user.user_id.clone(),
+                initiating_identity_id: format!("cli:{}", default_user.user_id),
                 primary_agent_id: default_user.primary_agent_id.clone().expect("agent"),
                 assigned_agent_id: default_user.primary_agent_id.clone().expect("agent"),
                 role_ids: roles.clone(),
@@ -826,6 +831,7 @@ mod tests {
                 resumed_task,
                 AgentRequest {
                     owner_user_id: default_user.user_id.clone(),
+                    initiating_identity_id: format!("cli:{}", default_user.user_id),
                     primary_agent_id: default_user.primary_agent_id.clone().expect("agent"),
                     assigned_agent_id: default_user.primary_agent_id.clone().expect("agent"),
                     role_ids: roles.clone(),
@@ -902,6 +908,7 @@ mod tests {
         let result = runner
             .run_task(AgentRequest {
                 owner_user_id: default_user.user_id.clone(),
+                initiating_identity_id: format!("cli:{}", default_user.user_id),
                 primary_agent_id: default_user.primary_agent_id.clone().expect("agent"),
                 assigned_agent_id: default_user.primary_agent_id.clone().expect("agent"),
                 role_ids: roles.clone(),

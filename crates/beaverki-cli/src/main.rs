@@ -5,7 +5,7 @@ use std::process::Stdio;
 use anyhow::{Context, Result, anyhow, bail};
 use beaverki_config::{
     LoadedConfig, SetupAnswers, default_app_paths, prompt_passphrase_from_env,
-    write_providers_config, write_setup_files,
+    write_integrations_config, write_providers_config, write_setup_files,
 };
 use beaverki_db::{Database, UserRow};
 use beaverki_models::OpenAiProvider;
@@ -26,6 +26,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    Connector {
+        #[command(subcommand)]
+        command: Box<ConnectorCommand>,
+    },
     Daemon {
         #[command(subcommand)]
         command: Box<DaemonCommand>,
@@ -50,6 +54,22 @@ enum Commands {
         #[command(subcommand)]
         command: Box<RoleCommand>,
     },
+}
+
+#[derive(Subcommand)]
+enum ConnectorCommand {
+    Discord {
+        #[command(subcommand)]
+        command: Box<DiscordCommand>,
+    },
+}
+
+#[derive(Subcommand)]
+enum DiscordCommand {
+    Show(ConfigDirArgs),
+    Configure(DiscordConfigureArgs),
+    MapUser(DiscordMapUserArgs),
+    ListMappings(ConfigDirArgs),
 }
 
 #[derive(Subcommand)]
@@ -211,6 +231,38 @@ struct SetModelsArgs {
 }
 
 #[derive(Args, Clone)]
+struct DiscordConfigureArgs {
+    #[arg(long)]
+    config_dir: Option<PathBuf>,
+    #[arg(long, default_value_t = false)]
+    enable: bool,
+    #[arg(long, default_value_t = false)]
+    disable: bool,
+    #[arg(long)]
+    command_prefix: Option<String>,
+    #[arg(long = "allow-channel")]
+    allowed_channel_ids: Vec<String>,
+    #[arg(long, default_value = "DISCORD_BOT_TOKEN")]
+    discord_token_env: String,
+    #[arg(long, default_value = "BEAVERKI_MASTER_PASSPHRASE")]
+    passphrase_env: String,
+}
+
+#[derive(Args, Clone)]
+struct DiscordMapUserArgs {
+    #[arg(long)]
+    config_dir: Option<PathBuf>,
+    #[arg(long)]
+    external_user_id: String,
+    #[arg(long)]
+    mapped_user_id: String,
+    #[arg(long)]
+    external_channel_id: Option<String>,
+    #[arg(long, default_value = "authenticated_message")]
+    trust_level: String,
+}
+
+#[derive(Args, Clone)]
 struct DaemonStartArgs {
     #[arg(long)]
     config_dir: Option<PathBuf>,
@@ -248,6 +300,14 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
     match cli.command {
+        Commands::Connector { command } => match *command {
+            ConnectorCommand::Discord { command } => match *command {
+                DiscordCommand::Show(args) => discord_show(args).await,
+                DiscordCommand::Configure(args) => discord_configure(args).await,
+                DiscordCommand::MapUser(args) => discord_map_user(args).await,
+                DiscordCommand::ListMappings(args) => discord_list_mappings(args).await,
+            },
+        },
         Commands::Daemon { command } => match *command {
             DaemonCommand::Start(args) => daemon_start(args).await,
             DaemonCommand::Run(args) => daemon_run(args).await,
@@ -367,6 +427,10 @@ async fn setup_init(args: SetupInitArgs) -> Result<()> {
     println!("BeaverKI setup complete.");
     println!("Runtime config: {}", artifacts.runtime_path.display());
     println!("Providers config: {}", artifacts.providers_path.display());
+    println!(
+        "Integrations config: {}",
+        artifacts.integrations_path.display()
+    );
     println!("Encrypted secret ref: {}", artifacts.secret_ref);
     println!("Data dir: {}", data_dir.display());
     println!("State dir: {}", state_dir.display());
@@ -698,6 +762,145 @@ async fn show_models(args: ConfigDirArgs) -> Result<()> {
     println!("Executor model: {}", provider.models.executor);
     println!("Summarizer model: {}", provider.models.summarizer);
 
+    Ok(())
+}
+
+async fn discord_show(args: ConfigDirArgs) -> Result<()> {
+    let config_dir = resolve_config_dir(args.config_dir)?;
+    let config = LoadedConfig::load_from_dir(&config_dir)?;
+    let discord = &config.integrations.discord;
+
+    println!("Config dir: {}", config.config_dir.display());
+    println!("Discord enabled: {}", discord.enabled);
+    println!("Command prefix: {}", discord.command_prefix);
+    println!(
+        "Bot token secret ref: {}",
+        discord
+            .bot_token_secret_ref
+            .as_deref()
+            .unwrap_or("<not configured>")
+    );
+    if discord.allowed_channel_ids.is_empty() {
+        println!("Allowed channels: <none>");
+    } else {
+        println!(
+            "Allowed channels: {}",
+            discord.allowed_channel_ids.join(", ")
+        );
+    }
+    println!("Task wait timeout: {}s", discord.task_wait_timeout_secs);
+    Ok(())
+}
+
+async fn discord_configure(args: DiscordConfigureArgs) -> Result<()> {
+    let config_dir = resolve_config_dir(args.config_dir)?;
+    if args.enable && args.disable {
+        bail!("--enable and --disable cannot be used together");
+    }
+
+    let mut config = LoadedConfig::load_from_dir(&config_dir)?;
+    let mut discord = config.integrations.discord.clone();
+
+    if args.enable {
+        discord.enabled = true;
+    }
+    if args.disable {
+        discord.enabled = false;
+    }
+    if let Some(command_prefix) = args.command_prefix {
+        let command_prefix = command_prefix.trim();
+        if command_prefix.is_empty() {
+            bail!("command prefix cannot be empty");
+        }
+        discord.command_prefix = command_prefix.to_owned();
+    }
+    if !args.allowed_channel_ids.is_empty() {
+        discord.allowed_channel_ids = args.allowed_channel_ids;
+    }
+
+    if discord.enabled {
+        let secret_ref = discord
+            .bot_token_secret_ref
+            .clone()
+            .unwrap_or_else(|| "secret://local/discord_bot_token".to_owned());
+        let token = std::env::var(&args.discord_token_env).unwrap_or_else(|_| {
+            Password::new()
+                .with_prompt("Discord bot token")
+                .interact()
+                .expect("failed to read Discord bot token")
+        });
+        if token.trim().is_empty() {
+            bail!("Discord bot token cannot be empty when enabling the connector");
+        }
+
+        let passphrase = prompt_passphrase_from_env(&args.passphrase_env).unwrap_or_else(|| {
+            Password::new()
+                .with_prompt("Master passphrase")
+                .interact()
+                .expect("failed to read master passphrase")
+        });
+        let secret_store = beaverki_config::SecretStore::new(&config.runtime.secret_dir);
+        secret_store.write_secret(&secret_ref, token.trim(), &passphrase)?;
+        discord.bot_token_secret_ref = Some(secret_ref);
+    }
+
+    config.integrations.discord = discord.clone();
+    let path = write_integrations_config(&config_dir, &config.integrations)?;
+    println!("Updated Discord integration config in {}", path.display());
+    println!("Discord enabled: {}", discord.enabled);
+    println!("Command prefix: {}", discord.command_prefix);
+    println!(
+        "Allowed channels: {}",
+        if discord.allowed_channel_ids.is_empty() {
+            "<none>".to_owned()
+        } else {
+            discord.allowed_channel_ids.join(", ")
+        }
+    );
+
+    Ok(())
+}
+
+async fn discord_map_user(args: DiscordMapUserArgs) -> Result<()> {
+    let config_dir = resolve_config_dir(args.config_dir)?;
+    let (_, db) = load_db(&config_dir).await?;
+    db.fetch_user(&args.mapped_user_id)
+        .await?
+        .ok_or_else(|| anyhow!("user '{}' not found", args.mapped_user_id))?;
+
+    let mapping = db
+        .upsert_connector_identity(
+            "discord",
+            &args.external_user_id,
+            args.external_channel_id.as_deref(),
+            &args.mapped_user_id,
+            &args.trust_level,
+        )
+        .await?;
+
+    println!("Discord mapping updated.");
+    println!("Identity ID: {}", mapping.identity_id);
+    println!("External user ID: {}", mapping.external_user_id);
+    println!("Mapped user ID: {}", mapping.mapped_user_id);
+    println!("Trust level: {}", mapping.trust_level);
+    Ok(())
+}
+
+async fn discord_list_mappings(args: ConfigDirArgs) -> Result<()> {
+    let config_dir = resolve_config_dir(args.config_dir)?;
+    let (_, db) = load_db(&config_dir).await?;
+    let mappings = db.list_connector_identities(Some("discord")).await?;
+    if mappings.is_empty() {
+        println!("No Discord mappings configured.");
+        return Ok(());
+    }
+
+    for mapping in mappings {
+        println!(
+            "- {} => {} ({})",
+            mapping.external_user_id, mapping.mapped_user_id, mapping.trust_level
+        );
+    }
     Ok(())
 }
 

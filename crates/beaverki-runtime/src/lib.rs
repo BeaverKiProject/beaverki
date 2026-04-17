@@ -8,8 +8,9 @@ use beaverki_agent::{AgentMemoryMode, AgentRequest, AgentResult, PrimaryAgentRun
 use beaverki_config::{LoadedConfig, SecretStore};
 use beaverki_core::{MemoryScope, TaskState, now_rfc3339};
 use beaverki_db::{
-    ApprovalRow, BootstrapState, Database, NewTask, RoleRow, RuntimeHeartbeatRow,
-    RuntimeSessionRow, TaskEventRow, TaskRow, ToolInvocationRow, UserRoleRow, UserRow,
+    ApprovalRow, BootstrapState, ConnectorIdentityRow, Database, NewTask, RoleRow,
+    RuntimeHeartbeatRow, RuntimeSessionRow, TaskEventRow, TaskRow, ToolInvocationRow, UserRoleRow,
+    UserRow,
 };
 use beaverki_memory::MemoryStore;
 use beaverki_models::{ModelProvider, OpenAiProvider};
@@ -22,6 +23,8 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Notify, RwLock};
 use tokio::time::{self, Instant};
 use tracing::warn;
+
+mod discord;
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
 const QUEUE_POLL_INTERVAL: Duration = Duration::from_millis(500);
@@ -39,6 +42,7 @@ pub struct Runtime {
     db: Database,
     default_user: UserRow,
     runner: PrimaryAgentRunner,
+    discord_bot_token: Option<String>,
 }
 
 impl Runtime {
@@ -50,7 +54,8 @@ impl Runtime {
             .await?
             .ok_or_else(|| anyhow!("runtime database has no bootstrap user; run setup first"))?;
         let provider = Arc::new(load_provider(&config, passphrase)?) as Arc<dyn ModelProvider>;
-        Self::from_parts(config, db, default_user, provider)
+        let discord_bot_token = load_discord_bot_token(&config, passphrase)?;
+        Self::from_parts_with_secrets(config, db, default_user, provider, discord_bot_token)
     }
 
     pub fn from_parts(
@@ -59,17 +64,34 @@ impl Runtime {
         default_user: UserRow,
         provider: Arc<dyn ModelProvider>,
     ) -> Result<Self> {
+        Self::from_parts_with_secrets(config, db, default_user, provider, None)
+    }
+
+    fn from_parts_with_secrets(
+        config: LoadedConfig,
+        db: Database,
+        default_user: UserRow,
+        provider: Arc<dyn ModelProvider>,
+        discord_bot_token: Option<String>,
+    ) -> Result<Self> {
         let memory = MemoryStore::new(db.clone());
         let mut allowed_roots = vec![config.runtime.workspace_root.clone()];
         if !allowed_roots.contains(&config.runtime.data_dir) {
             allowed_roots.push(config.runtime.data_dir.clone());
         }
+        let mut tool_context =
+            ToolContext::new(config.runtime.workspace_root.clone(), allowed_roots);
+        tool_context.browser_interactive_launcher =
+            config.integrations.browser.interactive_launcher.clone();
+        tool_context.browser_headless_program =
+            config.integrations.browser.headless_browser.clone();
+        tool_context.browser_headless_args = config.integrations.browser.headless_args.clone();
         let runner = PrimaryAgentRunner::new(
             db.clone(),
             memory,
             provider,
             builtin_registry(),
-            ToolContext::new(config.runtime.workspace_root.clone(), allowed_roots),
+            tool_context,
             usize::from(config.runtime.defaults.max_agent_steps),
         );
 
@@ -78,6 +100,7 @@ impl Runtime {
             db,
             default_user,
             runner,
+            discord_bot_token,
         })
     }
 
@@ -87,6 +110,10 @@ impl Runtime {
 
     pub fn db(&self) -> &Database {
         &self.db
+    }
+
+    pub fn discord_bot_token(&self) -> Option<&str> {
+        self.discord_bot_token.as_deref()
     }
 
     pub fn daemon_socket_path(&self) -> PathBuf {
@@ -104,7 +131,10 @@ impl Runtime {
         scope: MemoryScope,
     ) -> Result<AgentResult> {
         let user = self.resolve_user(user_id).await?;
-        let request = self.build_primary_request(&user, objective, scope).await?;
+        let initiating_identity_id = format!("cli:{}", user.user_id);
+        let request = self
+            .build_primary_request(&user, &initiating_identity_id, objective, scope)
+            .await?;
         self.runner.run_task(request).await
     }
 
@@ -115,10 +145,37 @@ impl Runtime {
         scope: MemoryScope,
     ) -> Result<TaskRow> {
         let user = self.resolve_user(user_id).await?;
-        let request = self.build_primary_request(&user, objective, scope).await?;
+        let initiating_identity_id = format!("cli:{}", user.user_id);
+        self.enqueue_objective_for_identity(&user, &initiating_identity_id, objective, scope)
+            .await
+    }
+
+    pub async fn enqueue_objective_from_connector(
+        &self,
+        mapped_user_id: &str,
+        initiating_identity_id: &str,
+        objective: &str,
+        scope: MemoryScope,
+    ) -> Result<TaskRow> {
+        let user = self.resolve_user(Some(mapped_user_id)).await?;
+        self.enqueue_objective_for_identity(&user, initiating_identity_id, objective, scope)
+            .await
+    }
+
+    async fn enqueue_objective_for_identity(
+        &self,
+        user: &UserRow,
+        initiating_identity_id: &str,
+        objective: &str,
+        scope: MemoryScope,
+    ) -> Result<TaskRow> {
+        let request = self
+            .build_primary_request(user, initiating_identity_id, objective, scope)
+            .await?;
         self.db
             .create_task_with_params(NewTask {
                 owner_user_id: &request.owner_user_id,
+                initiating_identity_id: &request.initiating_identity_id,
                 primary_agent_id: &request.primary_agent_id,
                 assigned_agent_id: &request.assigned_agent_id,
                 parent_task_id: request.parent_task_id.as_deref(),
@@ -297,6 +354,42 @@ impl Runtime {
         Ok(result.task)
     }
 
+    pub async fn upsert_connector_identity(
+        &self,
+        connector_type: &str,
+        external_user_id: &str,
+        external_channel_id: Option<&str>,
+        mapped_user_id: &str,
+        trust_level: &str,
+    ) -> Result<ConnectorIdentityRow> {
+        self.db
+            .upsert_connector_identity(
+                connector_type,
+                external_user_id,
+                external_channel_id,
+                mapped_user_id,
+                trust_level,
+            )
+            .await
+    }
+
+    pub async fn fetch_connector_identity(
+        &self,
+        connector_type: &str,
+        external_user_id: &str,
+    ) -> Result<Option<ConnectorIdentityRow>> {
+        self.db
+            .fetch_connector_identity(connector_type, external_user_id)
+            .await
+    }
+
+    pub async fn list_connector_identities(
+        &self,
+        connector_type: Option<&str>,
+    ) -> Result<Vec<ConnectorIdentityRow>> {
+        self.db.list_connector_identities(connector_type).await
+    }
+
     pub fn default_user(&self) -> &UserRow {
         &self.default_user
     }
@@ -315,6 +408,7 @@ impl Runtime {
     async fn build_primary_request(
         &self,
         user: &UserRow,
+        initiating_identity_id: &str,
         objective: &str,
         scope: MemoryScope,
     ) -> Result<AgentRequest> {
@@ -334,6 +428,7 @@ impl Runtime {
         }
         Ok(AgentRequest {
             owner_user_id: user.user_id.clone(),
+            initiating_identity_id: initiating_identity_id.to_owned(),
             primary_agent_id: primary_agent_id.clone(),
             assigned_agent_id: primary_agent_id,
             role_ids: role_ids.clone(),
@@ -367,6 +462,7 @@ impl Runtime {
 
         Ok(AgentRequest {
             owner_user_id: owner_user_id.to_owned(),
+            initiating_identity_id: task.initiating_identity_id.clone(),
             primary_agent_id: task.primary_agent_id.clone(),
             assigned_agent_id: task.assigned_agent_id.clone(),
             role_ids: role_ids.clone(),
@@ -468,6 +564,9 @@ pub enum DaemonRequest {
         approval_id: String,
         approve: bool,
     },
+    SubmitConnectorMessage {
+        message: ConnectorMessageRequest,
+    },
     Shutdown,
 }
 
@@ -479,7 +578,24 @@ pub enum DaemonResponse {
     Task { task: TaskRow },
     Inspection { inspection: TaskInspection },
     Approvals { approvals: Vec<ApprovalRow> },
+    ConnectorReply { reply: ConnectorMessageReply },
     ShutdownAck { status: DaemonStatus },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConnectorMessageRequest {
+    pub connector_type: String,
+    pub external_user_id: String,
+    pub channel_id: String,
+    pub message_id: String,
+    pub content: String,
+    pub is_direct_message: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConnectorMessageReply {
+    pub accepted: bool,
+    pub reply: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -591,6 +707,21 @@ impl DaemonClient {
         match self.request(DaemonRequest::Shutdown).await? {
             DaemonResponse::ShutdownAck { status } => Ok(status),
             other => Err(anyhow!("unexpected daemon shutdown response: {other:?}")),
+        }
+    }
+
+    pub async fn submit_connector_message(
+        &self,
+        message: ConnectorMessageRequest,
+    ) -> Result<ConnectorMessageReply> {
+        match self
+            .request(DaemonRequest::SubmitConnectorMessage { message })
+            .await?
+        {
+            DaemonResponse::ConnectorReply { reply } => Ok(reply),
+            other => Err(anyhow!(
+                "unexpected daemon connector reply response: {other:?}"
+            )),
         }
     }
 
@@ -725,6 +856,7 @@ impl RuntimeDaemon {
         let daemon = Arc::new(self);
         let worker = tokio::spawn(Self::worker_loop(Arc::clone(&daemon)));
         let heartbeat = tokio::spawn(Self::heartbeat_loop(Arc::clone(&daemon)));
+        let connector = daemon.start_connector_loop();
         let accept = tokio::spawn(Self::accept_loop(
             Arc::clone(&daemon),
             listener,
@@ -737,11 +869,21 @@ impl RuntimeDaemon {
         let heartbeat_result = heartbeat
             .await
             .context("daemon heartbeat loop join failure")?;
+        let connector_result = if let Some(connector) = connector {
+            Some(
+                connector
+                    .await
+                    .context("daemon connector loop join failure")?,
+            )
+        } else {
+            None
+        };
 
         let final_error = accept_result
             .err()
             .or(worker_result.err())
-            .or(heartbeat_result.err());
+            .or(heartbeat_result.err())
+            .or_else(|| connector_result.and_then(Result::err));
         daemon
             .finish(final_error.as_ref().map(ToString::to_string))
             .await?;
@@ -970,6 +1112,12 @@ impl RuntimeDaemon {
                 self.refresh_heartbeat(None).await?;
                 Ok((DaemonResponse::Task { task }, false))
             }
+            DaemonRequest::SubmitConnectorMessage { message } => Ok((
+                DaemonResponse::ConnectorReply {
+                    reply: self.handle_connector_message(message).await?,
+                },
+                false,
+            )),
             DaemonRequest::Shutdown => {
                 self.runtime
                     .db
@@ -1133,6 +1281,17 @@ impl RuntimeDaemon {
     async fn shutdown_notified(&self) -> bool {
         self.status.read().await.state == "stopping"
     }
+
+    fn start_connector_loop(self: &Arc<Self>) -> Option<tokio::task::JoinHandle<Result<()>>> {
+        if self.runtime.config.integrations.discord.enabled {
+            let daemon = Arc::clone(self);
+            Some(tokio::spawn(async move {
+                discord::run_discord_loop(daemon).await
+            }))
+        } else {
+            None
+        }
+    }
 }
 
 pub async fn load_daemon_client(config_dir: impl AsRef<Path>) -> Result<DaemonClient> {
@@ -1163,6 +1322,19 @@ fn load_provider(config: &LoadedConfig, passphrase: &str) -> Result<OpenAiProvid
     let secret_store = SecretStore::new(&config.runtime.secret_dir);
     let api_token = secret_store.read_secret(&provider_entry.auth.secret_ref, passphrase)?;
     OpenAiProvider::from_entry(provider_entry, api_token)
+}
+
+fn load_discord_bot_token(config: &LoadedConfig, passphrase: &str) -> Result<Option<String>> {
+    if !config.integrations.discord.enabled {
+        return Ok(None);
+    }
+
+    let Some(secret_ref) = config.integrations.discord.bot_token_secret_ref.as_deref() else {
+        bail!("Discord integration is enabled but bot_token_secret_ref is not configured");
+    };
+
+    let secret_store = SecretStore::new(&config.runtime.secret_dir);
+    Ok(Some(secret_store.read_secret(secret_ref, passphrase)?))
 }
 
 fn parse_scope(value: &str) -> Result<MemoryScope> {
@@ -1258,6 +1430,7 @@ mod tests {
                 active: "fake".to_owned(),
                 entries: vec![],
             },
+            integrations: beaverki_config::IntegrationsConfig::default(),
         };
         let db = Database::connect(&config.runtime.database_path)
             .await
@@ -1391,6 +1564,167 @@ mod tests {
         };
 
         assert_eq!(recovered.result_text.as_deref(), Some("recovered"));
+
+        client.shutdown().await.expect("shutdown request");
+        handle.await.expect("join").expect("daemon result");
+    }
+
+    #[tokio::test]
+    async fn discord_message_from_allowlisted_channel_enqueues_task() {
+        let (_tempdir, mut runtime) = test_runtime(vec![ModelTurnResponse {
+            output_items: vec![json!({
+                "type": "message",
+                "content": [{ "type": "output_text", "text": "discord done" }]
+            })],
+            tool_calls: vec![],
+            output_text: "discord done".to_owned(),
+        }])
+        .await;
+        runtime.config.integrations.discord.allowed_channel_ids = vec!["channel-1".to_owned()];
+        let mapping = runtime
+            .db
+            .upsert_connector_identity(
+                "discord",
+                "discord-user-1",
+                Some("channel-1"),
+                "user_alex",
+                "authenticated_message",
+            )
+            .await
+            .expect("mapping");
+
+        let socket_path = runtime.daemon_socket_path();
+        let daemon = RuntimeDaemon::new(runtime);
+        let handle = tokio::spawn(async move { daemon.run_until(pending()).await });
+        let client = DaemonClient::wait_until_ready(socket_path, Duration::from_secs(5))
+            .await
+            .expect("daemon ready");
+
+        let reply = client
+            .submit_connector_message(ConnectorMessageRequest {
+                connector_type: "discord".to_owned(),
+                external_user_id: "discord-user-1".to_owned(),
+                channel_id: "channel-1".to_owned(),
+                message_id: "msg-1".to_owned(),
+                content: "!bk Summarize the allowlisted channel request".to_owned(),
+                is_direct_message: false,
+            })
+            .await
+            .expect("connector message");
+
+        assert!(reply.accepted);
+        let reply_text = reply.reply.as_deref().expect("reply");
+        assert!(reply_text.contains("discord done"));
+        assert!(!reply_text.contains(&mapping.identity_id));
+        assert!(!reply_text.starts_with("Task "));
+
+        client.shutdown().await.expect("shutdown request");
+        handle.await.expect("join").expect("daemon result");
+    }
+
+    #[tokio::test]
+    async fn discord_approval_message_resolves_pending_task() {
+        let (_tempdir, runtime) = test_runtime(vec![
+            ModelTurnResponse {
+                output_items: vec![json!({
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "shell_exec",
+                    "arguments": "{\"command\":\"mkdir approved-dir\"}"
+                })],
+                tool_calls: vec![beaverki_models::ModelToolCall {
+                    call_id: "call_1".to_owned(),
+                    name: "shell_exec".to_owned(),
+                    arguments: json!({ "command": "mkdir approved-dir" }),
+                }],
+                output_text: String::new(),
+            },
+            ModelTurnResponse {
+                output_items: vec![json!({
+                    "type": "message",
+                    "content": [{ "type": "output_text", "text": "approved through discord" }]
+                })],
+                tool_calls: vec![],
+                output_text: "approved through discord".to_owned(),
+            },
+        ])
+        .await;
+        runtime
+            .db
+            .upsert_connector_identity(
+                "discord",
+                "discord-user-2",
+                None,
+                "user_alex",
+                "authenticated_message",
+            )
+            .await
+            .expect("mapping");
+
+        let db = runtime.db.clone();
+        let socket_path = runtime.daemon_socket_path();
+        let daemon = RuntimeDaemon::new(runtime);
+        let handle = tokio::spawn(async move { daemon.run_until(pending()).await });
+        let client = DaemonClient::wait_until_ready(socket_path, Duration::from_secs(5))
+            .await
+            .expect("daemon ready");
+
+        let pending_reply = client
+            .submit_connector_message(ConnectorMessageRequest {
+                connector_type: "discord".to_owned(),
+                external_user_id: "discord-user-2".to_owned(),
+                channel_id: "dm-1".to_owned(),
+                message_id: "msg-approval-1".to_owned(),
+                content: "Create a directory that needs approval".to_owned(),
+                is_direct_message: true,
+            })
+            .await
+            .expect("connector message");
+
+        assert!(pending_reply.accepted);
+        assert!(
+            pending_reply
+                .reply
+                .as_deref()
+                .expect("reply")
+                .contains("waiting for approval")
+        );
+
+        let approval = db
+            .list_approvals_for_user("user_alex", Some("pending"))
+            .await
+            .expect("approvals")
+            .into_iter()
+            .next()
+            .expect("approval");
+
+        let approval_reply = client
+            .submit_connector_message(ConnectorMessageRequest {
+                connector_type: "discord".to_owned(),
+                external_user_id: "discord-user-2".to_owned(),
+                channel_id: "dm-1".to_owned(),
+                message_id: "msg-approval-2".to_owned(),
+                content: format!("approve {}", approval.approval_id),
+                is_direct_message: true,
+            })
+            .await
+            .expect("approval connector message");
+
+        assert!(approval_reply.accepted);
+        assert!(
+            approval_reply
+                .reply
+                .as_deref()
+                .expect("approval reply")
+                .contains("approved through discord")
+        );
+
+        let completed_task = db
+            .fetch_task(&approval.task_id)
+            .await
+            .expect("task fetch")
+            .expect("task");
+        assert_eq!(completed_task.state, TaskState::Completed.as_str());
 
         client.shutdown().await.expect("shutdown request");
         handle.await.expect("join").expect("daemon result");

@@ -28,6 +28,7 @@ The repository now includes:
 - `M0 Foundation`
 - `M1 Core Multi-User`
 - `M1.5 Runtime Daemon`
+- `M2 Integrations`
 
 Implemented so far:
 
@@ -45,16 +46,17 @@ Implemented so far:
 - CLI approval flow for risky shell commands
 - bounded sub-agent spawning with explicit task slices
 - shell and filesystem tools for the primary agent
+- browser tooling with interactive and headless modes
+- Discord bot configuration and encrypted token storage
+- Discord identity mapping, DM intake, allowlisted channel intake, and approval routing
 - CI for formatting, linting, and tests
 
 Still intentionally out of scope:
 
-- Discord
-- browser automation
 - Lua runtime
 - safety-agent review flows
 
-Implementation remains staged. The next platform milestone is `M1.5 Runtime Daemon`.
+Implementation remains staged. The next platform milestone is `M3 Automation`.
 
 ## Project Direction
 
@@ -102,7 +104,7 @@ Every material change should start from an issue with clear acceptance criteria.
 ## Near-Term Next Steps
 
 - add Discord and browser integrations on top of the daemon
-- expand the daemon into connector-driven and scheduled background work
+- expand the daemon into richer connector-driven and scheduled background work
 - add safety review flows for risky generated actions and scripts
 
 ## Quick Start
@@ -131,6 +133,10 @@ cargo run -p beaverki-cli -- setup set-models --planner-model gpt-5.4 --executor
 cargo run -p beaverki-cli -- daemon start
 cargo run -p beaverki-cli -- daemon status
 cargo run -p beaverki-cli -- daemon stop
+cargo run -p beaverki-cli -- connector discord show
+cargo run -p beaverki-cli -- connector discord configure --enable --allow-channel 1234567890
+cargo run -p beaverki-cli -- connector discord map-user --external-user-id 111111111111111111 --mapped-user-id user_casey
+cargo run -p beaverki-cli -- connector discord list-mappings
 cargo run -p beaverki-cli -- role list
 cargo run -p beaverki-cli -- user list
 cargo run -p beaverki-cli -- user add --display-name Casey --role adult
@@ -144,6 +150,8 @@ cargo run -p beaverki-cli -- approval approve --approval-id <approval-id>
 Use `--config-dir` if you want a non-default location.
 
 `setup init` verifies the OpenAI API key unless `--skip-openai-check` is passed. The API token is stored in an age-encrypted local secret file under the BeaverKI state directory. `daemon start` and `daemon run` read the master passphrase from `BEAVERKI_MASTER_PASSPHRASE` when available, otherwise they prompt for it.
+
+Enable Discord by storing a bot token with `connector discord configure --enable`, then map each Discord user ID to a BeaverKI user with `connector discord map-user`. Direct messages are accepted by default; guild messages are accepted only from allowlisted channel IDs and only when they start with the configured command prefix.
 
 The daemon keeps the decrypted provider credentials only in memory for the current runtime process. Start it once with `daemon start` or `daemon run`, then use the existing `task` and `approval` CLI commands against the local socket.
 

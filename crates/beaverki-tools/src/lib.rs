@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::env;
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
@@ -26,6 +27,9 @@ pub struct ToolContext {
     pub allowed_roots: Vec<PathBuf>,
     pub max_output_chars: usize,
     pub approved_shell_commands: Vec<String>,
+    pub browser_interactive_launcher: Option<String>,
+    pub browser_headless_program: Option<String>,
+    pub browser_headless_args: Vec<String>,
 }
 
 impl ToolContext {
@@ -35,6 +39,9 @@ impl ToolContext {
             allowed_roots,
             max_output_chars: 12_000,
             approved_shell_commands: Vec::new(),
+            browser_interactive_launcher: None,
+            browser_headless_program: None,
+            browser_headless_args: Vec::new(),
         }
     }
 }
@@ -134,7 +141,59 @@ pub fn builtin_registry() -> ToolRegistry {
     registry.register(ReadTextTool);
     registry.register(WriteTextTool);
     registry.register(SearchFilesTool);
+    registry.register(BrowserVisitTool);
     registry
+}
+
+pub struct BrowserVisitTool;
+
+#[async_trait]
+impl Tool for BrowserVisitTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "browser_visit".to_owned(),
+            description: "Open a page in an interactive browser session or fetch its DOM through a headless browser session.".to_owned(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "url": { "type": "string" },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["interactive", "headless"]
+                    }
+                },
+                "required": ["url", "mode"],
+                "additionalProperties": false
+            }),
+        }
+    }
+
+    async fn call(
+        &self,
+        input: Value,
+        context: &ToolContext,
+    ) -> std::result::Result<ToolOutput, ToolError> {
+        let url = input
+            .get("url")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| ToolError::Failed(anyhow!("browser_visit requires url")))?;
+        ensure_browser_url(url).map_err(ToolError::Failed)?;
+
+        let mode = input
+            .get("mode")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ToolError::Failed(anyhow!("browser_visit requires mode")))?;
+
+        match mode {
+            "interactive" => launch_interactive_browser(url, context).await,
+            "headless" => run_headless_browser(url, context).await,
+            other => Err(ToolError::Failed(anyhow!(
+                "unsupported browser mode '{other}'"
+            ))),
+        }
+    }
 }
 
 pub struct ShellExecTool;
@@ -477,6 +536,173 @@ fn truncate_text(text: &str, max_chars: usize) -> String {
     }
 }
 
+fn ensure_browser_url(url: &str) -> Result<()> {
+    if url.starts_with("https://") || url.starts_with("http://") {
+        Ok(())
+    } else {
+        bail!("browser_visit only supports http:// and https:// URLs")
+    }
+}
+
+async fn launch_interactive_browser(
+    url: &str,
+    context: &ToolContext,
+) -> std::result::Result<ToolOutput, ToolError> {
+    #[cfg(target_os = "macos")]
+    let command_and_args = {
+        let launcher = context
+            .browser_interactive_launcher
+            .clone()
+            .unwrap_or_else(|| "open".to_owned());
+        (launcher, vec![url.to_owned()])
+    };
+
+    #[cfg(target_os = "linux")]
+    let command_and_args = {
+        let launcher = context
+            .browser_interactive_launcher
+            .clone()
+            .unwrap_or_else(|| "xdg-open".to_owned());
+        (launcher, vec![url.to_owned()])
+    };
+
+    #[cfg(target_os = "windows")]
+    let command_and_args = {
+        let launcher = context
+            .browser_interactive_launcher
+            .clone()
+            .unwrap_or_else(|| "cmd".to_owned());
+        (
+            launcher,
+            vec![
+                "/C".to_owned(),
+                "start".to_owned(),
+                "".to_owned(),
+                url.to_owned(),
+            ],
+        )
+    };
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    let command_and_args = {
+        let launcher = context
+            .browser_interactive_launcher
+            .clone()
+            .ok_or_else(|| {
+                ToolError::Failed(anyhow!(
+                    "interactive browser launcher is not configured for this platform"
+                ))
+            })?;
+        (launcher, vec![url.to_owned()])
+    };
+
+    let program = resolve_program(&command_and_args.0).ok_or_else(|| {
+        ToolError::Failed(anyhow!(
+            "interactive browser launcher '{}' was not found in PATH",
+            command_and_args.0
+        ))
+    })?;
+
+    let mut child = Command::new(&program);
+    child
+        .args(&command_and_args.1)
+        .current_dir(&context.working_dir);
+    let spawned = child
+        .spawn()
+        .with_context(|| {
+            format!(
+                "failed to launch interactive browser via {}",
+                program.display()
+            )
+        })
+        .map_err(ToolError::Failed)?;
+
+    Ok(ToolOutput {
+        payload: json!({
+            "mode": "interactive",
+            "url": url,
+            "launcher": program.display().to_string(),
+            "pid": spawned.id(),
+        }),
+    })
+}
+
+async fn run_headless_browser(
+    url: &str,
+    context: &ToolContext,
+) -> std::result::Result<ToolOutput, ToolError> {
+    let program_name = context
+        .browser_headless_program
+        .clone()
+        .unwrap_or_else(default_headless_browser_program);
+    let program = resolve_program(&program_name).ok_or_else(|| {
+        ToolError::Failed(anyhow!(
+            "headless browser '{}' was not found in PATH",
+            program_name
+        ))
+    })?;
+
+    let mut child = Command::new(&program);
+    child.current_dir(&context.working_dir);
+    child.args(&context.browser_headless_args);
+    child.args(["--headless", "--disable-gpu", "--dump-dom", url]);
+
+    let output = timeout(Duration::from_secs(30), child.output())
+        .await
+        .context("headless browser command timed out")
+        .map_err(ToolError::Failed)?
+        .with_context(|| format!("failed to start headless browser via {}", program.display()))
+        .map_err(ToolError::Failed)?;
+
+    Ok(ToolOutput {
+        payload: json!({
+            "mode": "headless",
+            "url": url,
+            "browser": program.display().to_string(),
+            "exit_code": output.status.code(),
+            "dom": truncate_text(&String::from_utf8_lossy(&output.stdout), 32_000),
+            "stderr": truncate_text(&String::from_utf8_lossy(&output.stderr), context.max_output_chars),
+        }),
+    })
+}
+
+fn default_headless_browser_program() -> String {
+    if cfg!(target_os = "windows") {
+        "chrome".to_owned()
+    } else {
+        [
+            "chromium",
+            "chromium-browser",
+            "google-chrome",
+            "microsoft-edge",
+            "chrome",
+        ]
+        .into_iter()
+        .find_map(resolve_program)
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "chromium".to_owned())
+    }
+}
+
+fn resolve_program(program: &str) -> Option<PathBuf> {
+    let candidate = Path::new(program);
+    if candidate.is_absolute() || program.contains('/') {
+        if candidate.exists() {
+            return Some(candidate.to_path_buf());
+        }
+        return None;
+    }
+
+    let paths = env::var_os("PATH")?;
+    for path in env::split_paths(&paths) {
+        let joined = path.join(program);
+        if joined.is_file() {
+            return Some(joined);
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -555,5 +781,106 @@ mod tests {
             .await;
 
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn rejects_non_http_browser_urls() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let context = ToolContext::new(
+            tempdir.path().to_path_buf(),
+            vec![tempdir.path().to_path_buf()],
+        );
+
+        let result = BrowserVisitTool
+            .call(
+                json!({
+                    "url": "file:///tmp/secret.txt",
+                    "mode": "headless"
+                }),
+                &context,
+            )
+            .await;
+
+        assert!(result.is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn interactive_browser_uses_configured_launcher() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let launcher_path = tempdir.path().join("launcher.sh");
+        let output_path = tempdir.path().join("launcher.out");
+        fs::write(
+            &launcher_path,
+            format!(
+                "#!/bin/sh\nprintf '%s' \"$1\" > '{}'\n",
+                output_path.display()
+            ),
+        )
+        .expect("write launcher");
+        let mut permissions = fs::metadata(&launcher_path)
+            .expect("metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&launcher_path, permissions).expect("permissions");
+
+        let mut context = ToolContext::new(
+            tempdir.path().to_path_buf(),
+            vec![tempdir.path().to_path_buf()],
+        );
+        context.browser_interactive_launcher = Some(launcher_path.display().to_string());
+
+        let output = BrowserVisitTool
+            .call(
+                json!({
+                    "url": "https://example.com",
+                    "mode": "interactive"
+                }),
+                &context,
+            )
+            .await
+            .expect("browser output");
+
+        assert_eq!(output.payload["mode"], "interactive");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn headless_browser_returns_dom() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let browser_path = tempdir.path().join("headless-browser.sh");
+        fs::write(&browser_path, "#!/bin/sh\necho '<html>ok</html>'\n").expect("write browser");
+        let mut permissions = fs::metadata(&browser_path).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&browser_path, permissions).expect("permissions");
+
+        let mut context = ToolContext::new(
+            tempdir.path().to_path_buf(),
+            vec![tempdir.path().to_path_buf()],
+        );
+        context.browser_headless_program = Some(browser_path.display().to_string());
+
+        let output = BrowserVisitTool
+            .call(
+                json!({
+                    "url": "https://example.com",
+                    "mode": "headless"
+                }),
+                &context,
+            )
+            .await
+            .expect("browser output");
+
+        assert_eq!(output.payload["mode"], "headless");
+        assert!(
+            output.payload["dom"]
+                .as_str()
+                .expect("dom")
+                .contains("<html>ok</html>")
+        );
     }
 }

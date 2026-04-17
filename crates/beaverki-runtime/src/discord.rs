@@ -1,0 +1,660 @@
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::{Context, Result, anyhow, bail};
+use futures_util::{SinkExt, StreamExt};
+use reqwest::StatusCode;
+use serde::Deserialize;
+use serde_json::{Value, json};
+use tokio::time::{self, MissedTickBehavior};
+use tokio_tungstenite::connect_async;
+use tokio_tungstenite::tungstenite::Message;
+use tracing::warn;
+
+use crate::{ConnectorMessageReply, ConnectorMessageRequest, RuntimeDaemon};
+use beaverki_core::{MemoryScope, TaskState};
+
+const DISCORD_GATEWAY_URL: &str = "https://discord.com/api/v10/gateway/bot";
+const DISCORD_API_BASE: &str = "https://discord.com/api/v10";
+const DISCORD_INTENTS: i64 = (1 << 0) | (1 << 9) | (1 << 12) | (1 << 15);
+const DISCORD_MAX_MESSAGE_LEN: usize = 1_900;
+
+#[derive(Debug, Deserialize)]
+struct DiscordGatewayInfo {
+    url: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct DiscordRateLimitBody {
+    retry_after: Option<f64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DiscordMessageCreate {
+    id: String,
+    channel_id: String,
+    guild_id: Option<String>,
+    content: String,
+    author: DiscordAuthor,
+}
+
+#[derive(Debug, Deserialize)]
+struct DiscordAuthor {
+    id: String,
+    bot: Option<bool>,
+}
+
+pub(crate) async fn run_discord_loop(daemon: Arc<RuntimeDaemon>) -> Result<()> {
+    let token = daemon
+        .runtime
+        .discord_bot_token()
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| anyhow!("Discord connector is enabled but no bot token is loaded"))?;
+    let http_client = reqwest::Client::builder()
+        .user_agent("beaverki/0.1")
+        .build()
+        .context("failed to build Discord HTTP client")?;
+
+    daemon
+        .runtime
+        .db
+        .record_audit_event(
+            "connector",
+            "discord",
+            "discord_connector_started",
+            json!({
+                "allowed_channel_ids": daemon.runtime.config.integrations.discord.allowed_channel_ids,
+                "command_prefix": daemon.runtime.config.integrations.discord.command_prefix,
+            }),
+        )
+        .await?;
+
+    let mut retry_delay = Duration::from_secs(1);
+    loop {
+        if daemon.shutdown_notified().await {
+            return Ok(());
+        }
+
+        match run_gateway_session(Arc::clone(&daemon), &http_client, &token).await {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                warn!("discord connector session failed: {error:#}");
+                daemon
+                    .runtime
+                    .db
+                    .record_audit_event(
+                        "connector",
+                        "discord",
+                        "discord_connector_error",
+                        json!({ "error": error.to_string() }),
+                    )
+                    .await?;
+                if daemon.shutdown_notified().await {
+                    return Ok(());
+                }
+                retry_delay = retry_delay_for_error(&error).unwrap_or(retry_delay);
+                time::sleep(retry_delay).await;
+                retry_delay = (retry_delay * 2).min(Duration::from_secs(30));
+            }
+        }
+    }
+}
+
+async fn run_gateway_session(
+    daemon: Arc<RuntimeDaemon>,
+    http_client: &reqwest::Client,
+    token: &str,
+) -> Result<()> {
+    let gateway_response = http_client
+        .get(DISCORD_GATEWAY_URL)
+        .header("Authorization", format!("Bot {token}"))
+        .send()
+        .await
+        .context("failed to fetch Discord gateway URL")?;
+    if gateway_response.status() == StatusCode::TOO_MANY_REQUESTS {
+        let retry_after = parse_retry_after_secs(gateway_response).await;
+        if let Some(retry_after) = retry_after {
+            bail!(
+                "Discord gateway URL request rate limited; retry_after_secs={retry_after}"
+            );
+        }
+        bail!("Discord gateway URL request rate limited");
+    }
+    let gateway_info = gateway_response
+        .error_for_status()
+        .context("Discord gateway URL request failed")?
+        .json::<DiscordGatewayInfo>()
+        .await
+        .context("failed to decode Discord gateway URL response")?;
+    let gateway_url = build_gateway_websocket_url(&gateway_info.url);
+    let (mut socket, _) = connect_async(&gateway_url)
+        .await
+        .with_context(|| format!("failed to connect to Discord gateway at {gateway_url}"))?;
+
+    let mut sequence_number: Option<i64> = None;
+    let mut heartbeat = time::interval(Duration::from_secs(60));
+    heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut identified = false;
+
+    loop {
+        tokio::select! {
+            _ = daemon.shutdown.notified() => {
+                let _ = socket.close(None).await;
+                return Ok(());
+            }
+            _ = heartbeat.tick(), if identified => {
+                let heartbeat_payload = json!({
+                    "op": 1,
+                    "d": sequence_number,
+                });
+                socket
+                    .send(Message::Text(heartbeat_payload.to_string()))
+                    .await
+                    .context("failed to send Discord heartbeat")?;
+            }
+            next_message = socket.next() => {
+                let Some(next_message) = next_message else {
+                    bail!("Discord gateway stream ended unexpectedly");
+                };
+                let next_message = next_message.context("Discord gateway message error")?;
+                match next_message {
+                    Message::Text(text) => {
+                        let payload: Value = serde_json::from_str(&text)
+                            .context("failed to decode Discord gateway payload")?;
+                        if let Some(sequence) = payload.get("s").and_then(Value::as_i64) {
+                            sequence_number = Some(sequence);
+                        }
+
+                        match payload.get("op").and_then(Value::as_i64).unwrap_or_default() {
+                            0 => {
+                                if let Some(event_type) = payload.get("t").and_then(Value::as_str) {
+                                    match event_type {
+                                        "READY" => {
+                                            daemon.runtime.db.record_audit_event(
+                                                "connector",
+                                                "discord",
+                                                "discord_connector_ready",
+                                                json!({ "session": payload.get("d") }),
+                                            ).await?;
+                                        }
+                                        "MESSAGE_CREATE" => {
+                                            let message = serde_json::from_value::<DiscordMessageCreate>(
+                                                payload.get("d").cloned().unwrap_or(Value::Null),
+                                            )
+                                            .context("failed to decode Discord message event")?;
+                                            if message.author.bot.unwrap_or(false) {
+                                                continue;
+                                            }
+                                            let reply = daemon.handle_connector_message(ConnectorMessageRequest {
+                                                connector_type: "discord".to_owned(),
+                                                external_user_id: message.author.id,
+                                                channel_id: message.channel_id.clone(),
+                                                message_id: message.id,
+                                                content: message.content,
+                                                is_direct_message: message.guild_id.is_none(),
+                                            }).await?;
+                                            if let Some(reply_text) = reply.reply {
+                                                send_discord_message(
+                                                    http_client,
+                                                    token,
+                                                    &message.channel_id,
+                                                    &reply_text,
+                                                )
+                                                .await?;
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                            1 => {
+                                let heartbeat_payload = json!({
+                                    "op": 1,
+                                    "d": sequence_number,
+                                });
+                                socket
+                                    .send(Message::Text(heartbeat_payload.to_string()))
+                                    .await
+                                    .context("failed to send Discord heartbeat request response")?;
+                            }
+                            7 => bail!("Discord gateway requested reconnect"),
+                            9 => bail!("Discord gateway invalidated the session"),
+                            10 => {
+                                let heartbeat_interval_ms = payload
+                                    .get("d")
+                                    .and_then(|value| value.get("heartbeat_interval"))
+                                    .and_then(Value::as_u64)
+                                    .ok_or_else(|| anyhow!("Discord gateway hello payload missing heartbeat interval"))?;
+                                heartbeat = time::interval(Duration::from_millis(heartbeat_interval_ms));
+                                heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
+                                let identify_payload = json!({
+                                    "op": 2,
+                                    "d": {
+                                        "token": token,
+                                        "intents": DISCORD_INTENTS,
+                                        "properties": {
+                                            "os": std::env::consts::OS,
+                                            "browser": "beaverki",
+                                            "device": "beaverki"
+                                        }
+                                    }
+                                });
+                                socket
+                                    .send(Message::Text(identify_payload.to_string()))
+                                    .await
+                                    .context("failed to send Discord identify payload")?;
+                                identified = true;
+                            }
+                            11 => {}
+                            _ => {}
+                        }
+                    }
+                    Message::Ping(payload) => {
+                        socket
+                            .send(Message::Pong(payload))
+                            .await
+                            .context("failed to respond to Discord ping")?;
+                    }
+                    Message::Close(frame) => {
+                        bail!("Discord gateway closed: {frame:?}");
+                    }
+                    Message::Binary(_) | Message::Pong(_) | Message::Frame(_) => {}
+                }
+            }
+        }
+    }
+}
+
+async fn send_discord_message(
+    http_client: &reqwest::Client,
+    token: &str,
+    channel_id: &str,
+    content: &str,
+) -> Result<()> {
+    let message = truncate_reply(content);
+    http_client
+        .post(format!("{DISCORD_API_BASE}/channels/{channel_id}/messages"))
+        .header("Authorization", format!("Bot {token}"))
+        .json(&json!({ "content": message }))
+        .send()
+        .await
+        .with_context(|| format!("failed to send Discord message to channel {channel_id}"))?
+        .error_for_status()
+        .with_context(|| format!("Discord rejected message for channel {channel_id}"))?;
+    Ok(())
+}
+
+impl RuntimeDaemon {
+    pub(crate) async fn handle_connector_message(
+        &self,
+        message: ConnectorMessageRequest,
+    ) -> Result<ConnectorMessageReply> {
+        if message.connector_type != "discord" {
+            bail!("unsupported connector type '{}'", message.connector_type);
+        }
+
+        self.runtime
+            .db
+            .record_audit_event(
+                "connector",
+                &format!("discord:{}", message.external_user_id),
+                "connector_message_received",
+                json!({
+                    "message_id": message.message_id,
+                    "channel_id": message.channel_id,
+                    "is_direct_message": message.is_direct_message,
+                }),
+            )
+            .await?;
+
+        let discord_config = &self.runtime.config.integrations.discord;
+        if !message.is_direct_message
+            && !discord_config
+                .allowed_channel_ids
+                .iter()
+                .any(|channel_id| channel_id == &message.channel_id)
+        {
+            self.runtime
+                .db
+                .record_audit_event(
+                    "connector",
+                    &format!("discord:{}", message.external_user_id),
+                    "connector_message_ignored",
+                    json!({
+                        "reason": "channel_not_allowlisted",
+                        "channel_id": message.channel_id,
+                    }),
+                )
+                .await?;
+            return Ok(ConnectorMessageReply {
+                accepted: false,
+                reply: None,
+            });
+        }
+
+        let command_text = match normalize_message_text(&message, &discord_config.command_prefix) {
+            Some(command_text) => command_text,
+            None => {
+                self.runtime
+                    .db
+                    .record_audit_event(
+                        "connector",
+                        &format!("discord:{}", message.external_user_id),
+                        "connector_message_ignored",
+                        json!({
+                            "reason": "missing_command_prefix",
+                            "channel_id": message.channel_id,
+                        }),
+                    )
+                    .await?;
+                return Ok(ConnectorMessageReply {
+                    accepted: false,
+                    reply: None,
+                });
+            }
+        };
+
+        let Some(identity) = self
+            .runtime
+            .fetch_connector_identity("discord", &message.external_user_id)
+            .await?
+        else {
+            return Ok(ConnectorMessageReply {
+                accepted: true,
+                reply: Some(
+                    "Your Discord account is not mapped to a BeaverKI user yet. Use the CLI to add a Discord mapping first.".to_owned(),
+                ),
+            });
+        };
+
+        if let Some((approve, approval_id)) = parse_approval_command(&command_text) {
+            let task = match self
+                .runtime
+                .resolve_approval(Some(&identity.mapped_user_id), approval_id, approve)
+                .await
+            {
+                Ok(task) => task,
+                Err(error) => {
+                    return Ok(ConnectorMessageReply {
+                        accepted: true,
+                        reply: Some(format!(
+                            "Could not {} approval {}: {}",
+                            if approve { "approve" } else { "deny" },
+                            approval_id,
+                            error
+                        )),
+                    });
+                }
+            };
+            self.runtime
+                .db
+                .record_audit_event(
+                    "connector",
+                    &identity.identity_id,
+                    "connector_approval_resolved",
+                    json!({
+                        "approval_id": approval_id,
+                        "approve": approve,
+                        "task_id": task.task_id,
+                        "task_state": task.state,
+                    }),
+                )
+                .await?;
+            return Ok(ConnectorMessageReply {
+                accepted: true,
+                reply: Some(format_task_reply(&task)),
+            });
+        }
+
+        let scope = if message.is_direct_message {
+            MemoryScope::Private
+        } else {
+            MemoryScope::Household
+        };
+        let task = self
+            .runtime
+            .enqueue_objective_from_connector(
+                &identity.mapped_user_id,
+                &identity.identity_id,
+                &command_text,
+                scope,
+            )
+            .await?;
+        self.runtime
+            .db
+            .record_audit_event(
+                "connector",
+                &identity.identity_id,
+                "connector_task_enqueued",
+                json!({
+                    "task_id": task.task_id,
+                    "scope": task.scope,
+                    "channel_id": message.channel_id,
+                    "is_direct_message": message.is_direct_message,
+                }),
+            )
+            .await?;
+        self.wake_worker.notify_one();
+
+        let waited_task = match time::timeout(
+            Duration::from_secs(discord_config.task_wait_timeout_secs),
+            self.wait_for_task_state(&task.owner_user_id, &task.task_id),
+        )
+        .await
+        {
+            Ok(result) => Some(result?),
+            Err(_) => None,
+        };
+
+        let reply = if let Some(waited_task) = waited_task {
+            format_task_reply(&waited_task)
+        } else {
+            format!(
+                "Request accepted for {}. The daemon is still working on it.",
+                identity.mapped_user_id
+            )
+        };
+        self.runtime
+            .db
+            .record_audit_event(
+                "connector",
+                &identity.identity_id,
+                "connector_reply_prepared",
+                json!({
+                    "task_id": task.task_id,
+                    "reply": reply,
+                }),
+            )
+            .await?;
+        Ok(ConnectorMessageReply {
+            accepted: true,
+            reply: Some(reply),
+        })
+    }
+}
+
+fn normalize_message_text(
+    message: &ConnectorMessageRequest,
+    command_prefix: &str,
+) -> Option<String> {
+    let trimmed = message.content.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if message.is_direct_message {
+        return Some(trimmed.to_owned());
+    }
+
+    let stripped = trimmed.strip_prefix(command_prefix)?.trim();
+    if stripped.is_empty() {
+        None
+    } else {
+        Some(stripped.to_owned())
+    }
+}
+
+fn parse_approval_command(command_text: &str) -> Option<(bool, &str)> {
+    let mut parts = command_text.split_whitespace();
+    let command = parts.next()?;
+    let approval_id = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    match command {
+        "approve" => Some((true, approval_id)),
+        "deny" => Some((false, approval_id)),
+        _ => None,
+    }
+}
+
+fn format_task_reply(task: &beaverki_db::TaskRow) -> String {
+    match task.state.parse::<TaskState>() {
+        Ok(TaskState::Completed) => task
+            .result_text
+            .clone()
+            .unwrap_or_else(|| "Task completed.".to_owned()),
+        Ok(TaskState::WaitingApproval) => format!(
+            "Task {} is waiting for approval. {}",
+            task.task_id,
+            task.result_text
+                .as_deref()
+                .unwrap_or("Approval details were not recorded.")
+        ),
+        Ok(TaskState::Failed) => format!(
+            "Task {} failed. {}",
+            task.task_id,
+            task.result_text
+                .as_deref()
+                .unwrap_or("No failure details were recorded.")
+        ),
+        _ => format!("Task is now {}.", task.state),
+    }
+}
+
+fn truncate_reply(reply: &str) -> String {
+    if reply.chars().count() <= DISCORD_MAX_MESSAGE_LEN {
+        reply.to_owned()
+    } else {
+        let shortened: String = reply.chars().take(DISCORD_MAX_MESSAGE_LEN).collect();
+        format!("{shortened}...")
+    }
+}
+
+fn build_gateway_websocket_url(base_url: &str) -> String {
+    if base_url.contains('?') {
+        return base_url.to_owned();
+    }
+
+    let trimmed = base_url.trim_end_matches('/');
+    format!("{trimmed}/?v=10&encoding=json")
+}
+
+async fn parse_retry_after_secs(response: reqwest::Response) -> Option<u64> {
+    if let Some(header_value) = response.headers().get("retry-after")
+        && let Ok(header_value) = header_value.to_str()
+    {
+        if let Ok(seconds) = header_value.parse::<u64>() {
+            return Some(seconds.max(1));
+        }
+        if let Ok(seconds) = header_value.parse::<f64>() {
+            return Some(seconds.ceil().max(1.0) as u64);
+        }
+    }
+
+    let body = response.text().await.ok()?;
+    let parsed = serde_json::from_str::<DiscordRateLimitBody>(&body).ok()?;
+    parsed
+        .retry_after
+        .map(|seconds| seconds.ceil().max(1.0) as u64)
+}
+
+fn retry_delay_for_error(error: &anyhow::Error) -> Option<Duration> {
+    let text = error.to_string();
+    let marker = "retry_after_secs=";
+    let start = text.find(marker)? + marker.len();
+    let end = text[start..]
+        .find(|ch: char| !ch.is_ascii_digit())
+        .map(|offset| start + offset)
+        .unwrap_or(text.len());
+    let seconds = text[start..end].parse::<u64>().ok()?;
+    Some(Duration::from_secs(seconds.max(1)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use beaverki_db::TaskRow;
+
+    fn test_task(task_id: &str, state: &str, result_text: Option<&str>) -> TaskRow {
+        TaskRow {
+            task_id: task_id.to_owned(),
+            owner_user_id: "user_alex".to_owned(),
+            initiating_identity_id: "identity_discord".to_owned(),
+            primary_agent_id: "agent_alex".to_owned(),
+            assigned_agent_id: "agent_alex".to_owned(),
+            parent_task_id: None,
+            kind: "interactive".to_owned(),
+            state: state.to_owned(),
+            objective: "test objective".to_owned(),
+            context_summary: None,
+            result_text: result_text.map(ToOwned::to_owned),
+            scope: "private".to_owned(),
+            wake_at: None,
+            created_at: "2026-04-17T00:00:00Z".to_owned(),
+            updated_at: "2026-04-17T00:00:00Z".to_owned(),
+            completed_at: None,
+        }
+    }
+
+    #[test]
+    fn gateway_url_gets_root_path_when_missing() {
+        assert_eq!(
+            build_gateway_websocket_url("wss://gateway.discord.gg"),
+            "wss://gateway.discord.gg/?v=10&encoding=json"
+        );
+    }
+
+    #[test]
+    fn gateway_url_preserves_existing_query() {
+        assert_eq!(
+            build_gateway_websocket_url("wss://gateway.discord.gg/?v=10&encoding=json"),
+            "wss://gateway.discord.gg/?v=10&encoding=json"
+        );
+    }
+
+    #[test]
+    fn retry_delay_can_be_extracted_from_error_text() {
+        let error = anyhow!("Discord gateway URL request rate limited; retry_after_secs=42");
+        let delay = retry_delay_for_error(&error).expect("retry delay");
+        assert_eq!(delay, Duration::from_secs(42));
+    }
+
+    #[test]
+    fn completed_reply_omits_task_id() {
+        let reply = format_task_reply(&test_task("task_123", "completed", Some("done")));
+
+        assert_eq!(reply, "done");
+        assert!(!reply.contains("task_123"));
+    }
+
+    #[test]
+    fn waiting_approval_reply_keeps_task_id() {
+        let reply = format_task_reply(&test_task(
+            "task_123",
+            "waiting_approval",
+            Some("Approval ID: approval_123"),
+        ));
+
+        assert!(reply.contains("task_123"));
+        assert!(reply.contains("waiting for approval"));
+    }
+
+    #[test]
+    fn failed_reply_keeps_task_id() {
+        let reply = format_task_reply(&test_task("task_123", "failed", Some("boom")));
+
+        assert!(reply.contains("task_123"));
+        assert!(reply.contains("failed"));
+    }
+}

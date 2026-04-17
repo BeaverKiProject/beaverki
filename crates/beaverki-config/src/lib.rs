@@ -71,12 +71,60 @@ pub struct ProviderModels {
     pub summarizer: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct IntegrationsConfig {
+    pub browser: BrowserConfig,
+    pub discord: DiscordConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BrowserConfig {
+    pub interactive_launcher: Option<String>,
+    pub headless_browser: Option<String>,
+    pub headless_args: Vec<String>,
+}
+
+impl Default for BrowserConfig {
+    fn default() -> Self {
+        Self {
+            interactive_launcher: None,
+            headless_browser: None,
+            headless_args: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DiscordConfig {
+    pub enabled: bool,
+    pub bot_token_secret_ref: Option<String>,
+    pub command_prefix: String,
+    pub allowed_channel_ids: Vec<String>,
+    pub task_wait_timeout_secs: u64,
+}
+
+impl Default for DiscordConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bot_token_secret_ref: None,
+            command_prefix: "!bk".to_owned(),
+            allowed_channel_ids: Vec::new(),
+            task_wait_timeout_secs: 5,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct LoadedConfig {
     pub config_dir: PathBuf,
     pub base_dir: PathBuf,
     pub runtime: RuntimeConfig,
     pub providers: ProvidersConfig,
+    pub integrations: IntegrationsConfig,
 }
 
 impl LoadedConfig {
@@ -85,6 +133,7 @@ impl LoadedConfig {
         let base_dir = config_base_dir(&config_dir);
         let runtime_path = config_dir.join("runtime.yaml");
         let providers_path = config_dir.join("providers.yaml");
+        let integrations_path = config_dir.join("integrations.yaml");
 
         let mut runtime: RuntimeConfig = serde_yaml::from_str(
             &fs::read_to_string(&runtime_path)
@@ -96,6 +145,15 @@ impl LoadedConfig {
                 .with_context(|| format!("failed to read {}", providers_path.display()))?,
         )
         .with_context(|| format!("failed to parse {}", providers_path.display()))?;
+        let integrations = if integrations_path.exists() {
+            serde_yaml::from_str::<IntegrationsConfig>(
+                &fs::read_to_string(&integrations_path)
+                    .with_context(|| format!("failed to read {}", integrations_path.display()))?,
+            )
+            .with_context(|| format!("failed to parse {}", integrations_path.display()))?
+        } else {
+            IntegrationsConfig::default()
+        };
 
         runtime.data_dir = resolve_path(&base_dir, &runtime.data_dir);
         runtime.state_dir = resolve_path(&base_dir, &runtime.state_dir);
@@ -109,6 +167,7 @@ impl LoadedConfig {
             base_dir,
             runtime,
             providers,
+            integrations,
         })
     }
 }
@@ -135,6 +194,7 @@ pub struct SetupAnswers {
 pub struct SetupArtifacts {
     pub runtime_path: PathBuf,
     pub providers_path: PathBuf,
+    pub integrations_path: PathBuf,
     pub secret_ref: String,
 }
 
@@ -183,13 +243,16 @@ pub fn write_setup_files(answers: &SetupAnswers) -> Result<SetupArtifacts> {
             },
         }],
     };
+    let integrations = IntegrationsConfig::default();
 
     let runtime_path = answers.config_dir.join("runtime.yaml");
     let providers_path = answers.config_dir.join("providers.yaml");
+    let integrations_path = answers.config_dir.join("integrations.yaml");
 
     fs::write(&runtime_path, serde_yaml::to_string(&runtime)?)
         .with_context(|| format!("failed to write {}", runtime_path.display()))?;
     write_providers_config_path(&providers_path, &providers)?;
+    write_integrations_config_path(&integrations_path, &integrations)?;
 
     let secret_store = SecretStore::new(&answers.secret_dir);
     secret_store.write_secret(
@@ -201,6 +264,7 @@ pub fn write_setup_files(answers: &SetupAnswers) -> Result<SetupArtifacts> {
     Ok(SetupArtifacts {
         runtime_path,
         providers_path,
+        integrations_path,
         secret_ref,
     })
 }
@@ -214,12 +278,24 @@ pub fn write_providers_config(
     Ok(path)
 }
 
+pub fn write_integrations_config(
+    config_dir: impl AsRef<Path>,
+    integrations: &IntegrationsConfig,
+) -> Result<PathBuf> {
+    let path = config_dir.as_ref().join("integrations.yaml");
+    write_integrations_config_path(&path, integrations)?;
+    Ok(path)
+}
+
 fn write_providers_config_path(path: &Path, providers: &ProvidersConfig) -> Result<()> {
     fs::write(path, serde_yaml::to_string(providers)?)
         .with_context(|| format!("failed to write {}", path.display()))
 }
 
-#[derive(Debug, Clone)]
+fn write_integrations_config_path(path: &Path, integrations: &IntegrationsConfig) -> Result<()> {
+    fs::write(path, serde_yaml::to_string(integrations)?)
+        .with_context(|| format!("failed to write {}", path.display()))
+}
 pub struct SecretStore {
     secret_dir: PathBuf,
 }
@@ -375,6 +451,7 @@ mod tests {
                 active: "openai_main".to_owned(),
                 entries: vec![],
             },
+            integrations: IntegrationsConfig::default(),
         };
 
         assert_eq!(loaded.base_dir, PathBuf::from("/tmp/beaverki"));
