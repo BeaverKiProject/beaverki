@@ -24,6 +24,10 @@ const DISCORD_MAX_MESSAGE_LEN: usize = 1_900;
 const DISCORD_CONVERSATION_HISTORY_LIMIT: i64 = 4;
 const DISCORD_ACTIVE_CONVERSATION_WINDOW_SECS: i64 = 45 * 60;
 const DISCORD_TYPING_REFRESH_INTERVAL: Duration = Duration::from_secs(8);
+const DISCORD_REACTION_WORKING: &str = "%E2%8F%B3";
+const CONNECTOR_MESSAGE_CONTEXT_EVENT: &str = "connector_message_context";
+const CONNECTOR_FOLLOW_UP_REQUESTED_EVENT: &str = "connector_follow_up_requested";
+const CONNECTOR_FOLLOW_UP_SENT_EVENT: &str = "connector_follow_up_sent";
 
 #[derive(Debug, Deserialize)]
 struct DiscordGatewayInfo {
@@ -58,10 +62,7 @@ pub(crate) async fn run_discord_loop(daemon: Arc<RuntimeDaemon>) -> Result<()> {
         .discord_bot_token()
         .map(ToOwned::to_owned)
         .ok_or_else(|| anyhow!("Discord connector is enabled but no bot token is loaded"))?;
-    let http_client = reqwest::Client::builder()
-        .user_agent("beaverki/0.1")
-        .build()
-        .context("failed to build Discord HTTP client")?;
+    let http_client = build_discord_http_client()?;
 
     daemon
         .runtime
@@ -298,6 +299,69 @@ async fn send_discord_message(
     Ok(())
 }
 
+async fn add_discord_reaction(
+    http_client: &reqwest::Client,
+    token: &str,
+    channel_id: &str,
+    message_id: &str,
+    emoji_path: &str,
+) -> Result<()> {
+    http_client
+        .put(format!(
+            "{DISCORD_API_BASE}/channels/{channel_id}/messages/{message_id}/reactions/{emoji_path}/@me"
+        ))
+        .header("Authorization", format!("Bot {token}"))
+        .send()
+        .await
+        .with_context(|| {
+            format!(
+                "failed to add Discord reaction to message {message_id} in channel {channel_id}"
+            )
+        })?
+        .error_for_status()
+        .with_context(|| {
+            format!(
+                "Discord rejected reaction add for message {message_id} in channel {channel_id}"
+            )
+        })?;
+    Ok(())
+}
+
+async fn delete_discord_reaction(
+    http_client: &reqwest::Client,
+    token: &str,
+    channel_id: &str,
+    message_id: &str,
+    emoji_path: &str,
+) -> Result<()> {
+    http_client
+        .delete(format!(
+            "{DISCORD_API_BASE}/channels/{channel_id}/messages/{message_id}/reactions/{emoji_path}/@me"
+        ))
+        .header("Authorization", format!("Bot {token}"))
+        .send()
+        .await
+        .with_context(|| {
+            format!(
+                "failed to delete Discord reaction from message {message_id} in channel {channel_id}"
+            )
+        })?
+        .error_for_status()
+        .with_context(|| {
+            format!(
+                "Discord rejected reaction delete for message {message_id} in channel {channel_id}"
+            )
+        })?;
+    Ok(())
+}
+
+fn build_discord_http_client() -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .user_agent("beaverki/0.1")
+        .build()
+        .context("failed to build Discord HTTP client")
+}
+
 async fn send_discord_typing(
     http_client: &reqwest::Client,
     token: &str,
@@ -400,6 +464,72 @@ async fn wait_for_discord_task_completion(
         }
         None => wait_for_task.await,
     }
+}
+
+pub(super) async fn maybe_send_task_follow_up(
+    daemon: &RuntimeDaemon,
+    task: &TaskRow,
+    events: &[TaskEventRow],
+) -> Result<()> {
+    let Some(channel_id) = connector_follow_up_channel(events, "discord", &task.state) else {
+        return Ok(());
+    };
+    let Some(token) = daemon.runtime.discord_bot_token() else {
+        return Ok(());
+    };
+
+    let http_client = build_discord_http_client()?;
+    let reply = format_task_reply(task);
+    send_discord_message(&http_client, token, &channel_id, &reply).await?;
+    if let Some(context) = connector_context_from_events(events)
+        && context.connector_type == "discord"
+        && let Some(message_id) = context.message_id.as_deref()
+        && let Err(error) = delete_discord_reaction(
+            &http_client,
+            token,
+            &channel_id,
+            message_id,
+            DISCORD_REACTION_WORKING,
+        )
+        .await
+    {
+        warn!(
+            "failed to clear Discord working reaction from message {} in channel {}: {error:#}",
+            message_id,
+            channel_id
+        );
+    }
+    daemon
+        .runtime
+        .db
+        .append_task_event(
+            &task.task_id,
+            CONNECTOR_FOLLOW_UP_SENT_EVENT,
+            "connector",
+            "discord",
+            json!({
+                "connector_type": "discord",
+                "channel_id": channel_id,
+                "task_state": task.state,
+            }),
+        )
+        .await?;
+    daemon
+        .runtime
+        .db
+        .record_audit_event(
+            "connector",
+            &task.task_id,
+            "connector_follow_up_sent",
+            json!({
+                "connector_type": "discord",
+                "channel_id": channel_id,
+                "task_state": task.state,
+            }),
+        )
+        .await?;
+
+    Ok(())
 }
 
 impl RuntimeDaemon {
@@ -583,7 +713,7 @@ impl RuntimeDaemon {
             .db
             .append_task_event(
                 &task.task_id,
-                "connector_message_context",
+                CONNECTOR_MESSAGE_CONTEXT_EVENT,
                 "connector",
                 &identity.identity_id,
                 json!({
@@ -591,6 +721,7 @@ impl RuntimeDaemon {
                     "external_user_id": &message.external_user_id,
                     "external_display_name": &message.external_display_name,
                     "channel_id": &message.channel_id,
+                    "message_id": &message.message_id,
                     "is_direct_message": message.is_direct_message,
                     "source_label": current_source_label,
                 }),
@@ -623,12 +754,45 @@ impl RuntimeDaemon {
         .await?;
 
         let reply = if let Some(waited_task) = waited_task {
-            format_task_reply(&waited_task)
+            Some(format_task_reply(&waited_task))
         } else {
-            format!(
-                "Request accepted for {}. The daemon is still working on it.",
-                identity.mapped_user_id
-            )
+            self.runtime
+                .db
+                .append_task_event(
+                    &task.task_id,
+                    CONNECTOR_FOLLOW_UP_REQUESTED_EVENT,
+                    "connector",
+                    &identity.identity_id,
+                    json!({
+                        "connector_type": &message.connector_type,
+                        "channel_id": &message.channel_id,
+                        "reason": "task_wait_timeout",
+                    }),
+                )
+                .await?;
+            if let Some((http_client, token)) = typing_context {
+                if let Err(error) = add_discord_reaction(
+                    http_client,
+                    token,
+                    &message.channel_id,
+                    &message.message_id,
+                    DISCORD_REACTION_WORKING,
+                )
+                .await
+                {
+                    warn!(
+                        "failed to add Discord working reaction to message {} in channel {}: {error:#}",
+                        message.message_id,
+                        message.channel_id
+                    );
+                }
+                None
+            } else {
+                Some(format!(
+                    "Request accepted for {}. The daemon is still working on it.",
+                    identity.mapped_user_id
+                ))
+            }
         };
         self.runtime
             .db
@@ -644,7 +808,7 @@ impl RuntimeDaemon {
             .await?;
         Ok(ConnectorMessageReply {
             accepted: true,
-            reply: Some(reply),
+            reply,
         })
     }
 }
@@ -907,16 +1071,23 @@ fn build_conversation_exchange(
 
 #[derive(Debug, Clone)]
 struct ConnectorEventContext {
+    connector_type: String,
     source_label: String,
     channel_id: String,
+    message_id: Option<String>,
     user_label: Option<String>,
 }
 
 fn connector_context_from_events(events: &[TaskEventRow]) -> Option<ConnectorEventContext> {
     let event = events
         .iter()
-        .find(|event| event.event_type == "connector_message_context")?;
+        .find(|event| event.event_type == CONNECTOR_MESSAGE_CONTEXT_EVENT)?;
     let payload: Value = serde_json::from_str(&event.payload_json).ok()?;
+    let connector_type = payload
+        .get("connector_type")
+        .and_then(Value::as_str)
+        .unwrap_or("connector")
+        .to_owned();
     let source_label = payload
         .get("source_label")
         .and_then(Value::as_str)
@@ -926,16 +1097,69 @@ fn connector_context_from_events(events: &[TaskEventRow]) -> Option<ConnectorEve
         .get("channel_id")
         .and_then(Value::as_str)?
         .to_owned();
+    let message_id = payload
+        .get("message_id")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
     let user_label = payload
         .get("external_display_name")
         .and_then(Value::as_str)
         .map(ToOwned::to_owned);
 
     Some(ConnectorEventContext {
+        connector_type,
         source_label,
         channel_id,
+        message_id,
         user_label,
     })
+}
+
+fn connector_follow_up_channel(
+    events: &[TaskEventRow],
+    connector_type: &str,
+    task_state: &str,
+) -> Option<String> {
+    let context = connector_context_from_events(events)?;
+    if context.connector_type != connector_type {
+        return None;
+    }
+
+    let follow_up_requested = events
+        .iter()
+        .filter(|event| event.event_type == CONNECTOR_FOLLOW_UP_REQUESTED_EVENT)
+        .any(|event| {
+            serde_json::from_str::<Value>(&event.payload_json)
+                .ok()
+                .and_then(|payload| {
+                    payload
+                        .get("connector_type")
+                        .and_then(Value::as_str)
+                        .map(|value| value == connector_type)
+                })
+                .unwrap_or(false)
+        });
+    if !follow_up_requested {
+        return None;
+    }
+
+    let already_sent = events
+        .iter()
+        .filter(|event| event.event_type == CONNECTOR_FOLLOW_UP_SENT_EVENT)
+        .any(|event| {
+            serde_json::from_str::<Value>(&event.payload_json)
+                .ok()
+                .map(|payload| {
+                    payload.get("connector_type").and_then(Value::as_str) == Some(connector_type)
+                        && payload.get("task_state").and_then(Value::as_str) == Some(task_state)
+                })
+                .unwrap_or(false)
+        });
+    if already_sent {
+        return None;
+    }
+
+    Some(context.channel_id)
 }
 
 fn parse_approval_command(command_text: &str) -> Option<(bool, &str)> {
@@ -1028,7 +1252,7 @@ fn retry_delay_for_error(error: &anyhow::Error) -> Option<Duration> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use beaverki_db::TaskRow;
+    use beaverki_db::{TaskEventRow, TaskRow};
     use chrono::{Duration as ChronoDuration, Utc};
 
     fn test_task(task_id: &str, state: &str, result_text: Option<&str>) -> TaskRow {
@@ -1049,6 +1273,18 @@ mod tests {
             created_at: "2026-04-17T00:00:00Z".to_owned(),
             updated_at: "2026-04-17T00:00:00Z".to_owned(),
             completed_at: None,
+        }
+    }
+
+    fn test_task_event(event_type: &str, payload: Value) -> TaskEventRow {
+        TaskEventRow {
+            event_id: format!("event_{event_type}"),
+            task_id: "task_123".to_owned(),
+            event_type: event_type.to_owned(),
+            actor_type: "connector".to_owned(),
+            actor_id: "connector-test".to_owned(),
+            payload_json: payload.to_string(),
+            created_at: "2026-04-17T00:00:00Z".to_owned(),
         }
     }
 
@@ -1152,5 +1388,131 @@ mod tests {
 
         assert!(context.contains("Conversation status: fresh conversation"));
         assert!(!context.contains("Recent attributed exchanges"));
+    }
+
+    #[test]
+    fn connector_follow_up_requires_timeout_marker() {
+        let events = vec![test_task_event(
+            CONNECTOR_MESSAGE_CONTEXT_EVENT,
+            json!({
+                "connector_type": "discord",
+                "channel_id": "dm-1",
+                "message_id": "msg-1",
+                "source_label": "Discord direct message",
+            }),
+        )];
+
+        assert_eq!(
+            connector_follow_up_channel(&events, "discord", "completed"),
+            None
+        );
+    }
+
+    #[test]
+    fn connector_follow_up_uses_context_channel() {
+        let events = vec![
+            test_task_event(
+                CONNECTOR_MESSAGE_CONTEXT_EVENT,
+                json!({
+                    "connector_type": "discord",
+                    "channel_id": "dm-1",
+                    "message_id": "msg-1",
+                    "source_label": "Discord direct message",
+                }),
+            ),
+            test_task_event(
+                CONNECTOR_FOLLOW_UP_REQUESTED_EVENT,
+                json!({
+                    "connector_type": "discord",
+                    "channel_id": "dm-1",
+                    "reason": "task_wait_timeout",
+                }),
+            ),
+        ];
+
+        assert_eq!(
+            connector_follow_up_channel(&events, "discord", "completed"),
+            Some("dm-1".to_owned())
+        );
+    }
+
+    #[test]
+    fn connector_follow_up_skips_duplicate_state() {
+        let events = vec![
+            test_task_event(
+                CONNECTOR_MESSAGE_CONTEXT_EVENT,
+                json!({
+                    "connector_type": "discord",
+                    "channel_id": "dm-1",
+                    "message_id": "msg-1",
+                    "source_label": "Discord direct message",
+                }),
+            ),
+            test_task_event(
+                CONNECTOR_FOLLOW_UP_REQUESTED_EVENT,
+                json!({
+                    "connector_type": "discord",
+                    "channel_id": "dm-1",
+                    "reason": "task_wait_timeout",
+                }),
+            ),
+            test_task_event(
+                CONNECTOR_FOLLOW_UP_SENT_EVENT,
+                json!({
+                    "connector_type": "discord",
+                    "channel_id": "dm-1",
+                    "task_state": "completed",
+                }),
+            ),
+        ];
+
+        assert_eq!(
+            connector_follow_up_channel(&events, "discord", "completed"),
+            None
+        );
+    }
+
+    #[test]
+    fn connector_follow_up_ignores_other_connectors() {
+        let events = vec![
+            test_task_event(
+                CONNECTOR_MESSAGE_CONTEXT_EVENT,
+                json!({
+                    "connector_type": "slack",
+                    "channel_id": "C123",
+                    "message_id": "msg-1",
+                    "source_label": "Slack DM",
+                }),
+            ),
+            test_task_event(
+                CONNECTOR_FOLLOW_UP_REQUESTED_EVENT,
+                json!({
+                    "connector_type": "slack",
+                    "channel_id": "C123",
+                    "reason": "task_wait_timeout",
+                }),
+            ),
+        ];
+
+        assert_eq!(
+            connector_follow_up_channel(&events, "discord", "completed"),
+            None
+        );
+    }
+
+    #[test]
+    fn connector_context_includes_message_id() {
+        let events = vec![test_task_event(
+            CONNECTOR_MESSAGE_CONTEXT_EVENT,
+            json!({
+                "connector_type": "discord",
+                "channel_id": "dm-1",
+                "message_id": "msg-42",
+                "source_label": "Discord direct message",
+            }),
+        )];
+
+        let context = connector_context_from_events(&events).expect("context");
+        assert_eq!(context.message_id.as_deref(), Some("msg-42"));
     }
 }

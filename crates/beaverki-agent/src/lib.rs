@@ -856,15 +856,16 @@ impl PrimaryAgentRunner {
             .get("capability_profile")
             .cloned()
             .unwrap_or_else(|| json!({}));
+        let mut prior_status = None::<String>;
 
         let script = if let Some(script_id) = script_id.as_deref() {
-            if self
+            if let Some(existing_script) = self
                 .db
                 .fetch_script_for_owner(&request.owner_user_id, script_id)
                 .await
                 .map_err(ToolError::Failed)?
-                .is_some()
             {
+                prior_status = Some(existing_script.status);
                 self.db
                     .update_script_contents(UpdateScript {
                         script_id,
@@ -939,7 +940,9 @@ impl PrimaryAgentRunner {
                     "rejected"
                 },
                 &review.summary,
-                if review.approved() {
+                if review.approved() && prior_status.as_deref() == Some("active") {
+                    Some("active")
+                } else if review.approved() {
                     Some("draft")
                 } else {
                     Some("blocked")
@@ -968,6 +971,9 @@ impl PrimaryAgentRunner {
                 json!({
                     "task_id": task.task_id,
                     "script_id": script.script_id,
+                    "prior_status": prior_status,
+                    "reactivated_after_rewrite": review.approved()
+                        && prior_status.as_deref() == Some("active"),
                     "safety_status": if review.approved() { "approved" } else { "rejected" },
                     "verdict": review.verdict,
                 }),
@@ -988,6 +994,8 @@ impl PrimaryAgentRunner {
                 "status": updated.status,
                 "safety_status": updated.safety_status,
                 "safety_summary": updated.safety_summary,
+                "reactivated_after_rewrite": review.approved()
+                    && prior_status.as_deref() == Some("active"),
                 "review_verdict": review.verdict,
                 "risk_level": review.risk_level,
                 "findings": review.findings,
@@ -1442,7 +1450,7 @@ fn tool_definitions(tools: &ToolRegistry) -> Vec<ToolDefinition> {
     });
     definitions.push(ToolDefinition {
         name: "lua_script_write".to_owned(),
-        description: "Create or update a Lua automation script using BeaverKI's current host API, then run blocking safety review on it. Prefer `return function(ctx) ... end` as the canonical shape, though a top-level chunk that returns directly is also valid. Use `ctx.log_info`, `ctx.notify_user`, `ctx.task_defer`, `ctx.memory_read`, `ctx.memory_write`, and `ctx.tool_call` instead of legacy globals like `run()`, `log()`, or `notify()`. The script remains draft until explicitly activated.".to_owned(),
+        description: "Create or update a Lua automation script using BeaverKI's current host API, then run blocking safety review on it. Prefer `return function(ctx) ... end` as the canonical shape, though a top-level chunk that returns directly is also valid. Use `ctx.log_info`, `ctx.notify_user`, `ctx.task_defer`, `ctx.memory_read`, `ctx.memory_write`, and `ctx.tool_call` instead of legacy globals like `run()`, `log()`, or `notify()`. New scripts remain draft until explicitly activated. Rewriting an already active script keeps it active if the new version passes safety review.".to_owned(),
         input_schema: json!({
             "type": "object",
             "properties": {
@@ -1582,7 +1590,7 @@ Current agent kind: {kind}.
 Current role set: {roles}.
 Use tools when needed, but keep the task focused and auditable.
 Only low-risk read-only shell commands are allowed by default. Medium/high/critical shell commands require user approval.
-Use Lua tools when recurring or structured automation materially helps. Writing a Lua script triggers safety review. Activation and scheduling require user approval. When writing Lua, prefer `return function(ctx) ... end`, use BeaverKI host APIs such as `ctx.log_info`, `ctx.notify_user`, `ctx.task_defer`, `ctx.memory_read`, `ctx.memory_write`, and `ctx.tool_call`, and avoid legacy globals like `run()`, `log()`, or `notify()`.
+Use Lua tools when recurring or structured automation materially helps. Writing a Lua script triggers safety review. New scripts require explicit activation later, while rewrites of already active scripts stay active if the new version passes safety review. Scheduling requires user approval. When writing Lua, prefer `return function(ctx) ... end`, use BeaverKI host APIs such as `ctx.log_info`, `ctx.notify_user`, `ctx.task_defer`, `ctx.memory_read`, `ctx.memory_write`, and `ctx.tool_call`, and avoid legacy globals like `run()`, `log()`, or `notify()`.
 For file writes, prefer filesystem_write_text. Never claim a denied tool succeeded.
 Use agent_spawn_subagent only for a tightly bounded, materially useful child task. Any sub-agent receives only the explicit task slice you provide.
 Conversation context and memory can include explicit speaker labels. Preserve who said what. Never treat assistant self-references as facts about the user.
@@ -2187,6 +2195,109 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rewriting_active_lua_script_keeps_it_active_after_approved_review() {
+        let provider = FakeProvider::new(vec![
+            ModelTurnResponse {
+                output_items: vec![json!({
+                    "type": "function_call",
+                    "call_id": "call_rewrite",
+                    "name": "lua_script_write",
+                    "arguments": "{\"script_id\":\"script_active_rewrite\",\"source_text\":\"return function(ctx)\\n    ctx.log_info(\\\"rewritten lua ran\\\")\\n    return \\\"rewritten ok\\\"\\nend\",\"capability_profile\":{},\"intended_behavior_summary\":\"Update the active script to return a new fixed success string.\"}"
+                })],
+                tool_calls: vec![beaverki_models::ModelToolCall {
+                    call_id: "call_rewrite".to_owned(),
+                    name: "lua_script_write".to_owned(),
+                    arguments: json!({
+                        "script_id": "script_active_rewrite",
+                        "source_text": "return function(ctx)\n    ctx.log_info(\"rewritten lua ran\")\n    return \"rewritten ok\"\nend",
+                        "capability_profile": {},
+                        "intended_behavior_summary": "Update the active script to return a new fixed success string."
+                    }),
+                }],
+                output_text: String::new(),
+            },
+            ModelTurnResponse {
+                output_items: vec![json!({
+                    "type": "message",
+                    "content": [{
+                        "type": "output_text",
+                        "text": "{\"verdict\":\"approved\",\"risk_level\":\"low\",\"findings\":[],\"required_changes\":[],\"summary\":\"The rewritten Lua automation matches the stated intent.\"}"
+                    }]
+                })],
+                tool_calls: vec![],
+                output_text: "{\"verdict\":\"approved\",\"risk_level\":\"low\",\"findings\":[],\"required_changes\":[],\"summary\":\"The rewritten Lua automation matches the stated intent.\"}".to_owned(),
+            },
+            ModelTurnResponse {
+                output_items: vec![json!({
+                    "type": "message",
+                    "content": [{ "type": "output_text", "text": "rewrite complete" }]
+                })],
+                tool_calls: vec![],
+                output_text: "rewrite complete".to_owned(),
+            },
+        ]);
+        let (db, runner) = test_runner(provider).await;
+        let default_user = db.default_user().await.expect("default").expect("user");
+        let roles = db
+            .list_user_roles(&default_user.user_id)
+            .await
+            .expect("roles")
+            .into_iter()
+            .map(|row| row.role_id)
+            .collect::<Vec<_>>();
+        db.create_script(NewScript {
+            script_id: Some("script_active_rewrite"),
+            owner_user_id: &default_user.user_id,
+            kind: "lua",
+            status: "active",
+            source_text: "return function(ctx) return \"old\" end",
+            capability_profile_json: json!({}),
+            created_from_task_id: None,
+            safety_status: "approved",
+            safety_summary: Some("approved"),
+        })
+        .await
+        .expect("script");
+
+        let result = runner
+            .run_task(AgentRequest {
+                owner_user_id: default_user.user_id.clone(),
+                initiating_identity_id: format!("cli:{}", default_user.user_id),
+                primary_agent_id: default_user.primary_agent_id.clone().expect("agent"),
+                assigned_agent_id: default_user.primary_agent_id.clone().expect("agent"),
+                role_ids: roles.clone(),
+                objective: "Rewrite the active Lua automation".to_owned(),
+                scope: MemoryScope::Private,
+                kind: "interactive".to_owned(),
+                parent_task_id: None,
+                task_context: None,
+                visible_scopes: visible_memory_scopes(&roles),
+                memory_mode: AgentMemoryMode::ScopedRetrieval,
+                approved_shell_commands: Vec::new(),
+                approved_automation_actions: Vec::new(),
+            })
+            .await
+            .expect("task");
+
+        assert_eq!(result.task.state, TaskState::Completed.as_str());
+        assert_eq!(result.task.result_text.as_deref(), Some("rewrite complete"));
+        let script = db
+            .fetch_script_for_owner(&default_user.user_id, "script_active_rewrite")
+            .await
+            .expect("script fetch")
+            .expect("script");
+        assert_eq!(script.status, "active");
+        assert_eq!(script.safety_status, "approved");
+        assert!(script.source_text.contains("rewritten ok"));
+        assert!(
+            db.list_approvals_for_user(&default_user.user_id, Some("pending"))
+                .await
+                .expect("approvals")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
     async fn lua_script_schedule_pauses_for_approval_and_resumes() {
         let provider = FakeProvider::new(vec![
             ModelTurnResponse {
@@ -2538,11 +2649,16 @@ mod tests {
             .find(|definition| definition.name == "lua_script_write")
             .expect("lua_script_write definition")
             .description;
-        let prompt = system_prompt("interactive", &["owner".to_owned()], &[PathBuf::from("/tmp")]);
+        let prompt = system_prompt(
+            "interactive",
+            &["owner".to_owned()],
+            &[PathBuf::from("/tmp")],
+        );
 
         assert!(description.contains("return function(ctx)"));
         assert!(description.contains("ctx.log_info"));
         assert!(description.contains("legacy globals like `run()`, `log()`, or `notify()`"));
+        assert!(description.contains("Rewriting an already active script keeps it active"));
         assert!(prompt.contains("prefer `return function(ctx) ... end`"));
         assert!(prompt.contains("avoid legacy globals like `run()`, `log()`, or `notify()`"));
     }

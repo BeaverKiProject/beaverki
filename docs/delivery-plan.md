@@ -141,11 +141,13 @@ Stories:
 - `M2-005` Support approval interactions through Discord.
 - `M2-006` Add audit coverage for connector events and approval responses.
 - `M2-007` Add end-to-end tests for Discord task submission and approval routing.
+- `M2-008` Add durable connector follow-up delivery so long-running connector tasks can acknowledge immediately and publish later state transitions through a connector-agnostic dispatcher.
 
 Exit criteria:
 
 - a mapped Discord user can trigger tasks
 - approvals can be handled through Discord where policy allows
+- connector-originated tasks that outlive the initial wait window still produce a later remote follow-up
 - browser automation works in desktop and VPS headless modes
 
 ## 3.5 M2.5 Approval UX And Remote Safety

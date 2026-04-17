@@ -30,6 +30,7 @@ mod discord;
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
 const QUEUE_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const TASK_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(150);
+const CONNECTOR_MESSAGE_CONTEXT_EVENT: &str = "connector_message_context";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskInspection {
@@ -1524,6 +1525,10 @@ impl RuntimeDaemon {
                 let run_result = daemon.runtime.execute_task(task).await;
                 daemon.set_active_task(None).await?;
 
+                if let Ok(result) = &run_result {
+                    daemon.dispatch_connector_follow_up(&result.task).await?;
+                }
+
                 if let Err(error) = run_result {
                     let error_text = format!("{error:#}");
                     daemon.runtime.db.fail_task(&task_id, &error_text).await?;
@@ -1552,6 +1557,9 @@ impl RuntimeDaemon {
                             }),
                         )
                         .await?;
+                    if let Some(task) = daemon.runtime.db.fetch_task(&task_id).await? {
+                        daemon.dispatch_connector_follow_up(&task).await?;
+                    }
                 }
 
                 daemon.refresh_heartbeat(None).await?;
@@ -1686,6 +1694,7 @@ impl RuntimeDaemon {
                     .runtime
                     .resolve_approval(user_id.as_deref(), &approval_id, approve)
                     .await?;
+                self.dispatch_connector_follow_up(&task).await?;
                 self.refresh_heartbeat(None).await?;
                 Ok((DaemonResponse::Task { task }, false))
             }
@@ -1736,6 +1745,22 @@ impl RuntimeDaemon {
                 | TaskState::Completed
                 | TaskState::Failed => return Ok(task),
             }
+        }
+    }
+
+    async fn dispatch_connector_follow_up(&self, task: &TaskRow) -> Result<()> {
+        let events = self
+            .runtime
+            .db
+            .fetch_task_events_for_owner(&task.owner_user_id, &task.task_id)
+            .await?;
+        let Some(connector_type) = connector_type_from_events(&events) else {
+            return Ok(());
+        };
+
+        match connector_type.as_str() {
+            "discord" => discord::maybe_send_task_follow_up(self, task, &events).await,
+            _ => Ok(()),
         }
     }
 
@@ -1918,6 +1943,17 @@ fn parse_scope(value: &str) -> Result<MemoryScope> {
     value
         .parse::<MemoryScope>()
         .map_err(|_| anyhow!("unsupported scope '{value}', expected private or household"))
+}
+
+fn connector_type_from_events(events: &[TaskEventRow]) -> Option<String> {
+    let event = events
+        .iter()
+        .find(|event| event.event_type == CONNECTOR_MESSAGE_CONTEXT_EVENT)?;
+    let payload: Value = serde_json::from_str(&event.payload_json).ok()?;
+    payload
+        .get("connector_type")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
 }
 
 #[cfg(test)]

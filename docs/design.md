@@ -489,6 +489,8 @@ For v1, Discord command intake should support:
 - explicitly approved channels
 - per-channel and per-user allowlists
 
+Connector-driven task delivery should not rely solely on a short inline wait for task completion. Some requests will complete quickly enough for an immediate reply, but longer-running or queued work should return a lightweight acceptance response and then continue through a durable follow-up path. The core runtime should persist connector context on the task itself, record that a follow-up is needed when the synchronous wait window expires, and later dispatch the final state transition through a connector-agnostic follow-up router. Connector modules should remain responsible only for rendering and transport details such as channel IDs, thread targets, interaction tokens, or platform-specific formatting.
+
 ## 11. Lua Scripting Runtime
 
 Lua is included to support higher-order workflows without recompiling the Rust core.
@@ -557,10 +559,12 @@ The same safety-review pattern should also be applied to generated shell command
 The system should support a workflow where an agent recognizes that a recurring automation would improve reliability or reduce cost. In that case it may:
 
 1. propose a Lua automation or create it directly if policy allows
-2. save it to a local scripts directory with metadata and ownership
+2. save it to the runtime database with metadata and ownership
 3. submit it to a safety-agent review
-4. request approval to bind it to a schedule if required
-5. register it as a recurring job under the requesting user's or shared household context
+4. if this is a new script, leave it in `draft` until it is explicitly activated
+5. if this is a rewrite of an already `active` script and the new version passes safety review, keep it `active`
+6. request approval to bind it to a schedule if required
+7. register it as a recurring job under the requesting user's or shared household context
 
 Generated scripts should carry metadata such as:
 
@@ -571,6 +575,7 @@ Generated scripts should carry metadata such as:
 - last run status
 - approval history
 - safety review status
+- lifecycle status such as `draft`, `active`, `disabled`, or `blocked`
 
 ## 12. Model Provider Abstraction
 
@@ -768,6 +773,7 @@ Messaging connectors should support:
 - routing approvals
 - attaching task context
 - restricting available commands by user role
+- delivering deferred follow-up replies for long-running tasks
 
 Message-originated tasks must carry an authenticated identity and permission scope.
 
@@ -777,6 +783,8 @@ Because messaging is a primary control surface, connectors should also support:
 - explicit user-to-runtime identity mapping
 - rate limiting and anti-spam controls
 - safe rendering of approval prompts and command results
+
+When a message-originated task outlives the connector's synchronous response window, the runtime should preserve enough connector metadata to send later task updates without reconstructing the request from logs or in-memory state. This follow-up mechanism should deduplicate per connector and task state transition so a restart or retry does not produce repeated remote replies.
 
 ## 16. Observability and Auditability
 

@@ -868,8 +868,9 @@ Lifecycle:
 1. main agent generates script
 2. script saved as `draft`
 3. safety agent reviews
-4. if approved and RBAC permits, script may transition to `active`
-5. if rejected, script transitions to `blocked`
+4. if this is a new script and review is approved, it remains `draft` until explicitly activated
+5. if this is a rewrite of an already `active` script and review is approved, it remains `active`
+6. if rejected, script transitions to `blocked`
 
 ### 11.2 Shell Review
 
@@ -1084,6 +1085,24 @@ trait Connector {
 }
 ```
 
+### 15.1.1 Durable Follow-Up Contract
+
+Connector reply delivery must support both synchronous replies and deferred follow-ups.
+
+Required runtime behavior:
+
+- when a connector-originated task is created, the runtime persists a `connector_message_context` task event that includes `connector_type` plus connector-specific target data such as channel, DM, thread, or interaction metadata
+- if the task does not leave `pending` or `running` within the connector's synchronous wait window, the runtime records a `connector_follow_up_requested` task event rather than assuming the connector interaction is finished
+- after any later task state transition to `waiting_approval`, `blocked`, `completed`, or `failed`, the daemon loads the persisted connector context and dispatches a follow-up through a connector-type router
+- each connector records `connector_follow_up_sent` with the connector type and task state so follow-up delivery is idempotent across retries, restarts, or repeated state inspection
+
+Boundary split:
+
+- the runtime owns follow-up eligibility, event persistence, idempotency, and routing by `connector_type`
+- each connector implementation owns target decoding, message rendering, and transport semantics
+
+This split is required so future connectors can reuse the same durable follow-up model without copying Discord-specific timeout behavior into the core task engine.
+
 ### 15.2 Discord Connector V1
 
 Must support:
@@ -1093,6 +1112,7 @@ Must support:
 - identity mapping from Discord user ID to BeaverKI user ID
 - sending replies
 - routing approval prompts
+- sending deferred follow-up messages after initial acceptance when a task completes later
 
 Message processing flow:
 
@@ -1100,7 +1120,9 @@ Message processing flow:
 2. validate guild/channel/DM policy
 3. map Discord identity to internal user
 4. create or resume task on that user's primary agent
-5. record connector event in audit log
+5. attempt synchronous wait for fast task completion
+6. if needed, acknowledge the request and persist follow-up intent
+7. record connector event in audit log
 
 ## 16. Orchestration Flow
 
@@ -1115,7 +1137,8 @@ Message processing flow:
 7. safety review runs if required
 8. tool executes or approval is requested
 9. memory and task state are persisted
-10. result is returned to user
+10. if the result is ready within the synchronous channel window, it is returned immediately
+11. otherwise the runtime returns an acceptance response and later sends a connector follow-up from persisted task context
 
 ### 16.2 Sub-Agent Flow
 
@@ -1133,9 +1156,11 @@ Message processing flow:
 2. main agent proposes Lua script
 3. script saved to database
 4. safety agent reviews
-5. if approved and permitted, schedule is registered
-6. scheduler wakes script at due time
-7. execution is recorded like any other task/tool sequence
+5. if this is a new script, it remains `draft` until explicitly activated
+6. if this is a rewrite of an already `active` script and review is approved, it remains `active`
+7. if approved and permitted, schedule is registered
+8. scheduler wakes script at due time
+9. execution is recorded like any other task/tool sequence
 
 ## 17. Approvals
 
@@ -1176,6 +1201,8 @@ Every approval request must capture:
 - tool invocation
 - approval request
 - approval resolution
+- connector follow-up requested
+- connector follow-up sent
 - task completion/failure
 
 ### 18.2 Logs vs Audit
