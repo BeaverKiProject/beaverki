@@ -248,6 +248,7 @@ impl PrimaryAgentRunner {
                             &request.owner_user_id,
                             request.scope,
                             &task.task_id,
+                            &request.objective,
                             &answer,
                         )
                         .await?;
@@ -610,16 +611,22 @@ fn build_user_prompt(
     prompt.push_str(objective);
 
     if let Some(task_context) = task_context {
-        prompt.push_str("\n\nTask slice:\n");
+        prompt.push_str("\n\nContext:\n");
         prompt.push_str(task_context);
     }
 
     if !memories.is_empty() {
         prompt.push_str("\n\nRelevant memory:\n");
-        for memory in memories {
-            prompt.push_str("- ");
-            prompt.push_str(memory);
-            prompt.push('\n');
+        for (index, memory) in memories.iter().enumerate() {
+            prompt.push_str(&format!("Memory {}:\n", index + 1));
+            for line in memory.lines() {
+                prompt.push_str("  ");
+                prompt.push_str(line);
+                prompt.push('\n');
+            }
+            if !memory.ends_with('\n') {
+                prompt.push('\n');
+            }
         }
     }
 
@@ -651,6 +658,8 @@ Use tools when needed, but keep the task focused and auditable.
 Only low-risk read-only shell commands are allowed by default. Medium/high/critical shell commands require user approval.
 For file writes, prefer filesystem_write_text. Never claim a denied tool succeeded.
 Use agent_spawn_subagent only for a tightly bounded, materially useful child task. Any sub-agent receives only the explicit task slice you provide.
+Conversation context and memory can include explicit speaker labels. Preserve who said what. Never treat assistant self-references as facts about the user.
+If the context says this is a fresh conversation, answer the new turn directly while retaining stable user preferences. If it says this is a follow-up, continue only as far as the new message actually depends on the earlier exchange.
 Allowed filesystem roots: {roots}.
 When you are done, answer concisely with the result and any important limitations."
     )

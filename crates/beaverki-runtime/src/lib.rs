@@ -146,7 +146,7 @@ impl Runtime {
     ) -> Result<TaskRow> {
         let user = self.resolve_user(user_id).await?;
         let initiating_identity_id = format!("cli:{}", user.user_id);
-        self.enqueue_objective_for_identity(&user, &initiating_identity_id, objective, scope)
+        self.enqueue_objective_for_identity(&user, &initiating_identity_id, objective, None, scope)
             .await
     }
 
@@ -155,11 +155,18 @@ impl Runtime {
         mapped_user_id: &str,
         initiating_identity_id: &str,
         objective: &str,
+        task_context: Option<&str>,
         scope: MemoryScope,
     ) -> Result<TaskRow> {
         let user = self.resolve_user(Some(mapped_user_id)).await?;
-        self.enqueue_objective_for_identity(&user, initiating_identity_id, objective, scope)
-            .await
+        self.enqueue_objective_for_identity(
+            &user,
+            initiating_identity_id,
+            objective,
+            task_context,
+            scope,
+        )
+        .await
     }
 
     async fn enqueue_objective_for_identity(
@@ -167,6 +174,7 @@ impl Runtime {
         user: &UserRow,
         initiating_identity_id: &str,
         objective: &str,
+        task_context: Option<&str>,
         scope: MemoryScope,
     ) -> Result<TaskRow> {
         let request = self
@@ -181,7 +189,7 @@ impl Runtime {
                 parent_task_id: request.parent_task_id.as_deref(),
                 kind: &request.kind,
                 objective: &request.objective,
-                context_summary: request.task_context.as_deref(),
+                context_summary: task_context.or(request.task_context.as_deref()),
                 scope: request.scope,
             })
             .await
@@ -586,6 +594,7 @@ pub enum DaemonResponse {
 pub struct ConnectorMessageRequest {
     pub connector_type: String,
     pub external_user_id: String,
+    pub external_display_name: Option<String>,
     pub channel_id: String,
     pub message_id: String,
     pub content: String,
@@ -769,18 +778,19 @@ impl DaemonClient {
     ) -> Result<Self> {
         let client = Self::new(socket_path);
         let deadline = Instant::now() + timeout;
-        loop {
-            if client.ping().await.is_ok() {
-                return Ok(client);
-            }
-            if Instant::now() >= deadline {
-                bail!(
-                    "timed out waiting for daemon at {}",
-                    client.socket_path.display()
-                );
+        let last_error = loop {
+            match client.ping().await {
+                Ok(_) => return Ok(client),
+                Err(error) if Instant::now() >= deadline => break error.to_string(),
+                Err(_) => {}
             }
             time::sleep(Duration::from_millis(150)).await;
-        }
+        };
+        bail!(
+            "timed out waiting for daemon at {} (last ping error: {})",
+            client.socket_path.display(),
+            last_error
+        );
     }
 }
 
@@ -1447,6 +1457,19 @@ mod tests {
         (tempdir, runtime)
     }
 
+    async fn wait_for_ready_or_report(
+        socket_path: PathBuf,
+        handle: &mut tokio::task::JoinHandle<Result<()>>,
+    ) -> DaemonClient {
+        match DaemonClient::wait_until_ready(socket_path.clone(), Duration::from_secs(5)).await {
+            Ok(client) => client,
+            Err(error) => {
+                let daemon_result = time::timeout(Duration::from_millis(250), &mut *handle).await;
+                panic!("daemon ready: {error}; daemon task result: {daemon_result:?}");
+            }
+        }
+    }
+
     #[tokio::test]
     async fn daemon_records_session_start_and_stop() {
         let (_tempdir, runtime) = test_runtime(vec![]).await;
@@ -1454,10 +1477,8 @@ mod tests {
         let instance_id = runtime.config.runtime.instance_id.clone();
         let socket_path = runtime.daemon_socket_path();
         let daemon = RuntimeDaemon::new(runtime);
-        let handle = tokio::spawn(async move { daemon.run_until(pending()).await });
-        let client = DaemonClient::wait_until_ready(socket_path.clone(), Duration::from_secs(5))
-            .await
-            .expect("daemon ready");
+        let mut handle = tokio::spawn(async move { daemon.run_until(pending()).await });
+        let client = wait_for_ready_or_report(socket_path.clone(), &mut handle).await;
 
         let status = client.status().await.expect("status");
         assert_eq!(status.state, "running");
@@ -1495,10 +1516,8 @@ mod tests {
         let instance_id = runtime.config.runtime.instance_id.clone();
         let socket_path = runtime.daemon_socket_path();
         let daemon = RuntimeDaemon::new(runtime);
-        let handle = tokio::spawn(async move { daemon.run_until(pending()).await });
-        let client = DaemonClient::wait_until_ready(socket_path, Duration::from_secs(5))
-            .await
-            .expect("daemon ready");
+        let mut handle = tokio::spawn(async move { daemon.run_until(pending()).await });
+        let client = wait_for_ready_or_report(socket_path, &mut handle).await;
 
         let task = client
             .run_task(
@@ -1547,10 +1566,8 @@ mod tests {
             .expect("enqueue");
         let socket_path = runtime.daemon_socket_path();
         let daemon = RuntimeDaemon::new(runtime);
-        let handle = tokio::spawn(async move { daemon.run_until(pending()).await });
-        let client = DaemonClient::wait_until_ready(socket_path, Duration::from_secs(5))
-            .await
-            .expect("daemon ready");
+        let mut handle = tokio::spawn(async move { daemon.run_until(pending()).await });
+        let client = wait_for_ready_or_report(socket_path, &mut handle).await;
 
         let recovered = loop {
             let inspection = client
@@ -1595,15 +1612,14 @@ mod tests {
 
         let socket_path = runtime.daemon_socket_path();
         let daemon = RuntimeDaemon::new(runtime);
-        let handle = tokio::spawn(async move { daemon.run_until(pending()).await });
-        let client = DaemonClient::wait_until_ready(socket_path, Duration::from_secs(5))
-            .await
-            .expect("daemon ready");
+        let mut handle = tokio::spawn(async move { daemon.run_until(pending()).await });
+        let client = wait_for_ready_or_report(socket_path, &mut handle).await;
 
         let reply = client
             .submit_connector_message(ConnectorMessageRequest {
                 connector_type: "discord".to_owned(),
                 external_user_id: "discord-user-1".to_owned(),
+                external_display_name: Some("Torlenor".to_owned()),
                 channel_id: "channel-1".to_owned(),
                 message_id: "msg-1".to_owned(),
                 content: "!bk Summarize the allowlisted channel request".to_owned(),
@@ -1617,6 +1633,91 @@ mod tests {
         assert!(reply_text.contains("discord done"));
         assert!(!reply_text.contains(&mapping.identity_id));
         assert!(!reply_text.starts_with("Task "));
+
+        client.shutdown().await.expect("shutdown request");
+        handle.await.expect("join").expect("daemon result");
+    }
+
+    #[tokio::test]
+    async fn discord_context_carries_recent_history_across_channels_for_same_user() {
+        let (_tempdir, mut runtime) = test_runtime(vec![
+            ModelTurnResponse {
+                output_items: vec![json!({
+                    "type": "message",
+                    "content": [{ "type": "output_text", "text": "channel reply" }]
+                })],
+                tool_calls: vec![],
+                output_text: "channel reply".to_owned(),
+            },
+            ModelTurnResponse {
+                output_items: vec![json!({
+                    "type": "message",
+                    "content": [{ "type": "output_text", "text": "dm reply" }]
+                })],
+                tool_calls: vec![],
+                output_text: "dm reply".to_owned(),
+            },
+        ])
+        .await;
+        runtime.config.integrations.discord.allowed_channel_ids = vec!["channel-1".to_owned()];
+        runtime
+            .db
+            .upsert_connector_identity(
+                "discord",
+                "discord-user-3",
+                Some("channel-1"),
+                "user_alex",
+                "authenticated_message",
+            )
+            .await
+            .expect("mapping");
+
+        let db = runtime.db.clone();
+        let socket_path = runtime.daemon_socket_path();
+        let daemon = RuntimeDaemon::new(runtime);
+        let mut handle = tokio::spawn(async move { daemon.run_until(pending()).await });
+        let client = wait_for_ready_or_report(socket_path, &mut handle).await;
+
+        let channel_reply = client
+            .submit_connector_message(ConnectorMessageRequest {
+                connector_type: "discord".to_owned(),
+                external_user_id: "discord-user-3".to_owned(),
+                external_display_name: Some("Torlenor".to_owned()),
+                channel_id: "channel-1".to_owned(),
+                message_id: "msg-cross-channel-1".to_owned(),
+                content: "!bk First channel message".to_owned(),
+                is_direct_message: false,
+            })
+            .await
+            .expect("channel message");
+        assert_eq!(channel_reply.reply.as_deref(), Some("channel reply"));
+
+        let dm_reply = client
+            .submit_connector_message(ConnectorMessageRequest {
+                connector_type: "discord".to_owned(),
+                external_user_id: "discord-user-3".to_owned(),
+                external_display_name: Some("Torlenor".to_owned()),
+                channel_id: "dm-2".to_owned(),
+                message_id: "msg-cross-channel-2".to_owned(),
+                content: "Follow up in DM".to_owned(),
+                is_direct_message: true,
+            })
+            .await
+            .expect("dm message");
+        assert_eq!(dm_reply.reply.as_deref(), Some("dm reply"));
+
+        let recent_tasks = db
+            .list_recent_interactive_tasks_for_owner("user_alex", 2)
+            .await
+            .expect("recent tasks");
+        let latest_task = recent_tasks.first().expect("latest task");
+        let context = latest_task
+            .context_summary
+            .as_deref()
+            .expect("context summary");
+        assert!(context.contains("Conversation history is shared across this BeaverKI user"));
+        assert!(context.contains("[Discord channel | channel channel-1] User (Torlenor): First channel message"));
+        assert!(context.contains("[Discord channel | channel channel-1] Assistant: channel reply"));
 
         client.shutdown().await.expect("shutdown request");
         handle.await.expect("join").expect("daemon result");
@@ -1664,15 +1765,14 @@ mod tests {
         let db = runtime.db.clone();
         let socket_path = runtime.daemon_socket_path();
         let daemon = RuntimeDaemon::new(runtime);
-        let handle = tokio::spawn(async move { daemon.run_until(pending()).await });
-        let client = DaemonClient::wait_until_ready(socket_path, Duration::from_secs(5))
-            .await
-            .expect("daemon ready");
+        let mut handle = tokio::spawn(async move { daemon.run_until(pending()).await });
+        let client = wait_for_ready_or_report(socket_path, &mut handle).await;
 
         let pending_reply = client
             .submit_connector_message(ConnectorMessageRequest {
                 connector_type: "discord".to_owned(),
                 external_user_id: "discord-user-2".to_owned(),
+                external_display_name: Some("Torlenor".to_owned()),
                 channel_id: "dm-1".to_owned(),
                 message_id: "msg-approval-1".to_owned(),
                 content: "Create a directory that needs approval".to_owned(),
@@ -1702,6 +1802,7 @@ mod tests {
             .submit_connector_message(ConnectorMessageRequest {
                 connector_type: "discord".to_owned(),
                 external_user_id: "discord-user-2".to_owned(),
+                external_display_name: Some("Torlenor".to_owned()),
                 channel_id: "dm-1".to_owned(),
                 message_id: "msg-approval-2".to_owned(),
                 content: format!("approve {}", approval.approval_id),

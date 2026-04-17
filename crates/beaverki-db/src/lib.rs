@@ -961,6 +961,27 @@ impl Database {
         Ok(row)
     }
 
+    pub async fn list_recent_interactive_tasks_for_owner(
+        &self,
+        owner_user_id: &str,
+        limit: i64,
+    ) -> Result<Vec<TaskRow>> {
+        let rows = sqlx::query_as::<_, TaskRow>(
+            "SELECT task_id, owner_user_id, initiating_identity_id, primary_agent_id, assigned_agent_id, parent_task_id, kind, state, objective, context_summary, result_text, scope, wake_at, created_at, updated_at, completed_at
+             FROM tasks
+             WHERE owner_user_id = ?
+               AND kind = 'interactive'
+             ORDER BY created_at DESC
+             LIMIT ?",
+        )
+        .bind(owner_user_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list recent interactive tasks for owner")?;
+        Ok(rows)
+    }
+
     pub async fn fetch_task(&self, task_id: &str) -> Result<Option<TaskRow>> {
         let row = sqlx::query_as::<_, TaskRow>(
             "SELECT task_id, owner_user_id, initiating_identity_id, primary_agent_id, assigned_agent_id, parent_task_id, kind, state, objective, context_summary, result_text, scope, wake_at, created_at, updated_at, completed_at

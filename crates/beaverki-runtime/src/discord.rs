@@ -2,6 +2,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
+use chrono::{DateTime, Utc};
+use beaverki_db::{Database, TaskEventRow, TaskRow};
 use futures_util::{SinkExt, StreamExt};
 use reqwest::StatusCode;
 use serde::Deserialize;
@@ -18,6 +20,8 @@ const DISCORD_GATEWAY_URL: &str = "https://discord.com/api/v10/gateway/bot";
 const DISCORD_API_BASE: &str = "https://discord.com/api/v10";
 const DISCORD_INTENTS: i64 = (1 << 0) | (1 << 9) | (1 << 12) | (1 << 15);
 const DISCORD_MAX_MESSAGE_LEN: usize = 1_900;
+const DISCORD_CONVERSATION_HISTORY_LIMIT: i64 = 4;
+const DISCORD_ACTIVE_CONVERSATION_WINDOW_SECS: i64 = 45 * 60;
 
 #[derive(Debug, Deserialize)]
 struct DiscordGatewayInfo {
@@ -42,6 +46,8 @@ struct DiscordMessageCreate {
 struct DiscordAuthor {
     id: String,
     bot: Option<bool>,
+    username: Option<String>,
+    global_name: Option<String>,
 }
 
 pub(crate) async fn run_discord_loop(daemon: Arc<RuntimeDaemon>) -> Result<()> {
@@ -185,9 +191,11 @@ async fn run_gateway_session(
                                             if message.author.bot.unwrap_or(false) {
                                                 continue;
                                             }
+                                            let external_display_name = discord_author_display_name(&message.author);
                                             let reply = daemon.handle_connector_message(ConnectorMessageRequest {
                                                 connector_type: "discord".to_owned(),
                                                 external_user_id: message.author.id,
+                                                external_display_name,
                                                 channel_id: message.channel_id.clone(),
                                                 message_id: message.id,
                                                 content: message.content,
@@ -411,13 +419,53 @@ impl RuntimeDaemon {
         } else {
             MemoryScope::Household
         };
+        let mapped_user = self
+            .runtime
+            .resolve_user(Some(&identity.mapped_user_id))
+            .await?;
+        let user_label = message
+            .external_display_name
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(mapped_user.display_name.as_str());
+        let recent_exchanges = load_recent_conversation_exchanges(
+            &self.runtime.db,
+            &identity.mapped_user_id,
+            mapped_user.display_name.as_str(),
+        )
+        .await?;
+        let current_source_label = discord_source_label(message.is_direct_message);
+        let task_context = build_discord_task_context(
+            &recent_exchanges,
+            current_source_label,
+            user_label,
+            &message.channel_id,
+        );
         let task = self
             .runtime
             .enqueue_objective_from_connector(
                 &identity.mapped_user_id,
                 &identity.identity_id,
                 &command_text,
+                Some(&task_context),
                 scope,
+            )
+            .await?;
+        self.runtime
+            .db
+            .append_task_event(
+                &task.task_id,
+                "connector_message_context",
+                "connector",
+                &identity.identity_id,
+                json!({
+                    "connector_type": &message.connector_type,
+                    "external_user_id": &message.external_user_id,
+                    "external_display_name": &message.external_display_name,
+                    "channel_id": &message.channel_id,
+                    "is_direct_message": message.is_direct_message,
+                    "source_label": current_source_label,
+                }),
             )
             .await?;
         self.runtime
@@ -492,6 +540,267 @@ fn normalize_message_text(
     } else {
         Some(stripped.to_owned())
     }
+}
+
+fn discord_author_display_name(author: &DiscordAuthor) -> Option<String> {
+    author
+        .global_name
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            author
+                .username
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+        })
+        .map(ToOwned::to_owned)
+}
+
+#[derive(Debug, Clone)]
+struct ConversationExchange {
+    created_at: String,
+    state: String,
+    source_label: String,
+    channel_id: Option<String>,
+    user_label: String,
+    user_text: String,
+    assistant_text: String,
+}
+
+fn build_discord_task_context(
+    recent_exchanges: &[ConversationExchange],
+    current_source_label: &str,
+    user_label: &str,
+    channel_id: &str,
+) -> String {
+    let mut context = String::new();
+    context.push_str("Connector context:\n");
+    context.push_str(&format!("- Source: {}.\n", current_source_label));
+    context.push_str(&format!("- Channel ID: {}.\n", channel_id));
+    context.push_str(&format!("- Current user label: {}.\n", user_label));
+    context.push_str(
+        "- Conversation history is shared across this BeaverKI user, even when they switch channels or connectors.\n",
+    );
+
+    let Some(latest_exchange) = recent_exchanges.first() else {
+        context.push_str(
+            "- Conversation status: new conversation. No recent prior exchange is available in this connector context.\n",
+        );
+        context.push_str(
+            "- Treat the current message as a new conversation unless the user explicitly refers to older context.\n",
+        );
+        return context;
+    };
+
+    let status = conversation_status(&latest_exchange.state, &latest_exchange.created_at);
+    let age_text = latest_exchange_age_text(latest_exchange.created_at.as_str())
+        .unwrap_or_else(|| "at an unknown time".to_owned());
+    match status {
+        ConversationStatus::FollowUp => {
+            context.push_str(&format!(
+                "- Conversation status: active follow-up. The latest exchange with this user was {}.\n",
+                age_text
+            ));
+            context.push_str(
+                "- Continue the prior topic only if the new message depends on it. If the user starts a new topic, answer the new topic directly.\n",
+            );
+            context.push_str("Recent attributed exchanges:\n");
+            for exchange in recent_exchanges.iter().rev() {
+                context.push_str(&format!(
+                    "- [{}] User ({}): {}\n",
+                    source_descriptor(&exchange.source_label, exchange.channel_id.as_deref()),
+                    exchange.user_label,
+                    compact_message_text(&exchange.user_text)
+                ));
+                context.push_str(&format!(
+                    "- [{}] Assistant: {}\n",
+                    source_descriptor(&exchange.source_label, exchange.channel_id.as_deref()),
+                    compact_message_text(&exchange.assistant_text)
+                ));
+            }
+        }
+        ConversationStatus::FreshStart => {
+            context.push_str(&format!(
+                "- Conversation status: fresh conversation. The latest exchange with this user was {}.\n",
+                age_text
+            ));
+            context.push_str(
+                "- Treat the current message as a new conversation unless the user explicitly refers to the earlier topic. Keep stable facts and preferences if they are reliable.\n",
+            );
+        }
+    }
+
+    context
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConversationStatus {
+    FollowUp,
+    FreshStart,
+}
+
+fn conversation_status(state: &str, created_at: &str) -> ConversationStatus {
+    if matches!(
+        state.parse::<TaskState>(),
+        Ok(TaskState::Pending | TaskState::Running | TaskState::WaitingApproval)
+    ) {
+        return ConversationStatus::FollowUp;
+    }
+
+    let Some(created_at) = parse_timestamp(created_at) else {
+        return ConversationStatus::FreshStart;
+    };
+    let age = Utc::now().signed_duration_since(created_at).num_seconds();
+    if age <= DISCORD_ACTIVE_CONVERSATION_WINDOW_SECS {
+        ConversationStatus::FollowUp
+    } else {
+        ConversationStatus::FreshStart
+    }
+}
+
+fn latest_exchange_age_text(created_at: &str) -> Option<String> {
+    let created_at = parse_timestamp(created_at)?;
+    let age = Utc::now().signed_duration_since(created_at);
+    if age.num_minutes() < 1 {
+        Some("less than a minute ago".to_owned())
+    } else if age.num_hours() < 1 {
+        Some(format!("{} minutes ago", age.num_minutes()))
+    } else if age.num_days() < 1 {
+        Some(format!("{} hours ago", age.num_hours()))
+    } else {
+        Some(format!("{} days ago", age.num_days()))
+    }
+}
+
+fn parse_timestamp(value: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|timestamp| timestamp.with_timezone(&Utc))
+}
+
+fn assistant_reply_for_context(task: &TaskRow) -> String {
+    match task.state.parse::<TaskState>() {
+        Ok(TaskState::Completed) => task
+            .result_text
+            .clone()
+            .unwrap_or_else(|| "Task completed without a recorded reply.".to_owned()),
+        Ok(TaskState::WaitingApproval) => task.result_text.clone().unwrap_or_else(|| {
+            "The assistant is waiting for approval before it can continue.".to_owned()
+        }),
+        Ok(TaskState::Pending | TaskState::Running) => {
+            "The assistant is still working on that request.".to_owned()
+        }
+        Ok(TaskState::Failed) => task
+            .result_text
+            .clone()
+            .unwrap_or_else(|| "The assistant failed without a recorded explanation.".to_owned()),
+        Ok(TaskState::Blocked) | Err(_) => task
+            .result_text
+            .clone()
+            .unwrap_or_else(|| format!("Task state: {}.", task.state)),
+    }
+}
+
+fn compact_message_text(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn source_descriptor(source_label: &str, channel_id: Option<&str>) -> String {
+    match channel_id {
+        Some(channel_id) => format!("{source_label} | channel {channel_id}"),
+        None => source_label.to_owned(),
+    }
+}
+
+fn discord_source_label(is_direct_message: bool) -> &'static str {
+    if is_direct_message {
+        "Discord direct message"
+    } else {
+        "Discord channel"
+    }
+}
+
+async fn load_recent_conversation_exchanges(
+    db: &Database,
+    owner_user_id: &str,
+    fallback_user_label: &str,
+) -> Result<Vec<ConversationExchange>> {
+    let tasks = db
+        .list_recent_interactive_tasks_for_owner(owner_user_id, DISCORD_CONVERSATION_HISTORY_LIMIT)
+        .await?;
+    let mut exchanges = Vec::with_capacity(tasks.len());
+    for task in tasks {
+        let events = db.fetch_task_events_for_owner(owner_user_id, &task.task_id).await?;
+        exchanges.push(build_conversation_exchange(
+            &task,
+            &events,
+            fallback_user_label,
+        ));
+    }
+    Ok(exchanges)
+}
+
+fn build_conversation_exchange(
+    task: &TaskRow,
+    events: &[TaskEventRow],
+    fallback_user_label: &str,
+) -> ConversationExchange {
+    let connector_context = connector_context_from_events(events);
+    let (source_label, channel_id, user_label) = if let Some(context) = connector_context {
+        (
+            context.source_label,
+            Some(context.channel_id),
+            context.user_label.unwrap_or_else(|| fallback_user_label.to_owned()),
+        )
+    } else if task.initiating_identity_id.starts_with("cli:") {
+        ("CLI".to_owned(), None, fallback_user_label.to_owned())
+    } else {
+        (
+            "Unknown source".to_owned(),
+            None,
+            fallback_user_label.to_owned(),
+        )
+    };
+
+    ConversationExchange {
+        created_at: task.created_at.clone(),
+        state: task.state.clone(),
+        source_label,
+        channel_id,
+        user_label,
+        user_text: task.objective.clone(),
+        assistant_text: assistant_reply_for_context(task),
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ConnectorEventContext {
+    source_label: String,
+    channel_id: String,
+    user_label: Option<String>,
+}
+
+fn connector_context_from_events(events: &[TaskEventRow]) -> Option<ConnectorEventContext> {
+    let event = events
+        .iter()
+        .find(|event| event.event_type == "connector_message_context")?;
+    let payload: Value = serde_json::from_str(&event.payload_json).ok()?;
+    let source_label = payload
+        .get("source_label")
+        .and_then(Value::as_str)
+        .unwrap_or("Connector")
+        .to_owned();
+    let channel_id = payload.get("channel_id").and_then(Value::as_str)?.to_owned();
+    let user_label = payload
+        .get("external_display_name")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+
+    Some(ConnectorEventContext {
+        source_label,
+        channel_id,
+        user_label,
+    })
 }
 
 fn parse_approval_command(command_text: &str) -> Option<(bool, &str)> {
@@ -585,6 +894,7 @@ fn retry_delay_for_error(error: &anyhow::Error) -> Option<Duration> {
 mod tests {
     use super::*;
     use beaverki_db::TaskRow;
+    use chrono::{Duration as ChronoDuration, Utc};
 
     fn test_task(task_id: &str, state: &str, result_text: Option<&str>) -> TaskRow {
         TaskRow {
@@ -656,5 +966,44 @@ mod tests {
 
         assert!(reply.contains("task_123"));
         assert!(reply.contains("failed"));
+    }
+
+    #[test]
+    fn discord_context_marks_recent_exchange_as_follow_up() {
+        let recent_exchange = ConversationExchange {
+            created_at: (Utc::now() - ChronoDuration::minutes(5)).to_rfc3339(),
+            state: "completed".to_owned(),
+            source_label: "Discord direct message".to_owned(),
+            channel_id: Some("dm-1".to_owned()),
+            user_label: "Torlenor".to_owned(),
+            user_text: "Who am I?".to_owned(),
+            assistant_text: "You said your name is Joe.".to_owned(),
+        };
+
+        let context =
+            build_discord_task_context(&[recent_exchange], "Discord direct message", "Torlenor", "dm-1");
+
+        assert!(context.contains("Conversation status: active follow-up"));
+        assert!(context.contains("[Discord direct message | channel dm-1] User (Torlenor): Who am I?"));
+        assert!(context.contains("[Discord direct message | channel dm-1] Assistant: You said your name is Joe."));
+    }
+
+    #[test]
+    fn discord_context_marks_stale_exchange_as_fresh_conversation() {
+        let stale_exchange = ConversationExchange {
+            created_at: (Utc::now() - ChronoDuration::hours(8)).to_rfc3339(),
+            state: "completed".to_owned(),
+            source_label: "Discord direct message".to_owned(),
+            channel_id: Some("dm-1".to_owned()),
+            user_label: "Torlenor".to_owned(),
+            user_text: "Old question".to_owned(),
+            assistant_text: "old reply".to_owned(),
+        };
+
+        let context =
+            build_discord_task_context(&[stale_exchange], "Discord direct message", "Torlenor", "dm-1");
+
+        assert!(context.contains("Conversation status: fresh conversation"));
+        assert!(!context.contains("Recent attributed exchanges"));
     }
 }
