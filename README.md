@@ -1,6 +1,6 @@
-# BeaverKI
+# BeaverKi
 
-BeaverKI is an open-source, local-first autonomous agent framework for running a personal or household assistant on hardware you control. It is built as a long-lived Rust runtime rather than a chat-only interface, so it can keep operating in the background, act through local tools, and preserve durable state on your machine.
+BeaverKi is an open-source, local-first autonomous agent framework for running a personal or household assistant on hardware you control. It is built as a long-lived Rust runtime rather than a chat-only interface, so it can keep operating in the background, act through local tools, and preserve durable state on your machine.
 
 The project is aimed at a practical V1 that can:
 
@@ -15,7 +15,7 @@ The longer-term goal is a trusted digital companion that stays understandable to
 
 ## Releases
 
-BeaverKI release identifiers are driven by Git tags, not by the Cargo package version in the workspace manifests.
+BeaverKi release identifiers are driven by Git tags, not by the Cargo package version in the workspace manifests.
 
 - release tags must use `YYYY-MM-DD.N`, for example `2026-04-18.1`
 - beta tags may use `YYYY-MM-DD.N-betaX`, for example `2026-04-18.2-beta1`
@@ -25,7 +25,7 @@ This is compatible with Rust because Cargo still uses the workspace crate versio
 
 ## Current State
 
-BeaverKI already has a usable local runtime foundation. Today the repository includes:
+BeaverKi already has a usable local runtime foundation. Today the repository includes:
 
 - a Rust workspace with separated crates for runtime, CLI, config, policy, memory, models, tools, automation, and storage
 - encrypted local OpenAI credential storage
@@ -43,7 +43,7 @@ Still intentionally out of scope for the current milestone:
 
 - safety-agent review flows
 
-## How BeaverKI Works Today
+## How BeaverKi Works Today
 
 The current V1 direction is:
 
@@ -56,15 +56,15 @@ The current V1 direction is:
 - blocking safety review for Lua scripts
 - approval gates for medium, high, and critical generated shell actions
 
-Operationally, that means BeaverKI is already useful as a local, multi-user assistant runtime, but it is still early-stage software and currently optimized for CLI-driven setup and operation.
+Operationally, that means BeaverKi is already useful as a local, multi-user assistant runtime, but it is still early-stage software and currently optimized for CLI-driven setup and operation.
 
-## Get BeaverKI Running For A Household
+## Get BeaverKi Running For A Household
 
 The shortest path is to use the Makefile targets for setup and daily operations, then drop into the direct CLI only when you need more control.
 
 1. Install the local prerequisites.
 
-	You need a Rust toolchain with `cargo`, plus `make`. BeaverKI currently runs as a local Rust workspace and uses OpenAI for the initial provider integration.
+	You need a Rust toolchain with `cargo`, plus `make`. BeaverKi currently runs as a local Rust workspace and uses OpenAI for the initial provider integration.
 
 2. Export an OpenAI API key.
 
@@ -72,7 +72,7 @@ The shortest path is to use the Makefile targets for setup and daily operations,
 	export OPENAI_API_KEY="your-openai-api-key"
 	```
 
-3. Initialize BeaverKI on the machine that will host the household runtime.
+3. Initialize BeaverKi on the machine that will host the household runtime.
 
 	```bash
 	make setup
@@ -86,7 +86,7 @@ The shortest path is to use the Makefile targets for setup and daily operations,
 	make daemon-start
 	```
 
-	BeaverKI keeps decrypted provider credentials only in memory for the runtime process. If `BEAVERKI_MASTER_PASSPHRASE` is not set, the daemon will prompt for it.
+	BeaverKi keeps decrypted provider credentials only in memory for the runtime process. If `BEAVERKI_MASTER_PASSPHRASE` is not set, the daemon will prompt for it.
 
 5. Review the built-in roles and add the rest of the household.
 
@@ -118,7 +118,7 @@ The shortest path is to use the Makefile targets for setup and daily operations,
 
 8. Optionally connect Discord for remote household use.
 
-	Store a bot token, enable the connector, then map each Discord user ID to a BeaverKI user. Direct messages are accepted by default; guild messages are accepted only from allowlisted channel IDs. For the full setup flow, see [Discord Setup Guide](docs/discord-setup.md).
+	Store a bot token, enable the connector, then map each Discord user ID to a BeaverKi user. Direct messages are accepted by default; guild messages are accepted only from allowlisted channel IDs. For the full setup flow, see [Discord Setup Guide](docs/discord-setup.md).
 
 9. Stop the daemon when you are done.
 

@@ -1,45 +1,45 @@
-# BeaverKI Sessions
+# BeaverKi Sessions
 
 ## 1. Purpose
 
-This document explains how conversation sessions work in BeaverKI today.
+This document explains how conversation sessions work in BeaverKi today.
 
 It is written for users and operators who want to understand:
 
-- when BeaverKI treats a message as part of the same conversation
+- when BeaverKi treats a message as part of the same conversation
 - when context is shared versus isolated
 - what `/new` does
 - how sessions differ from durable memory
 
 ## 2. What A Session Is
 
-A session is BeaverKI's current conversation context.
+A session is BeaverKi's current conversation context.
 
 It is the part of the system that answers questions like:
 
 - "Does this message continue the previous topic?"
 - "Should this room share context with other rooms?"
-- "If I switch DM channels, should BeaverKI still remember the recent thread?"
+- "If I switch DM channels, should BeaverKi still remember the recent thread?"
 
 Sessions are for short-term transcript continuity.
 
 They are not the same thing as durable memory:
 
 - session context is recent conversation history
-- durable memory is long-lived facts BeaverKI should keep across conversations
+- durable memory is long-lived facts BeaverKi should keep across conversations
 
 Example:
 
-- if you tell BeaverKI your preferred name, that may become durable memory
-- if you ask BeaverKI to continue the task from two minutes ago, that usually comes from the session
+- if you tell BeaverKi your preferred name, that may become durable memory
+- if you ask BeaverKi to continue the task from two minutes ago, that usually comes from the session
 
 ## 3. Current Session Types
 
-BeaverKI currently uses four session types.
+BeaverKi currently uses four session types.
 
 ### 3.1 CLI
 
-CLI requests for the same BeaverKI user share one CLI session.
+CLI requests for the same BeaverKi user share one CLI session.
 
 That means:
 
@@ -48,11 +48,11 @@ That means:
 
 ### 3.2 Direct Messages
 
-Direct-message sessions are tied to the mapped BeaverKI user, not to one raw DM channel ID.
+Direct-message sessions are tied to the mapped BeaverKi user, not to one raw DM channel ID.
 
 That means:
 
-- if the same mapped user sends direct messages through different DM entrypoints, BeaverKI keeps the same DM conversation continuity
+- if the same mapped user sends direct messages through different DM entrypoints, BeaverKi keeps the same DM conversation continuity
 - DM history is private to that user-level DM session
 
 ### 3.3 Group Rooms
@@ -75,9 +75,9 @@ That means:
 - one cron run does not inherit transcript continuity from an earlier cron run
 - scheduled work may still use durable memory, but it does not continue a prior transcript by default
 
-## 4. What BeaverKI Continues
+## 4. What BeaverKi Continues
 
-When a new request arrives, BeaverKI first resolves the session and then looks at recent transcript history inside that session only.
+When a new request arrives, BeaverKi first resolves the session and then looks at recent transcript history inside that session only.
 
 In practice:
 
@@ -96,7 +96,7 @@ Resetting or changing sessions does not delete:
 - audit history
 - durable semantic memory
 
-So if you start a new conversation, BeaverKI may still know stable facts it was meant to remember, such as:
+So if you start a new conversation, BeaverKi may still know stable facts it was meant to remember, such as:
 
 - your name
 - long-term preferences
@@ -120,7 +120,7 @@ Current behavior:
 - it does not forget durable memory
 - it does not delete task or audit records
 
-After `/new`, BeaverKI treats the next request in that session as a new conversation unless durable memory is still relevant.
+After `/new`, BeaverKi treats the next request in that session as a new conversation unless durable memory is still relevant.
 
 ## 7. Shared Rooms And Privacy Caps
 
@@ -131,17 +131,17 @@ This means a room can be configured so its session only uses a narrower memory s
 Example:
 
 - a user may have access to household-level context in general
-- a particular shared room can still be capped so BeaverKI only uses private-level context there
+- a particular shared room can still be capped so BeaverKi only uses private-level context there
 
 This lets shared spaces stay narrower than a user's broader permissions.
 
 ## 8. Session Management Today
 
-BeaverKI now supports both manual and policy-driven session management.
+BeaverKi now supports both manual and policy-driven session management.
 
 Current behavior:
 
-- BeaverKI creates or reuses the correct session automatically
+- BeaverKi creates or reuses the correct session automatically
 - users can reset the current session with `/new`
 - scheduled runs always start fresh
 - the runtime can automatically reset or archive inactive sessions based on configured lifecycle policies
@@ -167,7 +167,7 @@ Current operator controls include:
 
 ### 9.1 CLI Follow-Up
 
-You ask BeaverKI in the CLI:
+You ask BeaverKi in the CLI:
 
 ```text
 Summarize the notes in this folder.
@@ -179,7 +179,7 @@ Then you ask:
 Now turn that into a checklist.
 ```
 
-BeaverKI treats the second command as part of the same recent CLI conversation.
+BeaverKi treats the second command as part of the same recent CLI conversation.
 
 ### 9.2 DM Versus Room
 
@@ -201,11 +201,11 @@ Send:
 /new
 ```
 
-BeaverKI clears the current session's recent transcript continuity, but it still keeps durable memory and audit history.
+BeaverKi clears the current session's recent transcript continuity, but it still keeps durable memory and audit history.
 
 ## 10. Summary
 
-The current BeaverKI session model is:
+The current BeaverKi session model is:
 
 - recent transcript continuity is session-scoped
 - CLI, DMs, shared rooms, and scheduled runs do not all share one global conversation

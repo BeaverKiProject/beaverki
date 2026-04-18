@@ -1,14 +1,14 @@
 # Discord Setup Guide
 
-This guide walks through the complete Discord setup for BeaverKI, from creating the bot to mapping household members and testing the integration.
+This guide walks through the complete Discord setup for BeaverKi, from creating the bot to mapping household members and testing the integration.
 
 ## What The Discord Connector Does
 
-The current Discord integration lets BeaverKI:
+The current Discord integration lets BeaverKi:
 
 - accept direct messages from mapped Discord users
 - accept server messages only from explicitly allowlisted channel IDs
-- route each Discord identity to a BeaverKI household user
+- route each Discord identity to a BeaverKi household user
 - send task replies back into the same Discord conversation
 - keep short-lived working indicators active while a task is still running
 - route risky approval actions through Discord, with DM-only approval by default
@@ -19,9 +19,9 @@ The connector is designed for household remote control, not for a public multi-t
 
 Make sure you already have:
 
-- a working BeaverKI installation created with `make setup` or `beaverki setup init`
+- a working BeaverKi installation created with `make setup` or `beaverki setup init`
 - the daemon running locally with `make daemon-start` or `beaverki daemon start`
-- at least one BeaverKI user created for each household member you want to map
+- at least one BeaverKi user created for each household member you want to map
 - a Discord account with permission to create applications and invite bots to your server
 
 Useful commands before you begin:
@@ -34,16 +34,16 @@ cargo run -p beaverki-cli -- connector discord show
 ## 1. Create The Discord Application And Bot
 
 1. Open the Discord Developer Portal.
-2. Create a new application for BeaverKI.
+2. Create a new application for BeaverKi.
 3. Add a bot user to that application.
-4. Copy the bot token. You will store it in BeaverKI during connector configuration.
+4. Copy the bot token. You will store it in BeaverKi during connector configuration.
 5. Enable the Message Content intent for the bot.
 
-BeaverKI reads message text to turn Discord messages into task requests. Without Message Content intent, channel and DM requests will not work correctly.
+BeaverKi reads message text to turn Discord messages into task requests. Without Message Content intent, channel and DM requests will not work correctly.
 
 ## 2. Invite The Bot To Your Server
 
-If you want to use BeaverKI only in direct messages, you can skip shared server channels. If you want shared household channels, invite the bot to the server first.
+If you want to use BeaverKi only in direct messages, you can skip shared server channels. If you want shared household channels, invite the bot to the server first.
 
 When creating the invite in the Discord Developer Portal, grant the bot enough access to:
 
@@ -52,7 +52,7 @@ When creating the invite in the Discord Developer Portal, grant the bot enough a
 - send replies
 - add reactions
 
-BeaverKI uses replies, typing indicators, and a temporary working reaction while tasks are in progress.
+BeaverKi uses replies, typing indicators, and a temporary working reaction while tasks are in progress.
 
 ## 3. Enable Developer Mode In Discord
 
@@ -64,7 +64,7 @@ You will need Discord IDs to map users and allow channels.
 4. Right-click a user and copy their user ID.
 5. Right-click a channel and copy its channel ID.
 
-## 4. Enable The Connector In BeaverKI
+## 4. Enable The Connector In BeaverKi
 
 Export the bot token or let the CLI prompt for it.
 
@@ -89,7 +89,7 @@ cargo run -p beaverki-cli -- connector discord configure \
   --allow-channel 123456789012345678
 ```
 
-When the connector is enabled, BeaverKI encrypts and stores the Discord bot token locally using the same secret storage flow as the model credentials.
+When the connector is enabled, BeaverKi encrypts and stores the Discord bot token locally using the same secret storage flow as the model credentials.
 
 Inspect the resulting configuration:
 
@@ -106,9 +106,9 @@ You should see:
 
 ## 5. Map Discord Users To Household Users
 
-Each Discord user must be mapped to a BeaverKI household user before BeaverKI can accept their requests.
+Each Discord user must be mapped to a BeaverKi household user before BeaverKi can accept their requests.
 
-First list the BeaverKI users so you know the target IDs:
+First list the BeaverKi users so you know the target IDs:
 
 ```bash
 make user-list
@@ -167,7 +167,7 @@ Example channel message with the default prefix:
 !bk Summarize the latest task activity for my account.
 ```
 
-If the message is accepted, BeaverKI will either reply directly or acknowledge that the daemon is still working on it.
+If the message is accepted, BeaverKi will either reply directly or acknowledge that the daemon is still working on it.
 
 ## 8. How Approvals Work In Discord
 
@@ -176,11 +176,11 @@ The current default is DM-only approval handling.
 That means:
 
 - a risky request may start from a shared channel
-- BeaverKI can ask the user to continue the approval flow in a direct message
-- approval commands in Discord use one-time action tokens issued by BeaverKI
+- BeaverKi can ask the user to continue the approval flow in a direct message
+- approval commands in Discord use one-time action tokens issued by BeaverKi
 - critical approvals may require an additional confirmation token
 
-If a request needs approval, follow the instructions from BeaverKI in DM rather than continuing in the public channel.
+If a request needs approval, follow the instructions from BeaverKi in DM rather than continuing in the public channel.
 
 ## 9. Day-To-Day Operations
 
@@ -203,7 +203,7 @@ Check these first:
 
 - the daemon is running
 - the connector is enabled
-- the Discord user has been mapped to a BeaverKI user
+- the Discord user has been mapped to a BeaverKi user
 - the bot token was stored correctly
 - Message Content intent is enabled in the Discord Developer Portal
 
@@ -221,12 +221,12 @@ The usual causes are:
 
 - the channel ID is not in the allowlist
 - the message does not start with the configured prefix
-- the user is not mapped to a BeaverKI household user
+- the user is not mapped to a BeaverKi household user
 - the bot lacks permission to read or reply in that channel
 
 ### The bot was working before, then stopped after a token change
 
-Rerun the connector configuration command with `--enable` so BeaverKI stores the new token, then restart the daemon.
+Rerun the connector configuration command with `--enable` so BeaverKi stores the new token, then restart the daemon.
 
 ### A request pauses for approval
 

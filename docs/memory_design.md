@@ -1,8 +1,8 @@
-# BeaverKI Memory Design
+# BeaverKi Memory Design
 
 ## 1. Purpose
 
-This document describes the current memory layout in BeaverKI after `M4 Semantic Memory`.
+This document describes the current memory layout in BeaverKi after `M4 Semantic Memory`.
 
 It is intentionally narrower than the full technical spec. The goal is to give us one practical place to inspect:
 
@@ -14,7 +14,7 @@ It is intentionally narrower than the full technical spec. The goal is to give u
 
 ## 2. Current Model
 
-BeaverKI currently treats memory as SQLite-backed records in the `memories` table.
+BeaverKi currently treats memory as SQLite-backed records in the `memories` table.
 
 The runtime distinguishes two broad classes:
 

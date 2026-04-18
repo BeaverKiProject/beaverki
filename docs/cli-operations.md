@@ -1,6 +1,6 @@
 # CLI and Operations Guide
 
-This guide holds the command-oriented operational details for BeaverKI. The README stays focused on what the project is, what state it is in, and how to get a household installation running.
+This guide holds the command-oriented operational details for BeaverKi. The README stays focused on what the project is, what state it is in, and how to get a household installation running.
 
 ## Prerequisites And Defaults
 
@@ -56,7 +56,7 @@ Verify that the OpenAI credential works:
 cargo run -p beaverki-cli -- setup verify-openai
 ```
 
-Initialize a new BeaverKI installation:
+Initialize a new BeaverKi installation:
 
 ```bash
 cargo run -p beaverki-cli -- setup init
@@ -73,7 +73,7 @@ cargo run -p beaverki-cli -- setup set-models \
   --safety-review-model gpt-5.4-mini
 ```
 
-`setup init` verifies the OpenAI API token unless `--skip-openai-check` is passed. The token is stored as an encrypted local secret reference under the BeaverKI state directory.
+`setup init` verifies the OpenAI API token unless `--skip-openai-check` is passed. The token is stored as an encrypted local secret reference under the BeaverKi state directory.
 
 ## Daemon Lifecycle
 
@@ -116,7 +116,7 @@ cargo run -p beaverki-cli -- user add --display-name Sam --role child
 
 Each user gets:
 
-- a stable BeaverKI user ID
+- a stable BeaverKi user ID
 - a persistent primary agent
 - one or more built-in household roles
 
@@ -192,7 +192,7 @@ Enable Discord and allow a guild channel:
 cargo run -p beaverki-cli -- connector discord configure --enable --allow-channel 1234567890
 ```
 
-Map a Discord user to a BeaverKI household user:
+Map a Discord user to a BeaverKi household user:
 
 ```bash
 cargo run -p beaverki-cli -- connector discord map-user \
@@ -217,7 +217,7 @@ If you are configuring the bot from scratch, make sure the Discord application h
 - a bot user with a valid token
 - Message Content intent enabled
 - access to the server and channels you intend to allowlist
-- permissions that let it read messages, send replies, read channel history, and add reactions in the channels where BeaverKI will operate
+- permissions that let it read messages, send replies, read channel history, and add reactions in the channels where BeaverKi will operate
 
 ## Lua Automation And Schedules
 

@@ -1,8 +1,8 @@
-# BeaverKI Design Document
+# BeaverKi Design Document
 
 ## 1. Overview
 
-BeaverKI is an open-source autonomous AI agent framework designed to act as a personal, always-on digital assistant that runs on the user's own machine or server. Unlike passive chat interfaces, BeaverKI performs actions in the local environment: it can execute terminal commands, read and write files, control browsers, schedule background work, and interact with messaging platforms such as Telegram, Slack, Discord, and WhatsApp through modular integrations.
+BeaverKi is an open-source autonomous AI agent framework designed to act as a personal, always-on digital assistant that runs on the user's own machine or server. Unlike passive chat interfaces, BeaverKi performs actions in the local environment: it can execute terminal commands, read and write files, control browsers, schedule background work, and interact with messaging platforms such as Telegram, Slack, Discord, and WhatsApp through modular integrations.
 
 The framework is local-first, model-agnostic, and security-conscious. It is intended to run on macOS, Windows, Linux, and VPS environments, with configuration and history stored locally in transparent, user-editable Markdown and YAML files. The platform is implemented in Rust for safety, portability, performance, and strong systems-level control.
 
@@ -21,7 +21,7 @@ This document describes the initial product and technical design before implemen
 
 The following product-shaping decisions are now assumed for v1:
 
-- The runtime must support multiple human users, such as members of a household, sharing one BeaverKI installation.
+- The runtime must support multiple human users, such as members of a household, sharing one BeaverKi installation.
 - The product should target both desktop and headless VPS operation from the start.
 - The default operating mode should be bounded autonomy, with policy-defined limits rather than manual approval for every step.
 - Messaging integrations are first-class remote control surfaces, not only notification channels.
@@ -103,7 +103,7 @@ Autonomy is useful only if it is bounded. The system should support background o
 
 ## 6. System Overview
 
-At a high level, BeaverKI consists of the following major subsystems:
+At a high level, BeaverKi consists of the following major subsystems:
 
 1. Runtime Core
 2. Agent Orchestrator

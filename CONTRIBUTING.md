@@ -1,6 +1,6 @@
 # Contributing
 
-BeaverKI is intended to support a GitHub-native, agent-friendly development workflow. The repository should be easy for humans and AI coding agents to navigate, plan, implement, review, test, and merge safely.
+BeaverKi is intended to support a GitHub-native, agent-friendly development workflow. The repository should be easy for humans and AI coding agents to navigate, plan, implement, review, test, and merge safely.
 
 GitHub uses pull requests, not merge requests. This repository standardizes on `PR` terminology.
 

@@ -1,8 +1,8 @@
-# BeaverKI V1 Technical Spec
+# BeaverKi V1 Technical Spec
 
 ## 1. Purpose
 
-This document translates the product design into a concrete V1 implementation plan for BeaverKI.
+This document translates the product design into a concrete V1 implementation plan for BeaverKi.
 
 It defines:
 
@@ -998,7 +998,7 @@ Runtime-owned metadata such as task ID, acting user, connector origin, and conve
 
 Use `mlua`.
 
-`mlua` is a good fit for BeaverKI because it provides a practical Rust embedding layer for Lua while keeping the host/runtime boundary under Rust control. It is appropriate for both:
+`mlua` is a good fit for BeaverKi because it provides a practical Rust embedding layer for Lua while keeping the host/runtime boundary under Rust control. It is appropriate for both:
 
 - workflow scripting
 - user-authored or agent-authored tool logic
@@ -1016,7 +1016,7 @@ Minimal V1 host functions:
 
 ### 14.3 Lua-Defined Tools
 
-BeaverKI should be designed so that Lua can define higher-level tools, not only scripts. The important constraint is that these are still host-managed tools, not unrestricted Lua programs.
+BeaverKi should be designed so that Lua can define higher-level tools, not only scripts. The important constraint is that these are still host-managed tools, not unrestricted Lua programs.
 
 Suggested model:
 
@@ -1132,7 +1132,7 @@ Must support:
 
 - receiving DMs
 - receiving messages from allowlisted channels
-- identity mapping from Discord user ID to BeaverKI user ID
+- identity mapping from Discord user ID to BeaverKi user ID
 - sending replies
 - routing approval prompts
 - sending deferred follow-up messages after initial acceptance when a task completes later
@@ -1235,7 +1235,7 @@ Every approval request must capture:
 
 ## 18.3 Repository Workflow For Autonomous Development
 
-Because BeaverKI is intended to be developed with substantial AI-agent assistance, the GitHub workflow should be treated as part of the technical system rather than an afterthought.
+Because BeaverKi is intended to be developed with substantial AI-agent assistance, the GitHub workflow should be treated as part of the technical system rather than an afterthought.
 
 Repository-level requirements:
 
