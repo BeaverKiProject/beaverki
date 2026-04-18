@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
 use beaverki_automation as automation;
-use beaverki_core::{MemoryScope, ShellRisk, TaskState, ToolInvocationStatus};
+use beaverki_core::{MemoryKind, MemoryScope, ShellRisk, TaskState, ToolInvocationStatus};
 use beaverki_db::{
     Database, MemoryRow, NewApproval, NewSchedule, NewScript, NewScriptReview, NewTask, TaskRow,
     UpdateScript,
@@ -14,7 +14,7 @@ use beaverki_memory::{
 use beaverki_models::{ConversationItem, ModelProvider};
 use beaverki_policy::{
     can_request_automation_approval, can_request_shell_approval, can_spawn_subagents,
-    can_write_household_memory,
+    can_write_household_memory, visible_memory_scopes,
 };
 use beaverki_tools::{ToolContext, ToolDefinition, ToolError, ToolOutput, ToolRegistry};
 use serde_json::{Value, json};
@@ -734,6 +734,8 @@ impl PrimaryAgentRunner {
         tool_context: &ToolContext,
     ) -> std::result::Result<ToolOutput, ToolError> {
         match tool_name {
+            "memory_read" => self.handle_memory_read(task, request, arguments).await,
+            "memory_write" => self.handle_memory_write(task, request, arguments).await,
             "memory_remember" => self.handle_memory_remember(task, request, arguments).await,
             "memory_forget" => self.handle_memory_forget(task, request, arguments).await,
             "lua_script_list"
@@ -783,19 +785,158 @@ impl PrimaryAgentRunner {
         request: &AgentRequest,
         arguments: Value,
     ) -> std::result::Result<ToolOutput, ToolError> {
-        let scope = required_string_arg(&arguments, "scope", "memory_remember")?
+        self.handle_semantic_memory_write(task, request, arguments, "memory_remember")
+            .await
+    }
+
+    async fn handle_memory_write(
+        &self,
+        task: &TaskRow,
+        request: &AgentRequest,
+        arguments: Value,
+    ) -> std::result::Result<ToolOutput, ToolError> {
+        self.handle_semantic_memory_write(task, request, arguments, "memory_write")
+            .await
+    }
+
+    async fn handle_memory_read(
+        &self,
+        task: &TaskRow,
+        request: &AgentRequest,
+        arguments: Value,
+    ) -> std::result::Result<ToolOutput, ToolError> {
+        let explicit_scopes = explicit_memory_tool_scopes(request);
+        let scope_filter = required_string_arg(&arguments, "scope", "memory_read")?;
+        let scopes = match scope_filter {
+            "visible" => request.visible_scopes.clone(),
+            "private" => vec![MemoryScope::Private],
+            "household" => vec![MemoryScope::Household],
+            other => {
+                return Err(ToolError::Failed(anyhow!(
+                    "memory_read only supports visible, private, or household scope filters, got '{other}'"
+                )));
+            }
+        };
+
+        if scopes.is_empty() {
+            return Err(ToolError::Denied {
+                message: "memory reads are not available in this task context".to_owned(),
+                detail: json!({
+                    "scope": scope_filter,
+                }),
+            });
+        }
+
+        if scope_filter != "visible" && scopes.iter().any(|scope| !explicit_scopes.contains(scope))
+        {
+            return Err(ToolError::Denied {
+                message: "requested memory scope is not accessible to the current user".to_owned(),
+                detail: json!({
+                    "scope": scope_filter,
+                }),
+            });
+        }
+
+        let subject_type = optional_string_arg(&arguments, "subject_type");
+        let subject_key = optional_string_arg(&arguments, "subject_key");
+        let limit = arguments
+            .get("limit")
+            .and_then(Value::as_i64)
+            .map(|value| value.clamp(1, 10))
+            .unwrap_or(5);
+
+        let memories = self
+            .db
+            .query_memories(
+                Some(&request.owner_user_id),
+                &scopes,
+                Some(MemoryKind::Semantic),
+                subject_type,
+                subject_key,
+                false,
+                false,
+                limit,
+            )
+            .await
+            .map_err(ToolError::Failed)?;
+
+        self.db
+            .record_audit_event(
+                "agent",
+                &request.assigned_agent_id,
+                "semantic_memory_read",
+                json!({
+                    "task_id": task.task_id,
+                    "owner_user_id": request.owner_user_id,
+                    "scope_filter": scope_filter,
+                    "scopes": scopes.iter().map(|scope| scope.as_str()).collect::<Vec<_>>(),
+                    "subject_type": subject_type,
+                    "subject_key": subject_key,
+                    "limit": limit,
+                    "memory_ids": memories.iter().map(|memory| memory.memory_id.clone()).collect::<Vec<_>>(),
+                }),
+            )
+            .await
+            .map_err(ToolError::Failed)?;
+
+        Ok(ToolOutput {
+            payload: json!({
+                "status": "ok",
+                "scope_filter": scope_filter,
+                "subject_type": subject_type,
+                "subject_key": subject_key,
+                "match_count": memories.len(),
+                "memories": memories.iter().map(memory_row_to_json).collect::<Vec<_>>(),
+            }),
+        })
+    }
+
+    async fn handle_semantic_memory_write(
+        &self,
+        task: &TaskRow,
+        request: &AgentRequest,
+        arguments: Value,
+        tool_name: &str,
+    ) -> std::result::Result<ToolOutput, ToolError> {
+        let explicit_scopes = explicit_memory_tool_scopes(request);
+        let scope = required_string_arg(&arguments, "scope", tool_name)?
             .parse::<MemoryScope>()
             .map_err(ToolError::Failed)?;
         if !matches!(scope, MemoryScope::Private | MemoryScope::Household) {
             return Err(ToolError::Failed(anyhow!(
-                "memory_remember only supports private or household scope"
+                "{tool_name} only supports private or household scope"
             )));
         }
-        let subject_type = required_string_arg(&arguments, "subject_type", "memory_remember")?;
-        let subject_key = required_string_arg(&arguments, "subject_key", "memory_remember")?;
-        let content_text = required_string_arg(&arguments, "content_text", "memory_remember")?;
-        let source_type = required_string_arg(&arguments, "source_type", "memory_remember")?;
-        let source_summary = required_string_arg(&arguments, "source_summary", "memory_remember")?;
+        if !explicit_scopes.contains(&scope) {
+            self.db
+                .record_audit_event(
+                    "agent",
+                    &request.assigned_agent_id,
+                    "semantic_memory_write_denied",
+                    json!({
+                        "task_id": task.task_id,
+                        "owner_user_id": request.owner_user_id,
+                        "requested_scope": scope.as_str(),
+                        "subject_type": arguments.get("subject_type").and_then(Value::as_str),
+                        "subject_key": arguments.get("subject_key").and_then(Value::as_str),
+                        "reason": "scope_not_accessible",
+                    }),
+                )
+                .await
+                .map_err(ToolError::Failed)?;
+            return Err(ToolError::Denied {
+                message: "requested memory scope is not accessible to the current user".to_owned(),
+                detail: json!({
+                    "scope": scope.as_str(),
+                    "subject_key": arguments.get("subject_key").and_then(Value::as_str),
+                }),
+            });
+        }
+        let subject_type = required_string_arg(&arguments, "subject_type", tool_name)?;
+        let subject_key = required_string_arg(&arguments, "subject_key", tool_name)?;
+        let content_text = required_string_arg(&arguments, "content_text", tool_name)?;
+        let source_type = required_string_arg(&arguments, "source_type", tool_name)?;
+        let source_summary = required_string_arg(&arguments, "source_summary", tool_name)?;
         let source_ref = arguments
             .get("source_ref")
             .and_then(Value::as_str)
@@ -852,7 +993,18 @@ impl PrimaryAgentRunner {
             .await
             .map_err(ToolError::Failed)?;
 
-        let (event_type, payload) = match &write_result {
+        let payload = semantic_memory_write_payload(
+            &write_result,
+            scope,
+            subject_type,
+            subject_key,
+            content_text,
+            source_type,
+            source_ref,
+        );
+        let event_detail = payload.clone();
+
+        let (event_type, audit_payload) = match &write_result {
             SemanticMemoryWriteResult::Created { memory_id } => (
                 "semantic_memory_created",
                 json!({
@@ -898,24 +1050,17 @@ impl PrimaryAgentRunner {
             ),
         };
         self.db
-            .record_audit_event("agent", &request.assigned_agent_id, event_type, payload)
+            .record_audit_event(
+                "agent",
+                &request.assigned_agent_id,
+                event_type,
+                audit_payload,
+            )
             .await
             .map_err(ToolError::Failed)?;
 
         Ok(ToolOutput {
-            payload: json!({
-                "status": match write_result {
-                    SemanticMemoryWriteResult::Created { .. } => "created",
-                    SemanticMemoryWriteResult::Deduplicated { .. } => "deduplicated",
-                    SemanticMemoryWriteResult::Corrected { .. } => "corrected",
-                },
-                "scope": scope.as_str(),
-                "subject_type": subject_type,
-                "subject_key": subject_key,
-                "content_text": content_text,
-                "source_type": source_type,
-                "source_ref": source_ref,
-            }),
+            payload: event_detail,
         })
     }
 
@@ -925,6 +1070,7 @@ impl PrimaryAgentRunner {
         request: &AgentRequest,
         arguments: Value,
     ) -> std::result::Result<ToolOutput, ToolError> {
+        let explicit_scopes = explicit_memory_tool_scopes(request);
         let memory_id = required_string_arg(&arguments, "memory_id", "memory_forget")?;
         let reason = required_string_arg(&arguments, "reason", "memory_forget")?;
         let memory = self
@@ -938,9 +1084,9 @@ impl PrimaryAgentRunner {
             .parse::<MemoryScope>()
             .map_err(ToolError::Failed)?;
 
-        if !request.visible_scopes.contains(&memory_scope) {
+        if !explicit_scopes.contains(&memory_scope) {
             return Err(ToolError::Denied {
-                message: "memory is not visible to the current user".to_owned(),
+                message: "memory is not accessible to the current user".to_owned(),
                 detail: json!({ "memory_id": memory_id }),
             });
         }
@@ -949,7 +1095,7 @@ impl PrimaryAgentRunner {
             None => {}
             _ => {
                 return Err(ToolError::Denied {
-                    message: "memory is not visible to the current user".to_owned(),
+                    message: "memory is not accessible to the current user".to_owned(),
                     detail: json!({ "memory_id": memory_id }),
                 });
             }
@@ -1703,6 +1849,45 @@ impl PrimaryAgentRunner {
 fn tool_definitions(tools: &ToolRegistry) -> Vec<ToolDefinition> {
     let mut definitions = tools.definitions();
     definitions.push(ToolDefinition {
+        name: "memory_read".to_owned(),
+        description: "Read active scoped semantic memory entries before updating or relying on existing remembered state. Use this to inspect mutable keyed state such as shopping lists, inventories, checklists, or running household notes, and to confirm what is already stored under a subject key.".to_owned(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "scope": {
+                    "type": "string",
+                    "enum": ["visible", "private", "household"]
+                },
+                "subject_type": { "type": ["string", "null"] },
+                "subject_key": { "type": ["string", "null"] },
+                "limit": { "type": "integer" }
+            },
+            "required": ["scope", "subject_type", "subject_key", "limit"],
+            "additionalProperties": false
+        }),
+    });
+    definitions.push(ToolDefinition {
+        name: "memory_write".to_owned(),
+        description: "Create or replace a scoped semantic memory entry under a stable subject key. Use this for mutable durable state such as shopping lists, inventories, checklists, and shared notes that need an explicit canonical latest value. Reuse the same `subject_key` to update the stored value.".to_owned(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "scope": {
+                    "type": "string",
+                    "enum": ["private", "household"]
+                },
+                "subject_type": { "type": "string" },
+                "subject_key": { "type": "string" },
+                "content_text": { "type": "string" },
+                "source_type": { "type": "string" },
+                "source_summary": { "type": "string" },
+                "source_ref": { "type": ["string", "null"] }
+            },
+            "required": ["scope", "subject_type", "subject_key", "content_text", "source_type", "source_summary", "source_ref"],
+            "additionalProperties": false
+        }),
+    });
+    definitions.push(ToolDefinition {
         name: "memory_forget".to_owned(),
         description: "Deactivate a previously stored memory entry so it no longer participates in future retrieval. Use this when an earlier memory is wrong, unsafe, stale, or clearly should not continue influencing the agent. Prefer forgetting the specific incorrect memory row, then store the corrected fact separately when needed.".to_owned(),
         input_schema: json!({
@@ -1920,8 +2105,12 @@ Use tools when needed, but keep the task focused and auditable.
 Only low-risk read-only shell commands are allowed by default. Medium/high/critical shell commands require user approval.
 For exploring allowed roots and locating files, prefer filesystem_list, filesystem_read_text, and filesystem_search over shell_exec.
 Use Lua tools when recurring or structured automation materially helps. Writing a Lua script triggers safety review. New scripts require explicit activation later, while rewrites of already active scripts stay active if the new version passes safety review. Scheduling requires user approval. When writing Lua, prefer `return function(ctx) ... end`, use BeaverKI host APIs such as `ctx.log_info`, `ctx.notify_user`, `ctx.task_defer`, `ctx.memory_read`, `ctx.memory_write`, and `ctx.tool_call`, and avoid legacy globals like `run()`, `log()`, or `notify()`.
+Use memory_read before updating existing mutable memory or when you need to confirm the current canonical value under a subject key.
+Use memory_write for mutable durable scoped state such as shopping lists, inventories, checklists, and shared notes. When updating keyed state, write the full latest canonical value under the same subject_key rather than describing a partial edit in prose.
+Automatic memory retrieval for the current conversation may be narrower than your role-based memory tool access. In a private DM, you may still use explicit memory tools against household scope when the user clearly asks for a household update and the current user is allowed to access household memory.
 Use memory_remember only for durable semantic facts that are likely to matter in future conversations, such as names, identities, stable preferences, or long-lived household facts. Do not store transient task progress or one-off summaries with memory_remember. Use `private` scope by default and only use `household` for explicitly shared facts. Reuse the same subject_key when correcting an existing fact.
 Use memory_forget when a previously stored memory row is wrong or should stop affecting future tasks. If the user says an earlier remembered fact was incorrect, forget the wrong row and then store the corrected fact if appropriate.
+Never claim memory was persisted unless a memory_write or memory_remember tool call returned success in this task.
 For file writes, prefer filesystem_write_text. Never claim a denied tool succeeded.
 Use agent_spawn_subagent only for a tightly bounded, materially useful child task. Any sub-agent receives only the explicit task slice you provide.
 Conversation context and memory can include explicit speaker labels. Preserve who said what. Never treat assistant self-references as facts about the user.
@@ -1956,6 +2145,73 @@ fn format_memory_for_prompt(memory: &MemoryRow) -> String {
     lines.join("\n")
 }
 
+fn semantic_memory_write_payload(
+    write_result: &SemanticMemoryWriteResult,
+    scope: MemoryScope,
+    subject_type: &str,
+    subject_key: &str,
+    content_text: &str,
+    source_type: &str,
+    source_ref: Option<&str>,
+) -> Value {
+    let (status, memory_id, previous_memory_id) = match write_result {
+        SemanticMemoryWriteResult::Created { memory_id } => ("created", memory_id.as_str(), None),
+        SemanticMemoryWriteResult::Deduplicated { memory_id } => {
+            ("deduplicated", memory_id.as_str(), None)
+        }
+        SemanticMemoryWriteResult::Corrected {
+            previous_memory_id,
+            memory_id,
+        } => (
+            "corrected",
+            memory_id.as_str(),
+            Some(previous_memory_id.as_str()),
+        ),
+    };
+
+    json!({
+        "status": status,
+        "persisted": true,
+        "memory_id": memory_id,
+        "previous_memory_id": previous_memory_id,
+        "scope": scope.as_str(),
+        "subject_type": subject_type,
+        "subject_key": subject_key,
+        "content_text": content_text,
+        "source_type": source_type,
+        "source_ref": source_ref,
+    })
+}
+
+fn memory_row_to_json(memory: &MemoryRow) -> Value {
+    json!({
+        "memory_id": memory.memory_id,
+        "scope": memory.scope,
+        "memory_kind": memory.memory_kind,
+        "subject_type": memory.subject_type,
+        "subject_key": memory.subject_key,
+        "content_text": memory.content_text,
+        "source_type": memory.source_type,
+        "source_ref": memory.source_ref,
+        "source_summary": memory_source_summary(memory),
+        "created_at": memory.created_at,
+        "updated_at": memory.updated_at,
+    })
+}
+
+fn explicit_memory_tool_scopes(request: &AgentRequest) -> Vec<MemoryScope> {
+    visible_memory_scopes(&request.role_ids)
+}
+
+fn memory_source_summary(memory: &MemoryRow) -> Option<String> {
+    let content_json = memory.content_json.as_deref()?;
+    let metadata = serde_json::from_str::<Value>(content_json).ok()?;
+    metadata
+        .get("source_summary")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+}
+
 fn parse_shell_risk(value: Option<&str>) -> Option<ShellRisk> {
     match value? {
         "low" => Some(ShellRisk::Low),
@@ -1977,6 +2233,14 @@ fn required_string_arg<'a>(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| ToolError::Failed(anyhow!("{tool_name} requires {key}")))
+}
+
+fn optional_string_arg<'a>(arguments: &'a Value, key: &str) -> Option<&'a str> {
+    arguments
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
 }
 
 fn roles_label(role_ids: &[String]) -> String {
@@ -3315,6 +3579,146 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn memory_read_then_write_updates_household_shopping_list() {
+        let provider = FakeProvider::new(vec![
+            ModelTurnResponse {
+                output_items: vec![json!({
+                    "type": "function_call",
+                    "call_id": "call_read_list",
+                    "name": "memory_read",
+                    "arguments": "{\"scope\":\"household\",\"subject_type\":\"list\",\"subject_key\":\"household.shopping_list\",\"limit\":3}"
+                })],
+                tool_calls: vec![beaverki_models::ModelToolCall {
+                    call_id: "call_read_list".to_owned(),
+                    name: "memory_read".to_owned(),
+                    arguments: json!({
+                        "scope": "household",
+                        "subject_type": "list",
+                        "subject_key": "household.shopping_list",
+                        "limit": 3
+                    }),
+                }],
+                output_text: String::new(),
+            },
+            ModelTurnResponse {
+                output_items: vec![json!({
+                    "type": "function_call",
+                    "call_id": "call_write_list",
+                    "name": "memory_write",
+                    "arguments": "{\"scope\":\"household\",\"subject_type\":\"list\",\"subject_key\":\"household.shopping_list\",\"content_text\":\"Apfel x4\\nBananen\\nFaschiertes 400g\\nLinzerstangerl x4\\nMilch\",\"source_type\":\"user_statement\",\"source_summary\":\"User added Milch to the household shopping list.\",\"source_ref\":\"turn-2\"}"
+                })],
+                tool_calls: vec![beaverki_models::ModelToolCall {
+                    call_id: "call_write_list".to_owned(),
+                    name: "memory_write".to_owned(),
+                    arguments: json!({
+                        "scope": "household",
+                        "subject_type": "list",
+                        "subject_key": "household.shopping_list",
+                        "content_text": "Apfel x4\nBananen\nFaschiertes 400g\nLinzerstangerl x4\nMilch",
+                        "source_type": "user_statement",
+                        "source_summary": "User added Milch to the household shopping list.",
+                        "source_ref": "turn-2"
+                    }),
+                }],
+                output_text: String::new(),
+            },
+            ModelTurnResponse {
+                output_items: vec![json!({
+                    "type": "message",
+                    "content": [{ "type": "output_text", "text": "Added Milch and persisted the updated household shopping list." }]
+                })],
+                tool_calls: vec![],
+                output_text: "Added Milch and persisted the updated household shopping list."
+                    .to_owned(),
+            },
+        ]);
+        let (db, runner) = test_runner(provider).await;
+        let default_user = db.default_user().await.expect("default").expect("user");
+        let roles = db
+            .list_user_roles(&default_user.user_id)
+            .await
+            .expect("roles")
+            .into_iter()
+            .map(|row| row.role_id)
+            .collect::<Vec<_>>();
+        let original_metadata =
+            json!({ "source_summary": "User shared the current household shopping list." });
+        let original_memory_id = db
+            .insert_memory(beaverki_db::NewMemory {
+                owner_user_id: None,
+                scope: MemoryScope::Household,
+                memory_kind: MemoryKind::Semantic,
+                subject_type: "list",
+                subject_key: Some("household.shopping_list"),
+                content_text: "Apfel x4\nBananen\nFaschiertes 400g\nLinzerstangerl x4",
+                content_json: Some(&original_metadata),
+                sensitivity: "normal",
+                source_type: "user_statement",
+                source_ref: Some("turn-1"),
+                task_id: Some("task_seed"),
+            })
+            .await
+            .expect("seed shopping list");
+
+        let result = runner
+            .run_task(AgentRequest {
+                owner_user_id: default_user.user_id.clone(),
+                initiating_identity_id: format!("cli:{}", default_user.user_id),
+                primary_agent_id: default_user.primary_agent_id.clone().expect("agent"),
+                assigned_agent_id: default_user.primary_agent_id.clone().expect("agent"),
+                role_ids: roles.clone(),
+                objective: "Add Milch to the household shopping list.".to_owned(),
+                scope: MemoryScope::Household,
+                kind: "interactive".to_owned(),
+                parent_task_id: None,
+                task_context: None,
+                visible_scopes: visible_memory_scopes(&roles),
+                memory_mode: AgentMemoryMode::ScopedRetrieval,
+                approved_shell_commands: Vec::new(),
+                approved_automation_actions: Vec::new(),
+            })
+            .await
+            .expect("task");
+
+        assert_eq!(result.task.state, TaskState::Completed.as_str());
+        let current = db
+            .find_active_memory_by_subject(
+                None,
+                MemoryScope::Household,
+                MemoryKind::Semantic,
+                "list",
+                "household.shopping_list",
+            )
+            .await
+            .expect("find shopping list")
+            .expect("current shopping list");
+        assert_eq!(
+            current.content_text,
+            "Apfel x4\nBananen\nFaschiertes 400g\nLinzerstangerl x4\nMilch"
+        );
+        let superseded = db
+            .fetch_memory(&original_memory_id)
+            .await
+            .expect("fetch old shopping list")
+            .expect("superseded shopping list");
+        assert_eq!(
+            superseded.superseded_by_memory_id.as_deref(),
+            Some(current.memory_id.as_str())
+        );
+        let audit_events = db.list_audit_events(20).await.expect("audit events");
+        assert!(
+            audit_events
+                .iter()
+                .any(|event| event.event_type == "semantic_memory_read")
+        );
+        assert!(
+            audit_events
+                .iter()
+                .any(|event| event.event_type == "semantic_memory_corrected")
+        );
+    }
+
+    #[tokio::test]
     async fn memory_remember_denies_household_write_for_guest() {
         let provider = FakeProvider::new(vec![
             ModelTurnResponse {
@@ -3394,6 +3798,121 @@ mod tests {
                 .iter()
                 .any(|event| event.event_type == "semantic_memory_write_denied")
         );
+    }
+
+    #[tokio::test]
+    async fn memory_write_allows_household_write_from_private_context_when_role_allows_it() {
+        let provider = FakeProvider::new(vec![
+            ModelTurnResponse {
+                output_items: vec![json!({
+                    "type": "function_call",
+                    "call_id": "call_household_read",
+                    "name": "memory_read",
+                    "arguments": "{\"scope\":\"household\",\"subject_type\":\"list\",\"subject_key\":\"household.shopping_list\",\"limit\":3}"
+                })],
+                tool_calls: vec![beaverki_models::ModelToolCall {
+                    call_id: "call_household_read".to_owned(),
+                    name: "memory_read".to_owned(),
+                    arguments: json!({
+                        "scope": "household",
+                        "subject_type": "list",
+                        "subject_key": "household.shopping_list",
+                        "limit": 3
+                    }),
+                }],
+                output_text: String::new(),
+            },
+            ModelTurnResponse {
+                output_items: vec![json!({
+                    "type": "function_call",
+                    "call_id": "call_household_hidden",
+                    "name": "memory_write",
+                    "arguments": "{\"scope\":\"household\",\"subject_type\":\"list\",\"subject_key\":\"household.shopping_list\",\"content_text\":\"Brot\\nMilch\",\"source_type\":\"user_statement\",\"source_summary\":\"User asked to update the household shopping list.\",\"source_ref\":\"turn-1\"}"
+                })],
+                tool_calls: vec![beaverki_models::ModelToolCall {
+                    call_id: "call_household_hidden".to_owned(),
+                    name: "memory_write".to_owned(),
+                    arguments: json!({
+                        "scope": "household",
+                        "subject_type": "list",
+                        "subject_key": "household.shopping_list",
+                        "content_text": "Brot\nMilch",
+                        "source_type": "user_statement",
+                        "source_summary": "User asked to update the household shopping list.",
+                        "source_ref": "turn-1"
+                    }),
+                }],
+                output_text: String::new(),
+            },
+            ModelTurnResponse {
+                output_items: vec![json!({
+                    "type": "message",
+                    "content": [{ "type": "output_text", "text": "stored household memory" }]
+                })],
+                tool_calls: vec![],
+                output_text: "stored household memory".to_owned(),
+            },
+        ]);
+        let (db, runner) = test_runner(provider).await;
+        let default_user = db.default_user().await.expect("default").expect("user");
+        let roles = db
+            .list_user_roles(&default_user.user_id)
+            .await
+            .expect("roles")
+            .into_iter()
+            .map(|row| row.role_id)
+            .collect::<Vec<_>>();
+        let original_metadata =
+            json!({ "source_summary": "User shared the current household shopping list." });
+        db.insert_memory(beaverki_db::NewMemory {
+            owner_user_id: None,
+            scope: MemoryScope::Household,
+            memory_kind: MemoryKind::Semantic,
+            subject_type: "list",
+            subject_key: Some("household.shopping_list"),
+            content_text: "Brot",
+            content_json: Some(&original_metadata),
+            sensitivity: "normal",
+            source_type: "user_statement",
+            source_ref: Some("turn-0"),
+            task_id: Some("task_seed"),
+        })
+        .await
+        .expect("seed shopping list");
+
+        let result = runner
+            .run_task(AgentRequest {
+                owner_user_id: default_user.user_id.clone(),
+                initiating_identity_id: format!("cli:{}", default_user.user_id),
+                primary_agent_id: default_user.primary_agent_id.clone().expect("agent"),
+                assigned_agent_id: default_user.primary_agent_id.clone().expect("agent"),
+                role_ids: roles.clone(),
+                objective: "Update the household shopping list.".to_owned(),
+                scope: MemoryScope::Private,
+                kind: "interactive".to_owned(),
+                parent_task_id: None,
+                task_context: None,
+                visible_scopes: vec![MemoryScope::Private],
+                memory_mode: AgentMemoryMode::ScopedRetrieval,
+                approved_shell_commands: Vec::new(),
+                approved_automation_actions: Vec::new(),
+            })
+            .await
+            .expect("task");
+
+        assert_eq!(result.task.state, TaskState::Completed.as_str());
+        let household_memory = db
+            .find_active_memory_by_subject(
+                None,
+                MemoryScope::Household,
+                MemoryKind::Semantic,
+                "list",
+                "household.shopping_list",
+            )
+            .await
+            .expect("lookup household memory")
+            .expect("household memory");
+        assert_eq!(household_memory.content_text, "Brot\nMilch");
     }
 
     #[tokio::test]
@@ -3599,6 +4118,9 @@ mod tests {
         ));
         assert!(prompt.contains("prefer `return function(ctx) ... end`"));
         assert!(prompt.contains("avoid legacy globals like `run()`, `log()`, or `notify()`"));
+        assert!(prompt.contains("Use memory_read before updating existing mutable memory"));
+        assert!(prompt.contains("Use memory_write for mutable durable scoped state"));
+        assert!(prompt.contains("Automatic memory retrieval for the current conversation may be narrower than your role-based memory tool access"));
         assert!(prompt.contains("Use memory_remember only for durable semantic facts"));
     }
 
