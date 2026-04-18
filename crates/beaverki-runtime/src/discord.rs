@@ -63,6 +63,54 @@ struct DiscordAuthor {
     global_name: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct DiscordCurrentUser {
+    id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct DiscordRegisteredCommand {
+    name: String,
+    description: String,
+    #[serde(rename = "type")]
+    command_type: i64,
+    contexts: Option<Vec<i64>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DiscordInteractionCreate {
+    id: String,
+    application_id: String,
+    #[serde(rename = "type")]
+    interaction_type: i64,
+    token: String,
+    channel_id: Option<String>,
+    guild_id: Option<String>,
+    data: Option<DiscordInteractionData>,
+    member: Option<DiscordInteractionMember>,
+    user: Option<DiscordAuthor>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DiscordInteractionMember {
+    user: Option<DiscordAuthor>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DiscordInteractionData {
+    name: String,
+    #[serde(default)]
+    options: Vec<DiscordInteractionOption>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DiscordInteractionOption {
+    name: String,
+    value: Option<Value>,
+    #[serde(default)]
+    options: Vec<DiscordInteractionOption>,
+}
+
 pub(crate) async fn run_discord_loop(daemon: Arc<RuntimeDaemon>) -> Result<()> {
     let token = daemon
         .runtime
@@ -70,6 +118,24 @@ pub(crate) async fn run_discord_loop(daemon: Arc<RuntimeDaemon>) -> Result<()> {
         .map(ToOwned::to_owned)
         .ok_or_else(|| anyhow!("Discord connector is enabled but no bot token is loaded"))?;
     let http_client = build_discord_http_client()?;
+
+    if let Err(error) = sync_discord_global_commands(&daemon, &http_client, &token).await
+    {
+        warn!("failed to sync Discord global commands: {error:#}");
+        daemon
+            .runtime
+            .db
+            .record_audit_event(
+                "connector",
+                "discord",
+                "discord_command_registration_error",
+                json!({
+                    "scope": "global",
+                    "error": error.to_string(),
+                }),
+            )
+            .await?;
+    }
 
     daemon
         .runtime
@@ -225,6 +291,15 @@ async fn run_gateway_session(
                                                 .await?;
                                             }
                                         }
+                                        "INTERACTION_CREATE" => {
+                                            let interaction = serde_json::from_value::<DiscordInteractionCreate>(
+                                                payload.get("d").cloned().unwrap_or(Value::Null),
+                                            )
+                                            .context("failed to decode Discord interaction event")?;
+                                            daemon
+                                                .handle_discord_interaction(http_client, interaction)
+                                                .await?;
+                                        }
                                         _ => {}
                                     }
                                 }
@@ -303,6 +378,229 @@ async fn send_discord_message(
         .with_context(|| format!("failed to send Discord message to channel {channel_id}"))?
         .error_for_status()
         .with_context(|| format!("Discord rejected message for channel {channel_id}"))?;
+    Ok(())
+}
+
+async fn sync_discord_global_commands(
+    daemon: &RuntimeDaemon,
+    http_client: &reqwest::Client,
+    token: &str,
+) -> Result<()> {
+    let application_id = fetch_discord_application_id(http_client, token).await?;
+    let commands = list_discord_global_commands(http_client, token, &application_id).await?;
+    let desired_commands = discord_global_command_payloads();
+    if discord_command_sets_match(&commands, &desired_commands) {
+        daemon
+            .runtime
+            .db
+            .record_audit_event(
+                "connector",
+                "discord",
+                "discord_command_registration_checked",
+                json!({
+                    "scope": "global",
+                    "status": "already_synchronized",
+                    "command_count": commands.len(),
+                }),
+            )
+            .await?;
+        return Ok(());
+    }
+
+    overwrite_discord_global_commands(http_client, token, &application_id, &desired_commands).await?;
+    daemon
+        .runtime
+        .db
+        .record_audit_event(
+            "connector",
+            "discord",
+            "discord_command_registered",
+            json!({
+                "scope": "global",
+                "status": "synchronized",
+                "previous_command_count": commands.len(),
+                "command_names": desired_commands
+                    .iter()
+                    .filter_map(|command| command.get("name").and_then(Value::as_str))
+                    .collect::<Vec<_>>(),
+            }),
+        )
+        .await?;
+    Ok(())
+}
+
+async fn fetch_discord_application_id(
+    http_client: &reqwest::Client,
+    token: &str,
+) -> Result<String> {
+    let current_user = http_client
+        .get(format!("{DISCORD_API_BASE}/users/@me"))
+        .header("Authorization", format!("Bot {token}"))
+        .send()
+        .await
+        .context("failed to fetch Discord bot identity")?
+        .error_for_status()
+        .context("Discord rejected bot identity lookup")?
+        .json::<DiscordCurrentUser>()
+        .await
+        .context("failed to decode Discord bot identity response")?;
+    Ok(current_user.id)
+}
+
+async fn list_discord_global_commands(
+    http_client: &reqwest::Client,
+    token: &str,
+    application_id: &str,
+) -> Result<Vec<DiscordRegisteredCommand>> {
+    http_client
+        .get(format!("{DISCORD_API_BASE}/applications/{application_id}/commands"))
+        .header("Authorization", format!("Bot {token}"))
+        .send()
+        .await
+        .with_context(|| {
+            format!("failed to list Discord commands for application {application_id}")
+        })?
+        .error_for_status()
+        .with_context(|| {
+            format!("Discord rejected command listing for application {application_id}")
+        })?
+        .json::<Vec<DiscordRegisteredCommand>>()
+        .await
+        .with_context(|| {
+            format!("failed to decode Discord command list for application {application_id}")
+        })
+}
+
+async fn overwrite_discord_global_commands(
+    http_client: &reqwest::Client,
+    token: &str,
+    application_id: &str,
+    payload: &[Value],
+) -> Result<()> {
+    http_client
+        .put(format!("{DISCORD_API_BASE}/applications/{application_id}/commands"))
+        .header("Authorization", format!("Bot {token}"))
+        .json(&payload)
+        .send()
+        .await
+        .with_context(|| {
+            format!("failed to overwrite Discord commands for application {application_id}")
+        })?
+        .error_for_status()
+        .with_context(|| {
+            format!("Discord rejected command overwrite for application {application_id}")
+        })?;
+    Ok(())
+}
+
+fn discord_global_command_payloads() -> Vec<Value> {
+    vec![json!({
+        "name": "new",
+        "type": 1,
+        "description": "Start a new BeaverKI conversation",
+        "contexts": [0, 1],
+    })]
+}
+
+fn discord_command_sets_match(commands: &[DiscordRegisteredCommand], desired_commands: &[Value]) -> bool {
+    if commands.len() != desired_commands.len() {
+        return false;
+    }
+
+    commands.iter().all(|command| {
+        desired_commands
+            .iter()
+            .any(|desired| discord_registered_command_matches_payload(command, desired))
+    })
+}
+
+fn discord_registered_command_matches_payload(
+    command: &DiscordRegisteredCommand,
+    desired_command: &Value,
+) -> bool {
+    command.name == desired_command.get("name").and_then(Value::as_str).unwrap_or_default()
+        && command.command_type
+            == desired_command.get("type").and_then(Value::as_i64).unwrap_or_default()
+        && command.description
+            == desired_command
+                .get("description")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+        && normalized_discord_command_contexts(command.contexts.as_deref())
+            == normalized_discord_command_contexts_from_value(desired_command.get("contexts"))
+}
+
+fn normalized_discord_command_contexts(contexts: Option<&[i64]>) -> Vec<i64> {
+    let mut contexts = contexts.unwrap_or(&[]).to_vec();
+    contexts.sort_unstable();
+    contexts.dedup();
+    contexts
+}
+
+fn normalized_discord_command_contexts_from_value(contexts: Option<&Value>) -> Vec<i64> {
+    let mut contexts = contexts
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_i64)
+        .collect::<Vec<_>>();
+    contexts.sort_unstable();
+    contexts.dedup();
+    contexts
+}
+
+async fn send_discord_interaction_callback(
+    http_client: &reqwest::Client,
+    interaction_id: &str,
+    interaction_token: &str,
+    payload: Value,
+) -> Result<()> {
+    http_client
+        .post(format!(
+            "{DISCORD_API_BASE}/interactions/{interaction_id}/{interaction_token}/callback"
+        ))
+        .json(&payload)
+        .send()
+        .await
+        .with_context(|| {
+            format!(
+                "failed to send Discord interaction callback for interaction {interaction_id}"
+            )
+        })?
+        .error_for_status()
+        .with_context(|| {
+            format!(
+                "Discord rejected interaction callback for interaction {interaction_id}"
+            )
+        })?;
+    Ok(())
+}
+
+async fn edit_discord_interaction_response(
+    http_client: &reqwest::Client,
+    application_id: &str,
+    interaction_token: &str,
+    content: &str,
+) -> Result<()> {
+    let message = truncate_reply(content);
+    http_client
+        .patch(format!(
+            "{DISCORD_API_BASE}/webhooks/{application_id}/{interaction_token}/messages/@original"
+        ))
+        .json(&json!({ "content": message }))
+        .send()
+        .await
+        .with_context(|| {
+            format!(
+                "failed to edit Discord interaction response for application {application_id}"
+            )
+        })?
+        .error_for_status()
+        .with_context(|| {
+            format!(
+                "Discord rejected interaction response edit for application {application_id}"
+            )
+        })?;
     Ok(())
 }
 
@@ -539,6 +837,110 @@ pub(super) async fn maybe_send_task_follow_up(
 }
 
 impl RuntimeDaemon {
+    async fn handle_discord_interaction(
+        &self,
+        http_client: &reqwest::Client,
+        interaction: DiscordInteractionCreate,
+    ) -> Result<()> {
+        match interaction.interaction_type {
+            1 => {
+                send_discord_interaction_callback(
+                    http_client,
+                    &interaction.id,
+                    &interaction.token,
+                    json!({ "type": 1 }),
+                )
+                .await?;
+                Ok(())
+            }
+            2 => {
+                let interaction_id = interaction.id.clone();
+                let application_id = interaction.application_id.clone();
+                let interaction_token = interaction.token.clone();
+                send_discord_interaction_callback(
+                    http_client,
+                    &interaction_id,
+                    &interaction_token,
+                    json!({ "type": 5 }),
+                )
+                .await?;
+
+                let reply_text = match self
+                    .handle_discord_application_command(interaction)
+                    .await
+                {
+                    Ok(Some(reply_text)) => reply_text,
+                    Ok(None) => {
+                        "This Discord command is not enabled in this context.".to_owned()
+                    }
+                    Err(error) => {
+                        warn!("discord interaction handling failed: {error:#}");
+                        format!("Discord command failed: {error}")
+                    }
+                };
+
+                edit_discord_interaction_response(
+                    http_client,
+                    &application_id,
+                    &interaction_token,
+                    &reply_text,
+                )
+                .await
+            }
+            _ => Ok(()),
+        }
+    }
+
+    async fn handle_discord_application_command(
+        &self,
+        interaction: DiscordInteractionCreate,
+    ) -> Result<Option<String>> {
+        let request = self.discord_interaction_to_message_request(&interaction)?;
+        let reply = self.handle_connector_message(request).await?;
+        Ok(reply.reply)
+    }
+
+    fn discord_interaction_to_message_request(
+        &self,
+        interaction: &DiscordInteractionCreate,
+    ) -> Result<ConnectorMessageRequest> {
+        let channel_id = interaction
+            .channel_id
+            .clone()
+            .ok_or_else(|| anyhow!("Discord interaction missing channel_id"))?;
+        let author = interaction
+            .user
+            .as_ref()
+            .or_else(|| interaction.member.as_ref().and_then(|member| member.user.as_ref()))
+            .ok_or_else(|| anyhow!("Discord interaction missing user payload"))?;
+        let data = interaction
+            .data
+            .as_ref()
+            .ok_or_else(|| anyhow!("Discord application command missing data payload"))?;
+        let command_text = interaction_command_text(data)?;
+        let is_direct_message = interaction.guild_id.is_none();
+        let content = if is_direct_message {
+            command_text
+        } else {
+            let prefix = self.runtime.config.integrations.discord.command_prefix.trim();
+            if prefix.is_empty() {
+                command_text
+            } else {
+                format!("{prefix} {command_text}")
+            }
+        };
+
+        Ok(ConnectorMessageRequest {
+            connector_type: "discord".to_owned(),
+            external_user_id: author.id.clone(),
+            external_display_name: discord_author_display_name(author),
+            channel_id,
+            message_id: String::new(),
+            content,
+            is_direct_message,
+        })
+    }
+
     async fn handle_discord_gateway_message(
         &self,
         http_client: &reqwest::Client,
@@ -1361,6 +1763,127 @@ fn discord_author_display_name(author: &DiscordAuthor) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+fn interaction_command_text(data: &DiscordInteractionData) -> Result<String> {
+    let mut path = vec![data.name.clone()];
+    let mut values = Vec::new();
+    let mut preferred_prompt = None;
+
+    flatten_interaction_options(
+        &data.options,
+        &mut path,
+        &mut values,
+        &mut preferred_prompt,
+    );
+
+    if let Some(approval_command) = normalize_interaction_approval_command(&path, &values) {
+        return Ok(approval_command);
+    }
+
+    if values.is_empty() && path.len() == 1 && path[0] == "new" {
+        return Ok("/new".to_owned());
+    }
+
+    if path.len() == 1 {
+        if let Some(prompt) = preferred_prompt.or_else(|| {
+            if values.is_empty() {
+                None
+            } else {
+                Some(values.join(" "))
+            }
+        }) {
+            let trimmed = prompt.trim();
+            if !trimmed.is_empty() {
+                return Ok(trimmed.to_owned());
+            }
+        }
+
+        let trimmed = path[0].trim();
+        if !trimmed.is_empty() {
+            return Ok(trimmed.to_owned());
+        }
+    }
+
+    let mut parts = path;
+    parts.extend(values);
+    let command = parts
+        .join(" ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if command.is_empty() {
+        bail!("Discord application command did not contain usable input")
+    }
+    Ok(command)
+}
+
+fn flatten_interaction_options(
+    options: &[DiscordInteractionOption],
+    path: &mut Vec<String>,
+    values: &mut Vec<String>,
+    preferred_prompt: &mut Option<String>,
+) {
+    if let Some(nested_option) = options.iter().find(|option| !option.options.is_empty()) {
+        path.push(nested_option.name.clone());
+        flatten_interaction_options(&nested_option.options, path, values, preferred_prompt);
+        return;
+    }
+
+    for option in options {
+        let Some(value) = option.value.as_ref() else {
+            continue;
+        };
+        let rendered = render_interaction_option_value(value);
+        if rendered.trim().is_empty() {
+            continue;
+        }
+        if preferred_prompt.is_none() && is_prompt_option_name(&option.name) {
+            *preferred_prompt = Some(rendered.clone());
+        }
+        values.push(rendered);
+    }
+}
+
+fn normalize_interaction_approval_command(path: &[String], values: &[String]) -> Option<String> {
+    let last = path.last()?.as_str();
+    match last {
+        "approvals" => Some("approvals".to_owned()),
+        "approve" | "deny" | "inspect" | "confirm" => {
+            let token = values.first()?;
+            Some(format!("{last} {token}"))
+        }
+        "inbox" | "list" | "pending"
+            if path
+                .first()
+                .is_some_and(|segment| segment == "approval" || segment == "approvals") =>
+        {
+            Some("approvals".to_owned())
+        }
+        _ => None,
+    }
+}
+
+fn render_interaction_option_value(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        Value::Bool(boolean) => boolean.to_string(),
+        Value::Number(number) => number.to_string(),
+        Value::Array(items) => items
+            .iter()
+            .map(render_interaction_option_value)
+            .collect::<Vec<_>>()
+            .join(" "),
+        Value::Null => String::new(),
+        other => other.to_string(),
+    }
+}
+
+fn is_prompt_option_name(name: &str) -> bool {
+    matches!(
+        name,
+        "prompt" | "request" | "message" | "text" | "objective" | "input" | "query"
+    )
+}
+
 #[derive(Debug, Clone)]
 struct ConversationExchange {
     created_at: String,
@@ -1625,6 +2148,7 @@ fn connector_context_from_events(events: &[TaskEventRow]) -> Option<ConnectorEve
     let message_id = payload
         .get("message_id")
         .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
         .map(ToOwned::to_owned);
     let user_label = payload
         .get("external_display_name")
@@ -2046,6 +2570,135 @@ mod tests {
 
         let context = connector_context_from_events(&events).expect("context");
         assert_eq!(context.message_id.as_deref(), Some("msg-42"));
+    }
+
+    #[test]
+    fn connector_context_ignores_empty_message_id() {
+        let events = vec![test_task_event(
+            CONNECTOR_MESSAGE_CONTEXT_EVENT,
+            json!({
+                "connector_type": "discord",
+                "channel_id": "dm-1",
+                "message_id": "",
+                "source_label": "Discord direct message",
+            }),
+        )];
+
+        let context = connector_context_from_events(&events).expect("context");
+        assert_eq!(context.message_id, None);
+    }
+
+    #[test]
+    fn interaction_command_prefers_prompt_option_text() {
+        let command = interaction_command_text(&DiscordInteractionData {
+            name: "beaverki".to_owned(),
+            options: vec![DiscordInteractionOption {
+                name: "prompt".to_owned(),
+                value: Some(Value::String("summarize the latest task".to_owned())),
+                options: Vec::new(),
+            }],
+        })
+        .expect("command text");
+
+        assert_eq!(command, "summarize the latest task");
+    }
+
+    #[test]
+    fn interaction_command_maps_approval_subcommands() {
+        let command = interaction_command_text(&DiscordInteractionData {
+            name: "approval".to_owned(),
+            options: vec![DiscordInteractionOption {
+                name: "inspect".to_owned(),
+                value: None,
+                options: vec![DiscordInteractionOption {
+                    name: "token".to_owned(),
+                    value: Some(Value::String("approval_token_123".to_owned())),
+                    options: Vec::new(),
+                }],
+            }],
+        })
+        .expect("command text");
+
+        assert_eq!(command, "inspect approval_token_123");
+    }
+
+    #[test]
+    fn interaction_command_maps_new_to_session_reset() {
+        let command = interaction_command_text(&DiscordInteractionData {
+            name: "new".to_owned(),
+            options: Vec::new(),
+        })
+        .expect("command text");
+
+        assert_eq!(command, "/new");
+    }
+
+    #[test]
+    fn registered_command_match_requires_expected_new_shape() {
+        let command = DiscordRegisteredCommand {
+            name: "new".to_owned(),
+            description: "Start a new BeaverKI conversation".to_owned(),
+            command_type: 1,
+            contexts: Some(vec![1, 0, 1]),
+        };
+
+        assert!(discord_registered_command_matches_payload(
+            &command,
+            &discord_global_command_payloads()[0]
+        ));
+    }
+
+    #[test]
+    fn registered_command_match_rejects_wrong_description() {
+        let command = DiscordRegisteredCommand {
+            name: "new".to_owned(),
+            description: "Reset things".to_owned(),
+            command_type: 1,
+            contexts: Some(vec![0, 1]),
+        };
+
+        assert!(!discord_registered_command_matches_payload(
+            &command,
+            &discord_global_command_payloads()[0]
+        ));
+    }
+
+    #[test]
+    fn command_set_match_rejects_extra_existing_commands() {
+        let commands = vec![
+            DiscordRegisteredCommand {
+                name: "new".to_owned(),
+                description: "Start a new BeaverKI conversation".to_owned(),
+                command_type: 1,
+                contexts: Some(vec![0, 1]),
+            },
+            DiscordRegisteredCommand {
+                name: "old-test".to_owned(),
+                description: "Old test command".to_owned(),
+                command_type: 1,
+                contexts: Some(vec![0, 1]),
+            },
+        ];
+
+        assert!(!discord_command_sets_match(
+            &commands,
+            &discord_global_command_payloads()
+        ));
+    }
+
+    #[test]
+    fn command_set_match_accepts_expected_command_list() {
+        let commands = vec![DiscordRegisteredCommand {
+            name: "new".to_owned(),
+            description: "Start a new BeaverKI conversation".to_owned(),
+            command_type: 1,
+            contexts: Some(vec![1, 0]),
+        }];
+
+        assert!(discord_command_sets_match(
+            &commands,
+            &discord_global_command_payloads()
+        ));
     }
 
     #[test]
