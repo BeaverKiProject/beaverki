@@ -1,12 +1,14 @@
-use std::path::PathBuf;
+use std::collections::HashSet;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
 use beaverki_automation as automation;
 use beaverki_core::{MemoryKind, MemoryScope, ShellRisk, TaskState, ToolInvocationStatus};
 use beaverki_db::{
-    Database, MemoryRow, NewApproval, NewSchedule, NewScript, NewScriptReview, NewTask, TaskRow,
-    UpdateScript,
+    Database, LuaToolRow, MemoryRow, NewApproval, NewLuaTool, NewLuaToolReview, NewSchedule,
+    NewScript, NewScriptReview, NewTask, TaskRow, UpdateLuaTool, UpdateScript,
 };
 use beaverki_memory::{
     MemoryStore, RetrievalScope, SemanticMemoryRecord, SemanticMemoryWriteResult,
@@ -16,9 +18,15 @@ use beaverki_policy::{
     can_request_automation_approval, can_request_shell_approval, can_spawn_subagents,
     can_write_household_memory, visible_memory_scopes,
 };
-use beaverki_tools::{ToolContext, ToolDefinition, ToolError, ToolOutput, ToolRegistry};
+use beaverki_tools::{
+    ToolContext, ToolDefinition, ToolError, ToolOutput, ToolRegistry,
+    validate_json_schema_contract, validate_json_value_against_schema,
+    validate_openai_tool_definitions,
+};
+use serde::Deserialize;
 use serde_json::{Value, json};
-use tracing::info;
+use tracing::{info, warn};
+use walkdir::WalkDir;
 
 #[derive(Debug, Clone)]
 pub enum AgentMemoryMode {
@@ -68,6 +76,81 @@ enum ToolFailureDisposition {
 pub struct ApprovedAutomationAction {
     pub action_type: String,
     pub target_ref: String,
+}
+
+#[derive(Debug, Clone)]
+struct RegisteredLuaTool {
+    tool_id: String,
+    description: String,
+    source_text: String,
+    input_schema: Value,
+    output_schema: Value,
+    capability_profile: Value,
+    source: RegisteredLuaToolSource,
+}
+
+impl RegisteredLuaTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: self.tool_id.clone(),
+            description: self.description.clone(),
+            input_schema: self.input_schema.clone(),
+        }
+    }
+
+    fn source_kind(&self) -> &'static str {
+        match self.source {
+            RegisteredLuaToolSource::Database { .. } => "database",
+            RegisteredLuaToolSource::Filesystem { .. } => "filesystem",
+        }
+    }
+
+    fn source_ref(&self) -> String {
+        match &self.source {
+            RegisteredLuaToolSource::Database { owner_user_id } => owner_user_id.clone(),
+            RegisteredLuaToolSource::Filesystem { manifest_path } => {
+                manifest_path.display().to_string()
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum RegisteredLuaToolSource {
+    Database { owner_user_id: String },
+    Filesystem { manifest_path: PathBuf },
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct SkillManifest {
+    #[serde(default)]
+    tools: Vec<FilesystemLuaToolManifest>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FilesystemLuaToolManifest {
+    tool_id: String,
+    kind: String,
+    description: String,
+    #[serde(default)]
+    source_text: Option<String>,
+    #[serde(default)]
+    source_path: Option<String>,
+    input_schema: ManifestJsonSource,
+    output_schema: ManifestJsonSource,
+    #[serde(default)]
+    capability_profile: Option<Value>,
+    #[serde(default)]
+    enabled: Option<bool>,
+    #[serde(default)]
+    status: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum ManifestJsonSource {
+    Inline(Value),
+    RelativePath(String),
 }
 
 impl PrimaryAgentRunner {
@@ -222,6 +305,11 @@ impl PrimaryAgentRunner {
             } else {
                 ("executor", self.provider.model_names().executor.as_str())
             };
+            let registered_lua_tools = self
+                .load_registered_lua_tools(&request.owner_user_id, &tool_context)
+                .await?;
+            let available_tools =
+                tool_definitions_with_registered_lua_tools(&self.tools, &registered_lua_tools);
             let response = self
                 .provider
                 .generate_turn(
@@ -229,7 +317,7 @@ impl PrimaryAgentRunner {
                     model_name,
                     &instructions,
                     &conversation,
-                    &tool_definitions(&self.tools),
+                    &available_tools,
                 )
                 .await?;
 
@@ -603,8 +691,10 @@ impl PrimaryAgentRunner {
                 .await;
         }
 
-        if matches!(tool_name, "lua_script_activate" | "lua_script_schedule")
-            && let ToolError::Denied { detail, .. } = &error
+        if matches!(
+            tool_name,
+            "lua_script_activate" | "lua_script_schedule" | "lua_tool_activate"
+        ) && let ToolError::Denied { detail, .. } = &error
             && let Some(action_type) = detail.get("action_type").and_then(Value::as_str)
             && let Some(target_ref) = detail.get("target_ref").and_then(Value::as_str)
             && let Some(rationale) = detail.get("rationale").and_then(Value::as_str)
@@ -755,11 +845,32 @@ impl PrimaryAgentRunner {
             | "lua_script_write"
             | "lua_script_activate"
             | "lua_script_run"
-            | "lua_script_schedule" => {
+            | "lua_script_schedule"
+            | "lua_tool_list"
+            | "lua_tool_get"
+            | "lua_tool_write"
+            | "lua_tool_activate" => {
                 self.handle_lua_tool_call(task, request, tool_name, arguments, tool_context)
                     .await
             }
-            _ => self.tools.invoke(tool_name, arguments, tool_context).await,
+            _ => {
+                if let Some(lua_tool) = self
+                    .find_registered_lua_tool(&request.owner_user_id, tool_name, tool_context)
+                    .await
+                    .map_err(ToolError::Failed)?
+                {
+                    self.handle_registered_lua_tool_call(
+                        task,
+                        request,
+                        &lua_tool,
+                        arguments,
+                        tool_context,
+                    )
+                    .await
+                } else {
+                    self.tools.invoke(tool_name, arguments, tool_context).await
+                }
+            }
         }
     }
 
@@ -785,6 +896,13 @@ impl PrimaryAgentRunner {
             }
             "lua_script_schedule" => {
                 self.handle_lua_script_schedule(task, request, arguments)
+                    .await
+            }
+            "lua_tool_list" => self.handle_lua_tool_list(request).await,
+            "lua_tool_get" => self.handle_lua_tool_get(request, arguments).await,
+            "lua_tool_write" => self.handle_lua_tool_write(task, request, arguments).await,
+            "lua_tool_activate" => {
+                self.handle_lua_tool_activate(task, request, arguments)
                     .await
             }
             _ => Err(ToolError::Failed(anyhow!("unknown Lua tool: {tool_name}"))),
@@ -1505,6 +1623,7 @@ impl PrimaryAgentRunner {
             task_id: task.task_id.clone(),
             script_id: script.script_id.clone(),
             source_text: script.source_text.clone(),
+            input_json: None,
             capability_profile,
             working_dir: tool_context.working_dir.clone(),
             allowed_roots: tool_context.allowed_roots.clone(),
@@ -1702,6 +1821,580 @@ impl PrimaryAgentRunner {
         })
     }
 
+    async fn handle_lua_tool_list(
+        &self,
+        request: &AgentRequest,
+    ) -> std::result::Result<ToolOutput, ToolError> {
+        let tools = self
+            .db
+            .list_lua_tools_for_owner(&request.owner_user_id)
+            .await
+            .map_err(ToolError::Failed)?;
+        let tools = tools
+            .into_iter()
+            .map(|tool| {
+                json!({
+                    "tool_id": tool.tool_id,
+                    "status": tool.status,
+                    "safety_status": tool.safety_status,
+                    "safety_summary": tool.safety_summary,
+                    "created_from_task_id": tool.created_from_task_id,
+                    "updated_at": tool.updated_at,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        Ok(ToolOutput {
+            payload: json!({ "tools": tools }),
+        })
+    }
+
+    async fn handle_lua_tool_get(
+        &self,
+        request: &AgentRequest,
+        arguments: Value,
+    ) -> std::result::Result<ToolOutput, ToolError> {
+        let tool_id = required_string_arg(&arguments, "tool_id", "lua_tool_get")?;
+        let tool = self
+            .db
+            .fetch_lua_tool_for_owner(&request.owner_user_id, tool_id)
+            .await
+            .map_err(ToolError::Failed)?
+            .ok_or_else(|| ToolError::Failed(anyhow!("Lua tool '{tool_id}' not found")))?;
+        let input_schema =
+            parse_json_field(&tool.input_schema_json, "input schema").map_err(ToolError::Failed)?;
+        let output_schema = parse_json_field(&tool.output_schema_json, "output schema")
+            .map_err(ToolError::Failed)?;
+        let capability_profile =
+            parse_json_field(&tool.capability_profile_json, "capability profile")
+                .map_err(ToolError::Failed)?;
+
+        Ok(ToolOutput {
+            payload: json!({
+                "tool_id": tool.tool_id,
+                "description": tool.description,
+                "source_text": tool.source_text,
+                "input_schema": input_schema,
+                "output_schema": output_schema,
+                "capability_profile": capability_profile,
+                "status": tool.status,
+                "created_from_task_id": tool.created_from_task_id,
+                "safety_status": tool.safety_status,
+                "safety_summary": tool.safety_summary,
+                "updated_at": tool.updated_at,
+            }),
+        })
+    }
+
+    async fn handle_lua_tool_write(
+        &self,
+        task: &TaskRow,
+        request: &AgentRequest,
+        arguments: Value,
+    ) -> std::result::Result<ToolOutput, ToolError> {
+        let tool_id = arguments
+            .get("tool_id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| ToolError::Failed(anyhow!("lua_tool_write requires tool_id")))?;
+        let description = required_string_arg(&arguments, "description", "lua_tool_write")?;
+        let source_text = required_string_arg(&arguments, "source_text", "lua_tool_write")?;
+        let intended_behavior_summary =
+            required_string_arg(&arguments, "intended_behavior_summary", "lua_tool_write")?;
+        let input_schema = arguments
+            .get("input_schema")
+            .cloned()
+            .ok_or_else(|| ToolError::Failed(anyhow!("lua_tool_write requires input_schema")))?;
+        let output_schema = arguments
+            .get("output_schema")
+            .cloned()
+            .ok_or_else(|| ToolError::Failed(anyhow!("lua_tool_write requires output_schema")))?;
+        let capability_profile =
+            normalize_lua_capability_profile(arguments.get("capability_profile").cloned())
+                .map_err(ToolError::Failed)?;
+
+        self.validate_lua_tool_definition(
+            &tool_id,
+            description,
+            &input_schema,
+            &output_schema,
+            &capability_profile,
+            &self.base_tool_context,
+        )
+        .await
+        .map_err(ToolError::Failed)?;
+
+        let mut prior_status = None::<String>;
+        let tool = if let Some(existing_tool) = self
+            .db
+            .fetch_lua_tool_for_owner(&request.owner_user_id, &tool_id)
+            .await
+            .map_err(ToolError::Failed)?
+        {
+            prior_status = Some(existing_tool.status);
+            self.db
+                .update_lua_tool_contents(UpdateLuaTool {
+                    tool_id: &tool_id,
+                    owner_user_id: &request.owner_user_id,
+                    description,
+                    source_text,
+                    input_schema_json: input_schema.clone(),
+                    output_schema_json: output_schema.clone(),
+                    capability_profile_json: capability_profile.clone(),
+                    created_from_task_id: Some(&task.task_id),
+                    status: "draft",
+                    safety_status: "pending",
+                    safety_summary: Some("Awaiting safety review."),
+                })
+                .await
+                .map_err(ToolError::Failed)?;
+            self.db
+                .fetch_lua_tool_for_owner(&request.owner_user_id, &tool_id)
+                .await
+                .map_err(ToolError::Failed)?
+                .ok_or_else(|| {
+                    ToolError::Failed(anyhow!("Lua tool '{tool_id}' missing after update"))
+                })?
+        } else {
+            self.db
+                .create_lua_tool(NewLuaTool {
+                    tool_id: Some(&tool_id),
+                    owner_user_id: &request.owner_user_id,
+                    description,
+                    source_text,
+                    input_schema_json: input_schema.clone(),
+                    output_schema_json: output_schema.clone(),
+                    capability_profile_json: capability_profile.clone(),
+                    status: "draft",
+                    created_from_task_id: Some(&task.task_id),
+                    safety_status: "pending",
+                    safety_summary: Some("Awaiting safety review."),
+                })
+                .await
+                .map_err(ToolError::Failed)?
+        };
+
+        let review = automation::review_lua_tool(
+            &self.provider,
+            &tool.tool_id,
+            Some(&task.task_id),
+            &request.owner_user_id,
+            description,
+            source_text,
+            &input_schema,
+            &output_schema,
+            &capability_profile,
+            intended_behavior_summary,
+        )
+        .await
+        .map_err(ToolError::Failed)?;
+        let approved_status = if prior_status.as_deref() == Some("active") {
+            "active"
+        } else {
+            "draft"
+        };
+        let application =
+            automation::apply_script_review(&review, approved_status, prior_status.as_deref());
+        let reviewed_artifact_text = build_lua_tool_review_artifact(
+            description,
+            source_text,
+            &input_schema,
+            &output_schema,
+            &capability_profile,
+        )
+        .map_err(ToolError::Failed)?;
+
+        self.db
+            .update_lua_tool_safety(
+                &tool.tool_id,
+                &application.safety_status,
+                &review.summary,
+                Some(&application.resulting_status),
+            )
+            .await
+            .map_err(ToolError::Failed)?;
+        self.db
+            .create_lua_tool_review(NewLuaToolReview {
+                tool_id: &tool.tool_id,
+                reviewer_agent_id: automation::SAFETY_AGENT_ID,
+                review_type: "lua_tool",
+                verdict: &review.verdict,
+                risk_level: &review.risk_level,
+                findings_json: review.as_findings_json(),
+                summary_text: &review.summary,
+                reviewed_artifact_text: &reviewed_artifact_text,
+            })
+            .await
+            .map_err(ToolError::Failed)?;
+        self.db
+            .record_audit_event(
+                "agent",
+                &request.assigned_agent_id,
+                "lua_tool_written",
+                json!({
+                    "task_id": task.task_id,
+                    "tool_id": tool.tool_id,
+                    "prior_status": prior_status,
+                    "reactivated_after_rewrite": application.reactivated_after_rewrite,
+                    "safety_status": application.safety_status,
+                    "verdict": review.verdict,
+                }),
+            )
+            .await
+            .map_err(ToolError::Failed)?;
+
+        let updated = self
+            .db
+            .fetch_lua_tool_for_owner(&request.owner_user_id, &tool.tool_id)
+            .await
+            .map_err(ToolError::Failed)?
+            .ok_or_else(|| ToolError::Failed(anyhow!("Lua tool missing after review")))?;
+
+        Ok(ToolOutput {
+            payload: json!({
+                "tool_id": updated.tool_id,
+                "status": updated.status,
+                "safety_status": updated.safety_status,
+                "safety_summary": updated.safety_summary,
+                "reactivated_after_rewrite": application.reactivated_after_rewrite,
+                "review_verdict": review.verdict,
+                "risk_level": review.risk_level,
+                "findings": review.findings,
+                "required_changes": review.required_changes,
+            }),
+        })
+    }
+
+    async fn handle_lua_tool_activate(
+        &self,
+        task: &TaskRow,
+        request: &AgentRequest,
+        arguments: Value,
+    ) -> std::result::Result<ToolOutput, ToolError> {
+        let tool_id = required_string_arg(&arguments, "tool_id", "lua_tool_activate")?;
+        let tool = self
+            .db
+            .fetch_lua_tool_for_owner(&request.owner_user_id, tool_id)
+            .await
+            .map_err(ToolError::Failed)?
+            .ok_or_else(|| ToolError::Failed(anyhow!("Lua tool '{tool_id}' not found")))?;
+        if tool.safety_status != "approved" {
+            return Err(ToolError::Failed(anyhow!(
+                "Lua tool '{}' must pass safety review before activation",
+                tool.tool_id
+            )));
+        }
+        if tool.status == "active" {
+            return Ok(ToolOutput {
+                payload: json!({
+                    "tool_id": tool.tool_id,
+                    "status": tool.status,
+                }),
+            });
+        }
+
+        if !self.has_approved_action(request, "lua_tool_activate", &tool.tool_id) {
+            return Err(ToolError::Denied {
+                message: "Lua tool activation requires approval".to_owned(),
+                detail: json!({
+                    "action_type": "lua_tool_activate",
+                    "target_ref": tool.tool_id,
+                    "rationale": format!(
+                        "Task '{}' wants to activate Lua tool '{}'.",
+                        task.objective, tool.tool_id
+                    ),
+                }),
+            });
+        }
+
+        self.db
+            .update_lua_tool_status(&tool.tool_id, "active")
+            .await
+            .map_err(ToolError::Failed)?;
+        self.db
+            .record_audit_event(
+                "agent",
+                &request.assigned_agent_id,
+                "lua_tool_activated",
+                json!({
+                    "task_id": task.task_id,
+                    "tool_id": tool.tool_id,
+                }),
+            )
+            .await
+            .map_err(ToolError::Failed)?;
+        Ok(ToolOutput {
+            payload: json!({
+                "tool_id": tool.tool_id,
+                "status": "active",
+            }),
+        })
+    }
+
+    async fn find_registered_lua_tool(
+        &self,
+        owner_user_id: &str,
+        tool_name: &str,
+        tool_context: &ToolContext,
+    ) -> Result<Option<RegisteredLuaTool>> {
+        Ok(self
+            .load_registered_lua_tools(owner_user_id, tool_context)
+            .await?
+            .into_iter()
+            .find(|tool| tool.tool_id == tool_name))
+    }
+
+    async fn load_registered_lua_tools(
+        &self,
+        owner_user_id: &str,
+        tool_context: &ToolContext,
+    ) -> Result<Vec<RegisteredLuaTool>> {
+        let reserved_names = reserved_tool_names(&self.tools)
+            .into_iter()
+            .collect::<HashSet<_>>();
+        let mut seen = HashSet::new();
+        let mut loaded = Vec::new();
+
+        for row in self
+            .db
+            .list_active_lua_tools_for_owner(owner_user_id)
+            .await?
+        {
+            match self.database_lua_tool_from_row(row) {
+                Ok(tool) if reserved_names.contains(&tool.tool_id) => {
+                    warn!(tool_id = %tool.tool_id, "skipping database Lua tool because the name is reserved");
+                }
+                Ok(tool) if !seen.insert(tool.tool_id.clone()) => {
+                    warn!(tool_id = %tool.tool_id, "skipping duplicate database Lua tool definition");
+                }
+                Ok(tool) => loaded.push(tool),
+                Err(error) => {
+                    warn!(owner_user_id = %owner_user_id, error = %error, "skipping invalid database Lua tool")
+                }
+            }
+        }
+
+        for tool in load_filesystem_lua_tools(tool_context)? {
+            if reserved_names.contains(&tool.tool_id) {
+                warn!(tool_id = %tool.tool_id, "skipping filesystem Lua tool because the name is reserved");
+                continue;
+            }
+            if !seen.insert(tool.tool_id.clone()) {
+                warn!(tool_id = %tool.tool_id, "skipping duplicate filesystem Lua tool definition");
+                continue;
+            }
+            loaded.push(tool);
+        }
+
+        loaded.sort_by(|left, right| left.tool_id.cmp(&right.tool_id));
+        Ok(loaded)
+    }
+
+    fn database_lua_tool_from_row(&self, row: LuaToolRow) -> Result<RegisteredLuaTool> {
+        let input_schema = parse_json_field(&row.input_schema_json, "input schema")?;
+        let output_schema = parse_json_field(&row.output_schema_json, "output schema")?;
+        let capability_profile = normalize_lua_capability_profile(Some(parse_json_field(
+            &row.capability_profile_json,
+            "capability profile",
+        )?))?;
+        validate_openai_tool_definitions(&[ToolDefinition {
+            name: row.tool_id.clone(),
+            description: row.description.clone(),
+            input_schema: input_schema.clone(),
+        }])?;
+        validate_json_schema_contract(&output_schema)?;
+
+        Ok(RegisteredLuaTool {
+            tool_id: row.tool_id,
+            description: row.description,
+            source_text: row.source_text,
+            input_schema,
+            output_schema,
+            capability_profile,
+            source: RegisteredLuaToolSource::Database {
+                owner_user_id: row.owner_user_id,
+            },
+        })
+    }
+
+    async fn validate_lua_tool_definition(
+        &self,
+        tool_id: &str,
+        description: &str,
+        input_schema: &Value,
+        output_schema: &Value,
+        capability_profile: &Value,
+        tool_context: &ToolContext,
+    ) -> Result<()> {
+        if description.trim().is_empty() {
+            return Err(anyhow!("Lua tool '{}' requires a description", tool_id));
+        }
+        if reserved_tool_names(&self.tools)
+            .iter()
+            .any(|reserved| reserved == tool_id)
+        {
+            return Err(anyhow!(
+                "Lua tool '{}' conflicts with a reserved tool name",
+                tool_id
+            ));
+        }
+        if load_filesystem_lua_tools(tool_context)?
+            .into_iter()
+            .any(|tool| tool.tool_id == tool_id)
+        {
+            return Err(anyhow!(
+                "Lua tool '{}' conflicts with a filesystem-packaged tool",
+                tool_id
+            ));
+        }
+        validate_openai_tool_definitions(&[ToolDefinition {
+            name: tool_id.to_owned(),
+            description: description.to_owned(),
+            input_schema: input_schema.clone(),
+        }])?;
+        validate_json_schema_contract(output_schema)?;
+        let _ = capability_profile;
+        Ok(())
+    }
+
+    async fn handle_registered_lua_tool_call(
+        &self,
+        task: &TaskRow,
+        request: &AgentRequest,
+        lua_tool: &RegisteredLuaTool,
+        arguments: Value,
+        tool_context: &ToolContext,
+    ) -> std::result::Result<ToolOutput, ToolError> {
+        validate_json_value_against_schema(&arguments, &lua_tool.input_schema).map_err(
+            |error| {
+                ToolError::Failed(anyhow!(
+                    "Lua tool '{}' rejected invalid input: {}",
+                    lua_tool.tool_id,
+                    error
+                ))
+            },
+        )?;
+
+        let execution = automation::execute_lua_script(automation::LuaExecutionInput {
+            db: self.db.clone(),
+            owner_user_id: request.owner_user_id.clone(),
+            task_id: task.task_id.clone(),
+            script_id: lua_tool.tool_id.clone(),
+            source_text: lua_tool.source_text.clone(),
+            input_json: Some(arguments.clone()),
+            capability_profile: lua_tool.capability_profile.clone(),
+            working_dir: tool_context.working_dir.clone(),
+            allowed_roots: tool_context.allowed_roots.clone(),
+            browser_interactive_launcher: tool_context.browser_interactive_launcher.clone(),
+            browser_headless_program: tool_context.browser_headless_program.clone(),
+            browser_headless_args: tool_context.browser_headless_args.clone(),
+        })
+        .await;
+        let execution = match execution {
+            Ok(execution) => execution,
+            Err(error) => {
+                if let Some(policy_error) = error.downcast_ref::<automation::LuaToolPolicyDenied>()
+                {
+                    self.db
+                        .append_task_event(
+                            &task.task_id,
+                            "lua_tool_denied",
+                            "tool",
+                            &lua_tool.tool_id,
+                            json!({
+                                "tool_id": lua_tool.tool_id,
+                                "tool_source": lua_tool.source_kind(),
+                                "tool_source_ref": lua_tool.source_ref(),
+                                "tool_name": policy_error.tool_name,
+                                "detail": policy_error.detail,
+                                "message": policy_error.message,
+                            }),
+                        )
+                        .await
+                        .map_err(ToolError::Failed)?;
+                    self.db
+                        .record_audit_event(
+                            "agent",
+                            &request.assigned_agent_id,
+                            "lua_defined_tool_denied",
+                            json!({
+                                "task_id": task.task_id,
+                                "tool_id": lua_tool.tool_id,
+                                "tool_source": lua_tool.source_kind(),
+                                "tool_source_ref": lua_tool.source_ref(),
+                                "blocked_tool_name": policy_error.tool_name,
+                                "detail": policy_error.detail,
+                            }),
+                        )
+                        .await
+                        .map_err(ToolError::Failed)?;
+                }
+                return Err(ToolError::Failed(error));
+            }
+        };
+
+        if execution.deferred_until.is_some() {
+            return Err(ToolError::Failed(anyhow!(
+                "Lua tool '{}' may not defer tasks",
+                lua_tool.tool_id
+            )));
+        }
+        validate_json_value_against_schema(&execution.result_json, &lua_tool.output_schema)
+            .map_err(|error| {
+                ToolError::Failed(anyhow!(
+                    "Lua tool '{}' returned invalid output: {}",
+                    lua_tool.tool_id,
+                    error
+                ))
+            })?;
+
+        for log_line in &execution.logs {
+            self.db
+                .append_task_event(
+                    &task.task_id,
+                    "lua_log",
+                    "tool",
+                    &lua_tool.tool_id,
+                    json!({ "message": log_line }),
+                )
+                .await
+                .map_err(ToolError::Failed)?;
+        }
+        for notification in &execution.notifications {
+            self.db
+                .append_task_event(
+                    &task.task_id,
+                    "lua_notify_user",
+                    "tool",
+                    &lua_tool.tool_id,
+                    json!({ "message": notification }),
+                )
+                .await
+                .map_err(ToolError::Failed)?;
+        }
+
+        self.db
+            .record_audit_event(
+                "agent",
+                &request.assigned_agent_id,
+                "lua_tool_executed",
+                json!({
+                    "task_id": task.task_id,
+                    "tool_id": lua_tool.tool_id,
+                    "tool_source": lua_tool.source_kind(),
+                    "tool_source_ref": lua_tool.source_ref(),
+                }),
+            )
+            .await
+            .map_err(ToolError::Failed)?;
+
+        Ok(ToolOutput {
+            payload: execution.result_json,
+        })
+    }
+
     fn has_approved_action(
         &self,
         request: &AgentRequest,
@@ -1857,6 +2550,229 @@ impl PrimaryAgentRunner {
             }),
         })
     }
+}
+
+fn parse_json_field(raw: &str, label: &str) -> Result<Value> {
+    serde_json::from_str(raw).with_context(|| format!("failed to parse {label}"))
+}
+
+fn build_lua_tool_review_artifact(
+    description: &str,
+    source_text: &str,
+    input_schema: &Value,
+    output_schema: &Value,
+    capability_profile: &Value,
+) -> Result<String> {
+    serde_json::to_string_pretty(&json!({
+        "description": description,
+        "source_text": source_text,
+        "input_schema": input_schema,
+        "output_schema": output_schema,
+        "capability_profile": capability_profile,
+    }))
+    .context("failed to serialize Lua tool review artifact")
+}
+
+fn normalize_lua_capability_profile(value: Option<Value>) -> Result<Value> {
+    let value = value.unwrap_or_else(|| json!({}));
+    let object = value
+        .as_object()
+        .ok_or_else(|| anyhow!("Lua capability profile must be an object"))?;
+    for key in object.keys() {
+        if !matches!(key.as_str(), "allowed_tools" | "allowed_roots") {
+            return Err(anyhow!(
+                "Lua capability profile contains unsupported key '{}'",
+                key
+            ));
+        }
+    }
+    let allowed_tools = match object.get("allowed_tools") {
+        Some(Value::Array(items)) => Value::Array(
+            items
+                .iter()
+                .map(|item| {
+                    item.as_str()
+                        .map(|text| Value::String(text.to_owned()))
+                        .ok_or_else(|| anyhow!("allowed_tools entries must be strings"))
+                })
+                .collect::<Result<Vec<_>>>()?,
+        ),
+        Some(Value::Null) | None => Value::Null,
+        Some(_) => return Err(anyhow!("allowed_tools must be an array or null")),
+    };
+    let allowed_roots = match object.get("allowed_roots") {
+        Some(Value::Array(items)) => Value::Array(
+            items
+                .iter()
+                .map(|item| {
+                    item.as_str()
+                        .map(|text| Value::String(text.to_owned()))
+                        .ok_or_else(|| anyhow!("allowed_roots entries must be strings"))
+                })
+                .collect::<Result<Vec<_>>>()?,
+        ),
+        Some(Value::Null) | None => Value::Null,
+        Some(_) => return Err(anyhow!("allowed_roots must be an array or null")),
+    };
+    Ok(json!({
+        "allowed_tools": allowed_tools,
+        "allowed_roots": allowed_roots,
+    }))
+}
+
+fn reserved_tool_names(tools: &ToolRegistry) -> Vec<String> {
+    tool_definitions(tools)
+        .into_iter()
+        .map(|definition| definition.name)
+        .collect()
+}
+
+fn load_filesystem_lua_tools(tool_context: &ToolContext) -> Result<Vec<RegisteredLuaTool>> {
+    let skills_root = tool_context.working_dir.join("skills");
+    if !skills_root.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut loaded = Vec::new();
+    for entry in WalkDir::new(&skills_root)
+        .into_iter()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_type().is_file())
+    {
+        let Some(file_name) = entry.path().file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !matches!(file_name, "skill.yaml" | "skill.yml") {
+            continue;
+        }
+
+        let manifest_path = entry.path().to_path_buf();
+        let manifest_text = match fs::read_to_string(&manifest_path) {
+            Ok(text) => text,
+            Err(error) => {
+                warn!(path = %manifest_path.display(), error = %error, "skipping unreadable skill manifest");
+                continue;
+            }
+        };
+        let manifest = match serde_yaml::from_str::<SkillManifest>(&manifest_text) {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                warn!(path = %manifest_path.display(), error = %error, "skipping invalid skill manifest");
+                continue;
+            }
+        };
+
+        for tool_manifest in manifest.tools {
+            match load_filesystem_lua_tool(&manifest_path, tool_manifest) {
+                Ok(Some(tool)) => loaded.push(tool),
+                Ok(None) => {}
+                Err(error) => {
+                    warn!(path = %manifest_path.display(), error = %error, "skipping invalid packaged Lua tool")
+                }
+            }
+        }
+    }
+
+    Ok(loaded)
+}
+
+fn load_filesystem_lua_tool(
+    manifest_path: &Path,
+    tool_manifest: FilesystemLuaToolManifest,
+) -> Result<Option<RegisteredLuaTool>> {
+    if tool_manifest.kind != "lua" {
+        return Ok(None);
+    }
+    if tool_manifest.enabled == Some(false) {
+        return Ok(None);
+    }
+    if let Some(status) = tool_manifest.status.as_deref()
+        && status != "active"
+    {
+        return Ok(None);
+    }
+
+    let base_dir = manifest_path.parent().ok_or_else(|| {
+        anyhow!(
+            "manifest '{}' has no parent directory",
+            manifest_path.display()
+        )
+    })?;
+    let source_text = resolve_manifest_text(
+        base_dir,
+        &tool_manifest.source_text,
+        &tool_manifest.source_path,
+    )?;
+    let input_schema = resolve_manifest_json(base_dir, &tool_manifest.input_schema)?;
+    let output_schema = resolve_manifest_json(base_dir, &tool_manifest.output_schema)?;
+    let capability_profile =
+        normalize_lua_capability_profile(tool_manifest.capability_profile.clone())?;
+    validate_openai_tool_definitions(&[ToolDefinition {
+        name: tool_manifest.tool_id.clone(),
+        description: tool_manifest.description.clone(),
+        input_schema: input_schema.clone(),
+    }])?;
+    validate_json_schema_contract(&output_schema)?;
+
+    Ok(Some(RegisteredLuaTool {
+        tool_id: tool_manifest.tool_id,
+        description: tool_manifest.description,
+        source_text,
+        input_schema,
+        output_schema,
+        capability_profile,
+        source: RegisteredLuaToolSource::Filesystem {
+            manifest_path: manifest_path.to_path_buf(),
+        },
+    }))
+}
+
+fn resolve_manifest_text(
+    base_dir: &Path,
+    inline: &Option<String>,
+    path: &Option<String>,
+) -> Result<String> {
+    match (inline, path) {
+        (Some(text), None) => Ok(text.clone()),
+        (None, Some(path)) => fs::read_to_string(base_dir.join(path))
+            .with_context(|| format!("failed to read '{}'", base_dir.join(path).display())),
+        (Some(_), Some(_)) => Err(anyhow!(
+            "filesystem Lua tool must set either source_text or source_path, not both"
+        )),
+        (None, None) => Err(anyhow!(
+            "filesystem Lua tool must set source_text or source_path"
+        )),
+    }
+}
+
+fn resolve_manifest_json(base_dir: &Path, source: &ManifestJsonSource) -> Result<Value> {
+    match source {
+        ManifestJsonSource::Inline(value) => Ok(value.clone()),
+        ManifestJsonSource::RelativePath(path) => {
+            let raw = fs::read_to_string(base_dir.join(path))
+                .with_context(|| format!("failed to read '{}'", base_dir.join(path).display()))?;
+            serde_json::from_str(&raw).with_context(|| {
+                format!(
+                    "failed to parse JSON from '{}'",
+                    base_dir.join(path).display()
+                )
+            })
+        }
+    }
+}
+
+fn tool_definitions_with_registered_lua_tools(
+    tools: &ToolRegistry,
+    registered_lua_tools: &[RegisteredLuaTool],
+) -> Vec<ToolDefinition> {
+    let mut definitions = tool_definitions(tools);
+    definitions.extend(
+        registered_lua_tools
+            .iter()
+            .map(RegisteredLuaTool::definition),
+    );
+    definitions.sort_by(|left, right| left.name.cmp(&right.name));
+    definitions
 }
 
 fn tool_definitions(tools: &ToolRegistry) -> Vec<ToolDefinition> {
@@ -2040,6 +2956,82 @@ fn tool_definitions(tools: &ToolRegistry) -> Vec<ToolDefinition> {
                 "enabled": { "type": ["boolean", "null"] }
             },
             "required": ["script_id", "schedule_id", "cron_expr", "enabled"],
+            "additionalProperties": false
+        }),
+    });
+    definitions.push(ToolDefinition {
+        name: "lua_tool_list".to_owned(),
+        description: "List database-backed Lua-defined tools owned by the current user, including status and safety metadata.".to_owned(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "additionalProperties": false
+        }),
+    });
+    definitions.push(ToolDefinition {
+        name: "lua_tool_get".to_owned(),
+        description: "Fetch a database-backed Lua-defined tool's full source text, schemas, and metadata by tool ID.".to_owned(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "tool_id": { "type": "string" }
+            },
+            "required": ["tool_id"],
+            "additionalProperties": false
+        }),
+    });
+    definitions.push(ToolDefinition {
+        name: "lua_tool_write".to_owned(),
+        description: "Create or update a database-backed Lua-defined tool, then run blocking safety review on it. Lua-defined tools execute through `return function(ctx) ... end` and read structured arguments from `ctx.input`. They may compose approved built-in tools via `ctx.tool_call` and use the reviewed Lua host helpers, but they must return JSON that matches the declared output schema. Rewriting an already active tool keeps it active if the new version passes safety review.".to_owned(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "tool_id": { "type": "string" },
+                "description": { "type": "string" },
+                "source_text": { "type": "string" },
+                "input_schema": {
+                    "type": "object",
+                    "properties": {},
+                    "required": [],
+                    "additionalProperties": true
+                },
+                "output_schema": {
+                    "type": "object",
+                    "properties": {},
+                    "required": [],
+                    "additionalProperties": true
+                },
+                "capability_profile": {
+                    "type": ["object", "null"],
+                    "properties": {
+                        "allowed_tools": {
+                            "type": ["array", "null"],
+                            "items": { "type": "string" }
+                        },
+                        "allowed_roots": {
+                            "type": ["array", "null"],
+                            "items": { "type": "string" }
+                        }
+                    },
+                    "required": ["allowed_tools", "allowed_roots"],
+                    "additionalProperties": false
+                },
+                "intended_behavior_summary": { "type": "string" }
+            },
+            "required": ["tool_id", "description", "source_text", "input_schema", "output_schema", "capability_profile", "intended_behavior_summary"],
+            "additionalProperties": false
+        }),
+    });
+    definitions.push(ToolDefinition {
+        name: "lua_tool_activate".to_owned(),
+        description: "Activate a reviewed database-backed Lua-defined tool after user approval so it appears in the normal tool list for future agent turns.".to_owned(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "tool_id": { "type": "string" }
+            },
+            "required": ["tool_id"],
             "additionalProperties": false
         }),
     });
@@ -2426,6 +3418,33 @@ mod tests {
                     })
             })
             .collect()
+    }
+
+    async fn create_active_lua_tool(
+        db: &Database,
+        owner_user_id: &str,
+        tool_id: &str,
+        description: &str,
+        source_text: &str,
+        input_schema: Value,
+        output_schema: Value,
+        capability_profile_json: Value,
+    ) {
+        db.create_lua_tool(NewLuaTool {
+            tool_id: Some(tool_id),
+            owner_user_id,
+            description,
+            source_text,
+            input_schema_json: input_schema,
+            output_schema_json: output_schema,
+            capability_profile_json,
+            status: "active",
+            created_from_task_id: Some("task_seed"),
+            safety_status: "approved",
+            safety_summary: Some("approved"),
+        })
+        .await
+        .expect("lua tool");
     }
 
     #[tokio::test]
@@ -4398,5 +5417,527 @@ end"#,
                 && script["status"] == json!("active")
                 && script["safety_status"] == json!("approved")
         }));
+    }
+
+    #[tokio::test]
+    async fn agent_can_write_activate_and_invoke_lua_defined_tool() {
+        let provider = FakeProvider::new(vec![
+            ModelTurnResponse {
+                output_items: vec![json!({
+                    "type": "function_call",
+                    "call_id": "call_tool_write",
+                    "name": "lua_tool_write",
+                    "arguments": "{\"tool_id\":\"tool_agent_greet\",\"description\":\"Return a greeting object.\",\"source_text\":\"return function(ctx)\\n    return { greeting = 'hello ' .. ctx.input.name }\\nend\",\"input_schema\":{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"}},\"required\":[\"name\"],\"additionalProperties\":false},\"output_schema\":{\"type\":\"object\",\"properties\":{\"greeting\":{\"type\":\"string\"}},\"required\":[\"greeting\"],\"additionalProperties\":false},\"capability_profile\":{},\"intended_behavior_summary\":\"Return a JSON object containing a greeting for the provided name.\"}"
+                })],
+                tool_calls: vec![beaverki_models::ModelToolCall {
+                    call_id: "call_tool_write".to_owned(),
+                    name: "lua_tool_write".to_owned(),
+                    arguments: json!({
+                        "tool_id": "tool_agent_greet",
+                        "description": "Return a greeting object.",
+                        "source_text": "return function(ctx)\n    return { greeting = 'hello ' .. ctx.input.name }\nend",
+                        "input_schema": {
+                            "type": "object",
+                            "properties": { "name": { "type": "string" } },
+                            "required": ["name"],
+                            "additionalProperties": false
+                        },
+                        "output_schema": {
+                            "type": "object",
+                            "properties": { "greeting": { "type": "string" } },
+                            "required": ["greeting"],
+                            "additionalProperties": false
+                        },
+                        "capability_profile": {},
+                        "intended_behavior_summary": "Return a JSON object containing a greeting for the provided name."
+                    }),
+                }],
+                output_text: String::new(),
+                usage: None,
+            },
+            ModelTurnResponse {
+                output_items: vec![json!({
+                    "type": "message",
+                    "content": [{
+                        "type": "output_text",
+                        "text": "{\"verdict\":\"approved\",\"risk_level\":\"low\",\"findings\":[],\"required_changes\":[],\"summary\":\"The Lua tool matches the stated intent.\"}"
+                    }]
+                })],
+                tool_calls: vec![],
+                output_text: "{\"verdict\":\"approved\",\"risk_level\":\"low\",\"findings\":[],\"required_changes\":[],\"summary\":\"The Lua tool matches the stated intent.\"}".to_owned(),
+                usage: None,
+            },
+            ModelTurnResponse {
+                output_items: vec![json!({
+                    "type": "function_call",
+                    "call_id": "call_tool_activate_wait",
+                    "name": "lua_tool_activate",
+                    "arguments": "{\"tool_id\":\"tool_agent_greet\"}"
+                })],
+                tool_calls: vec![beaverki_models::ModelToolCall {
+                    call_id: "call_tool_activate_wait".to_owned(),
+                    name: "lua_tool_activate".to_owned(),
+                    arguments: json!({ "tool_id": "tool_agent_greet" }),
+                }],
+                output_text: String::new(),
+                usage: None,
+            },
+            ModelTurnResponse {
+                output_items: vec![json!({
+                    "type": "function_call",
+                    "call_id": "call_tool_activate_ok",
+                    "name": "lua_tool_activate",
+                    "arguments": "{\"tool_id\":\"tool_agent_greet\"}"
+                })],
+                tool_calls: vec![beaverki_models::ModelToolCall {
+                    call_id: "call_tool_activate_ok".to_owned(),
+                    name: "lua_tool_activate".to_owned(),
+                    arguments: json!({ "tool_id": "tool_agent_greet" }),
+                }],
+                output_text: String::new(),
+                usage: None,
+            },
+            ModelTurnResponse {
+                output_items: vec![json!({
+                    "type": "function_call",
+                    "call_id": "call_tool_run",
+                    "name": "tool_agent_greet",
+                    "arguments": "{\"name\":\"Alex\"}"
+                })],
+                tool_calls: vec![beaverki_models::ModelToolCall {
+                    call_id: "call_tool_run".to_owned(),
+                    name: "tool_agent_greet".to_owned(),
+                    arguments: json!({ "name": "Alex" }),
+                }],
+                output_text: String::new(),
+                usage: None,
+            },
+            ModelTurnResponse {
+                output_items: vec![json!({
+                    "type": "message",
+                    "content": [{ "type": "output_text", "text": "tool complete" }]
+                })],
+                tool_calls: vec![],
+                output_text: "tool complete".to_owned(),
+                usage: None,
+            },
+        ]);
+        let (db, runner) = test_runner(provider).await;
+        let default_user = db.default_user().await.expect("default").expect("user");
+        let roles = db
+            .list_user_roles(&default_user.user_id)
+            .await
+            .expect("roles")
+            .into_iter()
+            .map(|row| row.role_id)
+            .collect::<Vec<_>>();
+
+        let first = runner
+            .run_task(AgentRequest {
+                owner_user_id: default_user.user_id.clone(),
+                initiating_identity_id: format!("cli:{}", default_user.user_id),
+                primary_agent_id: default_user.primary_agent_id.clone().expect("agent"),
+                assigned_agent_id: default_user.primary_agent_id.clone().expect("agent"),
+                role_ids: roles.clone(),
+                objective: "Create and activate a Lua-defined tool".to_owned(),
+                scope: MemoryScope::Private,
+                kind: "interactive".to_owned(),
+                parent_task_id: None,
+                task_context: None,
+                visible_scopes: visible_memory_scopes(&roles),
+                memory_mode: AgentMemoryMode::ScopedRetrieval,
+                approved_shell_commands: Vec::new(),
+                approved_automation_actions: Vec::new(),
+            })
+            .await
+            .expect("first run");
+        assert_eq!(first.task.state, TaskState::WaitingApproval.as_str());
+
+        let approval = db
+            .list_approvals_for_user(&default_user.user_id, Some("pending"))
+            .await
+            .expect("approvals")
+            .into_iter()
+            .next()
+            .expect("approval");
+        assert_eq!(approval.action_type, "lua_tool_activate");
+        db.resolve_approval(&approval.approval_id, "approved")
+            .await
+            .expect("approve");
+        let resumed_task = db
+            .fetch_task_for_owner(&default_user.user_id, &first.task.task_id)
+            .await
+            .expect("fetch task")
+            .expect("task");
+
+        let resumed = runner
+            .resume_task(
+                resumed_task,
+                AgentRequest {
+                    owner_user_id: default_user.user_id.clone(),
+                    initiating_identity_id: format!("cli:{}", default_user.user_id),
+                    primary_agent_id: default_user.primary_agent_id.clone().expect("agent"),
+                    assigned_agent_id: default_user.primary_agent_id.clone().expect("agent"),
+                    role_ids: roles.clone(),
+                    objective: "Create and activate a Lua-defined tool".to_owned(),
+                    scope: MemoryScope::Private,
+                    kind: "interactive".to_owned(),
+                    parent_task_id: None,
+                    task_context: None,
+                    visible_scopes: visible_memory_scopes(&roles),
+                    memory_mode: AgentMemoryMode::ScopedRetrieval,
+                    approved_shell_commands: Vec::new(),
+                    approved_automation_actions: approved_actions_for_task(
+                        &db,
+                        &default_user.user_id,
+                        &first.task.task_id,
+                    )
+                    .await,
+                },
+            )
+            .await
+            .expect("resume");
+
+        assert_eq!(resumed.task.state, TaskState::Completed.as_str());
+        let lua_tool = db
+            .fetch_lua_tool_for_owner(&default_user.user_id, "tool_agent_greet")
+            .await
+            .expect("tool fetch")
+            .expect("tool");
+        assert_eq!(lua_tool.status, "active");
+        assert_eq!(lua_tool.safety_status, "approved");
+
+        let invocations = db
+            .fetch_tool_invocations_for_owner(&default_user.user_id, &first.task.task_id)
+            .await
+            .expect("tool invocations");
+        assert!(invocations.iter().any(|invocation| {
+            invocation.tool_name == "tool_agent_greet"
+                && invocation.status == beaverki_core::ToolInvocationStatus::Completed.as_str()
+        }));
+
+        let audit_events = db.list_audit_events(20).await.expect("audit");
+        assert!(
+            audit_events
+                .iter()
+                .any(|event| event.event_type == "lua_tool_written")
+        );
+        assert!(
+            audit_events
+                .iter()
+                .any(|event| event.event_type == "lua_tool_activated")
+        );
+        assert!(
+            audit_events
+                .iter()
+                .any(|event| event.event_type == "lua_tool_executed")
+        );
+    }
+
+    #[tokio::test]
+    async fn lua_defined_tool_rejects_invalid_output_schema() {
+        let (db, runner) = test_runner(FakeProvider::new(vec![])).await;
+        let default_user = db.default_user().await.expect("default").expect("user");
+        let roles = db
+            .list_user_roles(&default_user.user_id)
+            .await
+            .expect("roles")
+            .into_iter()
+            .map(|row| row.role_id)
+            .collect::<Vec<_>>();
+        let task = db
+            .create_task_with_params(NewTask {
+                owner_user_id: &default_user.user_id,
+                initiating_identity_id: &format!("cli:{}", default_user.user_id),
+                primary_agent_id: default_user.primary_agent_id.as_deref().expect("agent"),
+                assigned_agent_id: default_user.primary_agent_id.as_deref().expect("agent"),
+                parent_task_id: None,
+                session_id: None,
+                kind: "interactive",
+                objective: "Invoke a Lua-defined tool",
+                context_summary: None,
+                scope: MemoryScope::Private,
+                wake_at: None,
+            })
+            .await
+            .expect("task");
+        create_active_lua_tool(
+            &db,
+            &default_user.user_id,
+            "tool_invalid_output",
+            "Return the wrong output type.",
+            "return function(ctx)\n    return \"not an object\"\nend",
+            json!({
+                "type": "object",
+                "properties": {},
+                "required": [],
+                "additionalProperties": false
+            }),
+            json!({
+                "type": "object",
+                "properties": { "greeting": { "type": "string" } },
+                "required": ["greeting"],
+                "additionalProperties": false
+            }),
+            json!({}),
+        )
+        .await;
+
+        let tool_context = ToolContext::new(std::env::temp_dir(), vec![std::env::temp_dir()]);
+        let lua_tool = runner
+            .find_registered_lua_tool(&default_user.user_id, "tool_invalid_output", &tool_context)
+            .await
+            .expect("find tool")
+            .expect("tool");
+
+        let error = runner
+            .handle_registered_lua_tool_call(
+                &task,
+                &AgentRequest {
+                    owner_user_id: default_user.user_id.clone(),
+                    initiating_identity_id: format!("cli:{}", default_user.user_id),
+                    primary_agent_id: default_user.primary_agent_id.clone().expect("agent"),
+                    assigned_agent_id: default_user.primary_agent_id.clone().expect("agent"),
+                    role_ids: roles,
+                    objective: "Invoke a Lua-defined tool".to_owned(),
+                    scope: MemoryScope::Private,
+                    kind: "interactive".to_owned(),
+                    parent_task_id: None,
+                    task_context: None,
+                    visible_scopes: visible_memory_scopes(&["owner".to_owned()]),
+                    memory_mode: AgentMemoryMode::ScopedRetrieval,
+                    approved_shell_commands: Vec::new(),
+                    approved_automation_actions: Vec::new(),
+                },
+                &lua_tool,
+                json!({}),
+                &tool_context,
+            )
+            .await
+            .expect_err("invalid output");
+
+        let ToolError::Failed(error) = error else {
+            panic!("expected ToolError::Failed");
+        };
+        assert!(error.to_string().contains("returned invalid output"));
+    }
+
+    #[tokio::test]
+    async fn filesystem_packaged_lua_tool_loads_and_runs() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let skills_dir = tempdir.path().join("skills").join("demo");
+        std::fs::create_dir_all(&skills_dir).expect("skills dir");
+        std::fs::write(
+            skills_dir.join("skill.yaml"),
+            r#"tools:
+  - tool_id: packaged_greet
+    kind: lua
+    description: Return a packaged greeting object.
+    source_text: |
+      return function(ctx)
+          return { greeting = "hi " .. ctx.input.name }
+      end
+    input_schema:
+      type: object
+      properties:
+        name:
+          type: string
+      required: [name]
+      additionalProperties: false
+    output_schema:
+      type: object
+      properties:
+        greeting:
+          type: string
+      required: [greeting]
+      additionalProperties: false
+"#,
+        )
+        .expect("write manifest");
+
+        let db_path = tempdir.path().join("test.db");
+        let db = Database::connect(&db_path).await.expect("connect");
+        db.bootstrap_single_user("Alex").await.expect("bootstrap");
+        let provider = Arc::new(FakeProvider::new(vec![])) as Arc<dyn ModelProvider>;
+        let runner = PrimaryAgentRunner::new(
+            db.clone(),
+            MemoryStore::new(db.clone()),
+            provider,
+            builtin_registry(),
+            ToolContext::new(
+                tempdir.path().to_path_buf(),
+                vec![tempdir.path().to_path_buf()],
+            ),
+            6,
+        );
+        let default_user = db.default_user().await.expect("default").expect("user");
+        let roles = db
+            .list_user_roles(&default_user.user_id)
+            .await
+            .expect("roles")
+            .into_iter()
+            .map(|row| row.role_id)
+            .collect::<Vec<_>>();
+        let task = db
+            .create_task_with_params(NewTask {
+                owner_user_id: &default_user.user_id,
+                initiating_identity_id: &format!("cli:{}", default_user.user_id),
+                primary_agent_id: default_user.primary_agent_id.as_deref().expect("agent"),
+                assigned_agent_id: default_user.primary_agent_id.as_deref().expect("agent"),
+                parent_task_id: None,
+                session_id: None,
+                kind: "interactive",
+                objective: "Run packaged Lua tool",
+                context_summary: None,
+                scope: MemoryScope::Private,
+                wake_at: None,
+            })
+            .await
+            .expect("task");
+
+        let loaded = runner
+            .load_registered_lua_tools(&default_user.user_id, &runner.base_tool_context)
+            .await
+            .expect("load tools");
+        assert!(loaded.iter().any(|tool| tool.tool_id == "packaged_greet"));
+        let packaged_tool = loaded
+            .into_iter()
+            .find(|tool| tool.tool_id == "packaged_greet")
+            .expect("packaged tool");
+
+        let output = runner
+            .handle_registered_lua_tool_call(
+                &task,
+                &AgentRequest {
+                    owner_user_id: default_user.user_id.clone(),
+                    initiating_identity_id: format!("cli:{}", default_user.user_id),
+                    primary_agent_id: default_user.primary_agent_id.clone().expect("agent"),
+                    assigned_agent_id: default_user.primary_agent_id.clone().expect("agent"),
+                    role_ids: roles,
+                    objective: "Run packaged Lua tool".to_owned(),
+                    scope: MemoryScope::Private,
+                    kind: "interactive".to_owned(),
+                    parent_task_id: None,
+                    task_context: None,
+                    visible_scopes: visible_memory_scopes(&["owner".to_owned()]),
+                    memory_mode: AgentMemoryMode::ScopedRetrieval,
+                    approved_shell_commands: Vec::new(),
+                    approved_automation_actions: Vec::new(),
+                },
+                &packaged_tool,
+                json!({ "name": "Alex" }),
+                &runner.base_tool_context,
+            )
+            .await
+            .expect("tool output");
+
+        assert_eq!(output.payload["greeting"], json!("hi Alex"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn lua_defined_tool_surfaces_typed_policy_denial() {
+        let (db, runner) = test_runner(FakeProvider::new(vec![])).await;
+        let default_user = db.default_user().await.expect("default").expect("user");
+        let roles = db
+            .list_user_roles(&default_user.user_id)
+            .await
+            .expect("roles")
+            .into_iter()
+            .map(|row| row.role_id)
+            .collect::<Vec<_>>();
+        let task = db
+            .create_task_with_params(NewTask {
+                owner_user_id: &default_user.user_id,
+                initiating_identity_id: &format!("cli:{}", default_user.user_id),
+                primary_agent_id: default_user.primary_agent_id.as_deref().expect("agent"),
+                assigned_agent_id: default_user.primary_agent_id.as_deref().expect("agent"),
+                parent_task_id: None,
+                session_id: None,
+                kind: "interactive",
+                objective: "Run a Lua-defined tool with risky shell",
+                context_summary: None,
+                scope: MemoryScope::Private,
+                wake_at: None,
+            })
+            .await
+            .expect("task");
+        create_active_lua_tool(
+            &db,
+            &default_user.user_id,
+            "tool_risky_shell",
+            "Attempt a risky shell command.",
+            "return function(ctx)\n    return ctx.tool_call(\"shell_exec\", { command = \"mkdir /tmp/beaverki_agent_lua_tool_policy_denied\" })\nend",
+            json!({
+                "type": "object",
+                "properties": {},
+                "required": [],
+                "additionalProperties": false
+            }),
+            json!({
+                "type": "object",
+                "properties": {},
+                "required": [],
+                "additionalProperties": false
+            }),
+            json!({
+                "allowed_tools": ["shell_exec"]
+            }),
+        )
+        .await;
+
+        let tool_context = ToolContext::new(std::env::temp_dir(), vec![]);
+        let lua_tool = runner
+            .find_registered_lua_tool(&default_user.user_id, "tool_risky_shell", &tool_context)
+            .await
+            .expect("find tool")
+            .expect("tool");
+
+        let error = runner
+            .handle_registered_lua_tool_call(
+                &task,
+                &AgentRequest {
+                    owner_user_id: default_user.user_id.clone(),
+                    initiating_identity_id: format!("cli:{}", default_user.user_id),
+                    primary_agent_id: default_user.primary_agent_id.clone().expect("agent"),
+                    assigned_agent_id: default_user.primary_agent_id.clone().expect("agent"),
+                    role_ids: roles,
+                    objective: "Run a Lua-defined tool with risky shell".to_owned(),
+                    scope: MemoryScope::Private,
+                    kind: "interactive".to_owned(),
+                    parent_task_id: None,
+                    task_context: None,
+                    visible_scopes: visible_memory_scopes(&["owner".to_owned()]),
+                    memory_mode: AgentMemoryMode::ScopedRetrieval,
+                    approved_shell_commands: Vec::new(),
+                    approved_automation_actions: Vec::new(),
+                },
+                &lua_tool,
+                json!({}),
+                &tool_context,
+            )
+            .await
+            .expect_err("policy denial");
+
+        let ToolError::Failed(error) = error else {
+            panic!("expected ToolError::Failed");
+        };
+        let policy_error = error
+            .downcast_ref::<automation::LuaToolPolicyDenied>()
+            .expect("typed policy error");
+        assert_eq!(policy_error.tool_name, "shell_exec");
+        assert_eq!(policy_error.detail["risk"], json!("high"));
+
+        let events = db
+            .fetch_task_events_for_owner(&default_user.user_id, &task.task_id)
+            .await
+            .expect("events");
+        let denial_event = events
+            .iter()
+            .find(|event| event.event_type == "lua_tool_denied")
+            .expect("lua_tool_denied event");
+        let payload: Value = serde_json::from_str(&denial_event.payload_json).expect("payload");
+        assert_eq!(payload["tool_id"], json!("tool_risky_shell"));
+        assert_eq!(payload["tool_name"], json!("shell_exec"));
+        assert_eq!(payload["detail"]["risk"], json!("high"));
     }
 }

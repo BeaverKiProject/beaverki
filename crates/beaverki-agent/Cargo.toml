@@ -17,7 +17,9 @@ beaverki-policy = { path = "../beaverki-policy" }
 beaverki-tools = { path = "../beaverki-tools" }
 serde.workspace = true
 serde_json.workspace = true
+serde_yaml.workspace = true
 tracing.workspace = true
+walkdir.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

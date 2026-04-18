@@ -219,9 +219,11 @@ dependencies = [
  "beaverki-tools",
  "serde",
  "serde_json",
+ "serde_yaml",
  "tempfile",
  "tokio",
  "tracing",
+ "walkdir",
 ]
 
 [[package]]

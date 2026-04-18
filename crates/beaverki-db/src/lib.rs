@@ -1830,6 +1830,198 @@ impl Database {
         Ok(rows)
     }
 
+    pub async fn create_lua_tool(&self, input: NewLuaTool<'_>) -> Result<LuaToolRow> {
+        let tool_id = input
+            .tool_id
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| new_prefixed_id("lua_tool"));
+        let timestamp = now_rfc3339();
+        sqlx::query(
+            "INSERT INTO lua_tools
+             (tool_id, owner_user_id, description, source_text, input_schema_json, output_schema_json, capability_profile_json, status, created_from_task_id, safety_status, safety_summary, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&tool_id)
+        .bind(input.owner_user_id)
+        .bind(input.description)
+        .bind(input.source_text)
+        .bind(input.input_schema_json.to_string())
+        .bind(input.output_schema_json.to_string())
+        .bind(input.capability_profile_json.to_string())
+        .bind(input.status)
+        .bind(input.created_from_task_id)
+        .bind(input.safety_status)
+        .bind(input.safety_summary)
+        .bind(&timestamp)
+        .bind(&timestamp)
+        .execute(&self.pool)
+        .await
+        .context("failed to create lua tool")?;
+
+        self.fetch_lua_tool_for_owner(input.owner_user_id, &tool_id)
+            .await?
+            .context("lua tool missing after insert")
+    }
+
+    pub async fn fetch_lua_tool_for_owner(
+        &self,
+        owner_user_id: &str,
+        tool_id: &str,
+    ) -> Result<Option<LuaToolRow>> {
+        let row = sqlx::query_as::<_, LuaToolRow>(
+            "SELECT tool_id, owner_user_id, description, source_text, input_schema_json, output_schema_json, capability_profile_json, status, created_from_task_id, safety_status, safety_summary, created_at, updated_at
+             FROM lua_tools
+             WHERE owner_user_id = ? AND tool_id = ?",
+        )
+        .bind(owner_user_id)
+        .bind(tool_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to fetch lua tool")?;
+        Ok(row)
+    }
+
+    pub async fn list_lua_tools_for_owner(&self, owner_user_id: &str) -> Result<Vec<LuaToolRow>> {
+        let rows = sqlx::query_as::<_, LuaToolRow>(
+            "SELECT tool_id, owner_user_id, description, source_text, input_schema_json, output_schema_json, capability_profile_json, status, created_from_task_id, safety_status, safety_summary, created_at, updated_at
+             FROM lua_tools
+             WHERE owner_user_id = ?
+             ORDER BY created_at DESC",
+        )
+        .bind(owner_user_id)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list lua tools")?;
+        Ok(rows)
+    }
+
+    pub async fn list_active_lua_tools_for_owner(
+        &self,
+        owner_user_id: &str,
+    ) -> Result<Vec<LuaToolRow>> {
+        let rows = sqlx::query_as::<_, LuaToolRow>(
+            "SELECT tool_id, owner_user_id, description, source_text, input_schema_json, output_schema_json, capability_profile_json, status, created_from_task_id, safety_status, safety_summary, created_at, updated_at
+             FROM lua_tools
+             WHERE owner_user_id = ?
+               AND status = 'active'
+               AND safety_status = 'approved'
+             ORDER BY created_at DESC",
+        )
+        .bind(owner_user_id)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list active lua tools")?;
+        Ok(rows)
+    }
+
+    pub async fn update_lua_tool_contents(&self, input: UpdateLuaTool<'_>) -> Result<()> {
+        sqlx::query(
+            "UPDATE lua_tools
+             SET description = ?, source_text = ?, input_schema_json = ?, output_schema_json = ?, capability_profile_json = ?, created_from_task_id = ?, status = ?, safety_status = ?, safety_summary = ?, updated_at = ?
+             WHERE tool_id = ? AND owner_user_id = ?",
+        )
+        .bind(input.description)
+        .bind(input.source_text)
+        .bind(input.input_schema_json.to_string())
+        .bind(input.output_schema_json.to_string())
+        .bind(input.capability_profile_json.to_string())
+        .bind(input.created_from_task_id)
+        .bind(input.status)
+        .bind(input.safety_status)
+        .bind(input.safety_summary)
+        .bind(now_rfc3339())
+        .bind(input.tool_id)
+        .bind(input.owner_user_id)
+        .execute(&self.pool)
+        .await
+        .context("failed to update lua tool contents")?;
+        Ok(())
+    }
+
+    pub async fn update_lua_tool_status(&self, tool_id: &str, status: &str) -> Result<()> {
+        sqlx::query(
+            "UPDATE lua_tools
+             SET status = ?, updated_at = ?
+             WHERE tool_id = ?",
+        )
+        .bind(status)
+        .bind(now_rfc3339())
+        .bind(tool_id)
+        .execute(&self.pool)
+        .await
+        .context("failed to update lua tool status")?;
+        Ok(())
+    }
+
+    pub async fn update_lua_tool_safety(
+        &self,
+        tool_id: &str,
+        safety_status: &str,
+        safety_summary: &str,
+        status: Option<&str>,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE lua_tools
+             SET safety_status = ?, safety_summary = ?, status = COALESCE(?, status), updated_at = ?
+             WHERE tool_id = ?",
+        )
+        .bind(safety_status)
+        .bind(safety_summary)
+        .bind(status)
+        .bind(now_rfc3339())
+        .bind(tool_id)
+        .execute(&self.pool)
+        .await
+        .context("failed to update lua tool safety")?;
+        Ok(())
+    }
+
+    pub async fn create_lua_tool_review(
+        &self,
+        input: NewLuaToolReview<'_>,
+    ) -> Result<LuaToolReviewRow> {
+        let review_id = new_prefixed_id("review");
+        let timestamp = now_rfc3339();
+        sqlx::query(
+            "INSERT INTO lua_tool_reviews
+             (review_id, tool_id, reviewer_agent_id, review_type, verdict, risk_level, findings_json, summary_text, reviewed_artifact_text, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&review_id)
+        .bind(input.tool_id)
+        .bind(input.reviewer_agent_id)
+        .bind(input.review_type)
+        .bind(input.verdict)
+        .bind(input.risk_level)
+        .bind(input.findings_json.to_string())
+        .bind(input.summary_text)
+        .bind(input.reviewed_artifact_text)
+        .bind(&timestamp)
+        .execute(&self.pool)
+        .await
+        .context("failed to create lua tool review")?;
+
+        self.list_lua_tool_reviews(input.tool_id)
+            .await?
+            .into_iter()
+            .find(|row| row.review_id == review_id)
+            .ok_or_else(|| anyhow!("lua tool review missing after insert"))
+    }
+
+    pub async fn list_lua_tool_reviews(&self, tool_id: &str) -> Result<Vec<LuaToolReviewRow>> {
+        let rows = sqlx::query_as::<_, LuaToolReviewRow>(
+            "SELECT review_id, tool_id, reviewer_agent_id, review_type, verdict, risk_level, findings_json, summary_text, reviewed_artifact_text, created_at
+             FROM lua_tool_reviews
+             WHERE tool_id = ?
+             ORDER BY created_at DESC",
+        )
+        .bind(tool_id)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list lua tool reviews")?;
+        Ok(rows)
+    }
+
     pub async fn create_schedule(&self, input: NewSchedule<'_>) -> Result<ScheduleRow> {
         let schedule_id = input
             .schedule_id
@@ -2325,6 +2517,21 @@ pub struct NewScript<'a> {
     pub safety_summary: Option<&'a str>,
 }
 
+#[derive(Debug, Clone)]
+pub struct NewLuaTool<'a> {
+    pub tool_id: Option<&'a str>,
+    pub owner_user_id: &'a str,
+    pub description: &'a str,
+    pub source_text: &'a str,
+    pub input_schema_json: Value,
+    pub output_schema_json: Value,
+    pub capability_profile_json: Value,
+    pub status: &'a str,
+    pub created_from_task_id: Option<&'a str>,
+    pub safety_status: &'a str,
+    pub safety_summary: Option<&'a str>,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct NewApproval<'a> {
     pub task_id: &'a str,
@@ -2361,8 +2568,35 @@ pub struct UpdateScript<'a> {
 }
 
 #[derive(Debug, Clone)]
+pub struct UpdateLuaTool<'a> {
+    pub tool_id: &'a str,
+    pub owner_user_id: &'a str,
+    pub description: &'a str,
+    pub source_text: &'a str,
+    pub input_schema_json: Value,
+    pub output_schema_json: Value,
+    pub capability_profile_json: Value,
+    pub created_from_task_id: Option<&'a str>,
+    pub status: &'a str,
+    pub safety_status: &'a str,
+    pub safety_summary: Option<&'a str>,
+}
+
+#[derive(Debug, Clone)]
 pub struct NewScriptReview<'a> {
     pub script_id: &'a str,
+    pub reviewer_agent_id: &'a str,
+    pub review_type: &'a str,
+    pub verdict: &'a str,
+    pub risk_level: &'a str,
+    pub findings_json: Value,
+    pub summary_text: &'a str,
+    pub reviewed_artifact_text: &'a str,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewLuaToolReview<'a> {
+    pub tool_id: &'a str,
     pub reviewer_agent_id: &'a str,
     pub review_type: &'a str,
     pub verdict: &'a str,
@@ -2574,6 +2808,37 @@ pub struct ScriptRow {
 pub struct ScriptReviewRow {
     pub review_id: String,
     pub script_id: String,
+    pub reviewer_agent_id: String,
+    pub review_type: String,
+    pub verdict: String,
+    pub risk_level: String,
+    pub findings_json: String,
+    pub summary_text: String,
+    pub reviewed_artifact_text: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct LuaToolRow {
+    pub tool_id: String,
+    pub owner_user_id: String,
+    pub description: String,
+    pub source_text: String,
+    pub input_schema_json: String,
+    pub output_schema_json: String,
+    pub capability_profile_json: String,
+    pub status: String,
+    pub created_from_task_id: Option<String>,
+    pub safety_status: String,
+    pub safety_summary: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct LuaToolReviewRow {
+    pub review_id: String,
+    pub tool_id: String,
     pub reviewer_agent_id: String,
     pub review_type: String,
     pub verdict: String,

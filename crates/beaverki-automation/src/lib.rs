@@ -102,6 +102,7 @@ pub struct LuaExecutionInput {
     pub task_id: String,
     pub script_id: String,
     pub source_text: String,
+    pub input_json: Option<Value>,
     pub capability_profile: Value,
     pub working_dir: PathBuf,
     pub allowed_roots: Vec<PathBuf>,
@@ -113,6 +114,7 @@ pub struct LuaExecutionInput {
 #[derive(Debug, Clone)]
 pub struct LuaExecutionResult {
     pub result_text: String,
+    pub result_json: Value,
     pub deferred_until: Option<String>,
     pub notifications: Vec<String>,
     pub logs: Vec<String>,
@@ -161,6 +163,40 @@ pub async fn review_lua_script(
         "originating_task_id": task_id,
         "owner_user_id": owner_user_id,
         "source_text": source_text,
+        "capability_profile": capability_profile,
+        "intended_behavior_summary": intended_behavior_summary,
+    });
+    review_with_prompt(
+        provider,
+        "safety_review",
+        provider.model_names().safety_review.as_str(),
+        LUA_REVIEW_INSTRUCTIONS,
+        &request,
+    )
+    .await
+}
+
+pub async fn review_lua_tool(
+    provider: &Arc<dyn ModelProvider>,
+    tool_id: &str,
+    task_id: Option<&str>,
+    owner_user_id: &str,
+    description: &str,
+    source_text: &str,
+    input_schema: &Value,
+    output_schema: &Value,
+    capability_profile: &Value,
+    intended_behavior_summary: &str,
+) -> Result<SafetyReviewOutcome> {
+    let request = json!({
+        "review_type": "lua_tool",
+        "tool_id": tool_id,
+        "originating_task_id": task_id,
+        "owner_user_id": owner_user_id,
+        "description": description,
+        "source_text": source_text,
+        "input_schema": input_schema,
+        "output_schema": output_schema,
         "capability_profile": capability_profile,
         "intended_behavior_summary": intended_behavior_summary,
     });
@@ -265,6 +301,10 @@ pub async fn execute_lua_script(input: LuaExecutionInput) -> Result<LuaExecution
     globals.set("debug", LuaValue::Nil).map_err(lua_to_anyhow)?;
 
     let ctx = lua.create_table().map_err(lua_to_anyhow)?;
+
+    let input_json = input.input_json.clone().unwrap_or(Value::Null);
+    ctx.set("input", lua.to_value(&input_json).map_err(lua_to_anyhow)?)
+        .map_err(lua_to_anyhow)?;
 
     {
         let db = db.clone();
@@ -480,17 +520,20 @@ pub async fn execute_lua_script(input: LuaExecutionInput) -> Result<LuaExecution
             .map_err(map_lua_runtime_error)?,
         other => other,
     };
-    let result_text = match value {
-        LuaValue::Nil => "Lua script completed without returning a value.".to_owned(),
-        LuaValue::String(text) => text.to_str().map_err(lua_to_anyhow)?.to_owned(),
-        other => {
-            let json_value: Value = lua.from_value(other).map_err(lua_to_anyhow)?;
-            serde_json::to_string_pretty(&json_value)?
-        }
+    let result_json = match value {
+        LuaValue::Nil => Value::Null,
+        LuaValue::String(text) => Value::String(text.to_str().map_err(lua_to_anyhow)?.to_owned()),
+        other => lua.from_value(other).map_err(lua_to_anyhow)?,
+    };
+    let result_text = match &result_json {
+        Value::Null => "Lua script completed without returning a value.".to_owned(),
+        Value::String(text) => text.clone(),
+        other => serde_json::to_string_pretty(other)?,
     };
 
     Ok(LuaExecutionResult {
         result_text,
+        result_json,
         deferred_until: deferred_until
             .lock()
             .map_err(|_| anyhow!("failed to lock deferred state"))?
@@ -541,7 +584,7 @@ fn capability_allowed_roots(
 }
 
 const LUA_REVIEW_INSTRUCTIONS: &str = r#"You are BeaverKI's safety review agent.
-Review the provided Lua automation script for intent matching, dangerous side effects, privilege escalation, hidden exfiltration, and capability/profile mismatch.
+Review the provided Lua automation artifact for intent matching, dangerous side effects, privilege escalation, hidden exfiltration, and capability/profile mismatch.
 Return only JSON with this exact schema:
 {"verdict":"approved|rejected|needs_changes","risk_level":"low|medium|high|critical","findings":["..."],"required_changes":["..."],"summary":"..."}"#;
 

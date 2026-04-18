@@ -1033,6 +1033,7 @@ impl Runtime {
             task_id: task.task_id.clone(),
             script_id: script.script_id.clone(),
             source_text: script.source_text.clone(),
+            input_json: None,
             capability_profile,
             working_dir: self.config.runtime.workspace_root.clone(),
             allowed_roots: self.default_allowed_roots(),

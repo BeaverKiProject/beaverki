@@ -84,6 +84,243 @@ fn validate_openai_schema_node(schema: &Value, path: &str) -> Result<()> {
     Ok(())
 }
 
+pub fn validate_json_schema_contract(schema: &Value) -> Result<()> {
+    validate_json_schema_node(schema, "$")
+}
+
+fn validate_json_schema_node(schema: &Value, path: &str) -> Result<()> {
+    let schema_object = schema
+        .as_object()
+        .ok_or_else(|| anyhow!("schema path '{}' must be an object", path))?;
+
+    if let Some(types) = schema_object.get("type") {
+        let type_list = schema_type_list(types, path)?;
+        for entry in &type_list {
+            ensure_supported_schema_type(entry, path)?;
+        }
+    }
+
+    if let Some(properties) = schema_object.get("properties") {
+        let properties = properties
+            .as_object()
+            .ok_or_else(|| anyhow!("schema path '{}.properties' must be an object", path))?;
+        for (name, child_schema) in properties {
+            validate_json_schema_node(child_schema, &format!("{path}.properties.{name}"))?;
+        }
+    }
+
+    if let Some(required) = schema_object.get("required") {
+        let required = required
+            .as_array()
+            .ok_or_else(|| anyhow!("schema path '{}.required' must be an array", path))?;
+        for entry in required {
+            entry
+                .as_str()
+                .ok_or_else(|| anyhow!("schema path '{}.required' must contain strings", path))?;
+        }
+    }
+
+    if let Some(additional_properties) = schema_object.get("additionalProperties")
+        && !additional_properties.is_boolean()
+    {
+        bail!(
+            "schema path '{}.additionalProperties' must be a boolean",
+            path
+        );
+    }
+
+    if let Some(items) = schema_object.get("items") {
+        validate_json_schema_node(items, &format!("{path}.items"))?;
+    }
+
+    if let Some(variants) = schema_object.get("enum")
+        && !variants.is_array()
+    {
+        bail!("schema path '{}.enum' must be an array", path);
+    }
+
+    for keyword in ["anyOf", "allOf", "oneOf"] {
+        if let Some(variants) = schema_object.get(keyword) {
+            let variants = variants
+                .as_array()
+                .ok_or_else(|| anyhow!("schema path '{}.{}' must be an array", path, keyword))?;
+            for (index, variant) in variants.iter().enumerate() {
+                validate_json_schema_node(variant, &format!("{path}.{keyword}[{index}]"))?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+pub fn validate_json_value_against_schema(value: &Value, schema: &Value) -> Result<()> {
+    validate_json_value_against_schema_at(value, schema, "$")
+}
+
+fn validate_json_value_against_schema_at(value: &Value, schema: &Value, path: &str) -> Result<()> {
+    let schema_object = schema
+        .as_object()
+        .ok_or_else(|| anyhow!("schema path '{}' must be an object", path))?;
+
+    if let Some(types) = schema_object.get("type") {
+        let type_list = schema_type_list(types, path)?;
+        if !type_matches_any(value, &type_list) {
+            bail!(
+                "value at '{}' does not match expected type(s) {:?}",
+                path,
+                type_list
+            );
+        }
+    }
+
+    if let Some(variants) = schema_object.get("enum") {
+        let variants = variants
+            .as_array()
+            .ok_or_else(|| anyhow!("schema path '{}.enum' must be an array", path))?;
+        if !variants.iter().any(|variant| variant == value) {
+            bail!("value at '{}' is not in the allowed enum set", path);
+        }
+    }
+
+    if let Some(properties) = schema_object.get("properties")
+        && value.is_object()
+    {
+        let value_object = value
+            .as_object()
+            .ok_or_else(|| anyhow!("value at '{}' must be an object", path))?;
+        let properties = properties
+            .as_object()
+            .ok_or_else(|| anyhow!("schema path '{}.properties' must be an object", path))?;
+        let required = schema_object
+            .get("required")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        for required_key in required {
+            let required_key = required_key
+                .as_str()
+                .ok_or_else(|| anyhow!("schema path '{}.required' must contain strings", path))?;
+            if !value_object.contains_key(required_key) {
+                bail!(
+                    "value at '{}' is missing required property '{}'",
+                    path,
+                    required_key
+                );
+            }
+        }
+        if schema_object
+            .get("additionalProperties")
+            .and_then(Value::as_bool)
+            == Some(false)
+        {
+            for key in value_object.keys() {
+                if !properties.contains_key(key) {
+                    bail!("value at '{}' has unsupported property '{}'", path, key);
+                }
+            }
+        }
+        for (name, child_schema) in properties {
+            if let Some(child_value) = value_object.get(name) {
+                validate_json_value_against_schema_at(
+                    child_value,
+                    child_schema,
+                    &format!("{path}.{name}"),
+                )?;
+            }
+        }
+    }
+
+    if let Some(items) = schema_object.get("items")
+        && let Some(values) = value.as_array()
+    {
+        for (index, entry) in values.iter().enumerate() {
+            validate_json_value_against_schema_at(entry, items, &format!("{path}[{index}]"))?;
+        }
+    }
+
+    if let Some(variants) = schema_object.get("anyOf") {
+        let variants = variants
+            .as_array()
+            .ok_or_else(|| anyhow!("schema path '{}.anyOf' must be an array", path))?;
+        if !variants
+            .iter()
+            .any(|variant| validate_json_value_against_schema_at(value, variant, path).is_ok())
+        {
+            bail!(
+                "value at '{}' did not match any allowed schema variant",
+                path
+            );
+        }
+    }
+
+    if let Some(variants) = schema_object.get("oneOf") {
+        let variants = variants
+            .as_array()
+            .ok_or_else(|| anyhow!("schema path '{}.oneOf' must be an array", path))?;
+        let matches = variants
+            .iter()
+            .filter(|variant| validate_json_value_against_schema_at(value, variant, path).is_ok())
+            .count();
+        if matches != 1 {
+            bail!(
+                "value at '{}' must match exactly one schema variant, matched {}",
+                path,
+                matches
+            );
+        }
+    }
+
+    if let Some(variants) = schema_object.get("allOf") {
+        let variants = variants
+            .as_array()
+            .ok_or_else(|| anyhow!("schema path '{}.allOf' must be an array", path))?;
+        for variant in variants {
+            validate_json_value_against_schema_at(value, variant, path)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn schema_type_list<'a>(types: &'a Value, path: &str) -> Result<Vec<&'a str>> {
+    match types {
+        Value::String(value) => Ok(vec![value.as_str()]),
+        Value::Array(values) => values
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .ok_or_else(|| anyhow!("schema path '{}.type' must contain strings", path))
+            })
+            .collect(),
+        _ => bail!("schema path '{}.type' must be a string or array", path),
+    }
+}
+
+fn ensure_supported_schema_type(type_name: &str, path: &str) -> Result<()> {
+    match type_name {
+        "object" | "array" | "string" | "number" | "integer" | "boolean" | "null" => Ok(()),
+        other => bail!("schema path '{}' uses unsupported type '{}'", path, other),
+    }
+}
+
+fn type_matches_any(value: &Value, types: &[&str]) -> bool {
+    types.iter().any(|type_name| type_matches(value, type_name))
+}
+
+fn type_matches(value: &Value, type_name: &str) -> bool {
+    match type_name {
+        "object" => value.is_object(),
+        "array" => value.is_array(),
+        "string" => value.is_string(),
+        "number" => value.is_number(),
+        "integer" => value.as_i64().is_some() || value.as_u64().is_some(),
+        "boolean" => value.is_boolean(),
+        "null" => value.is_null(),
+        _ => false,
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ToolContext {
     pub working_dir: PathBuf,
@@ -1109,5 +1346,46 @@ mod tests {
                 .expect("dom")
                 .contains("<html>ok</html>")
         );
+    }
+
+    #[test]
+    fn json_schema_contract_accepts_supported_subset() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "name": { "type": "string" },
+                "count": { "type": ["integer", "null"] },
+                "tags": {
+                    "type": "array",
+                    "items": { "type": "string" }
+                }
+            },
+            "required": ["name"],
+            "additionalProperties": false
+        });
+
+        validate_json_schema_contract(&schema).expect("valid schema");
+        validate_json_value_against_schema(
+            &json!({ "name": "ok", "count": 2, "tags": ["a", "b"] }),
+            &schema,
+        )
+        .expect("matching value");
+    }
+
+    #[test]
+    fn json_schema_validation_rejects_extra_properties() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "name": { "type": "string" }
+            },
+            "required": ["name"],
+            "additionalProperties": false
+        });
+
+        let error =
+            validate_json_value_against_schema(&json!({ "name": "ok", "extra": true }), &schema)
+                .expect_err("extra property rejected");
+        assert!(error.to_string().contains("unsupported property"));
     }
 }

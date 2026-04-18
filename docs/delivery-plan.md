@@ -354,7 +354,7 @@ Add reviewed, activatable Lua-defined agent tools on top of the existing Lua aut
 
 Status:
 
-- proposed after M4.6
+- implemented in the repository
 
 Implementation notes:
 
