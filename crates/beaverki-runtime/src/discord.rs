@@ -75,6 +75,20 @@ struct DiscordRegisteredCommand {
     #[serde(rename = "type")]
     command_type: i64,
     contexts: Option<Vec<i64>>,
+    #[serde(default)]
+    options: Vec<DiscordRegisteredCommandOption>,
+}
+
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+struct DiscordRegisteredCommandOption {
+    #[serde(rename = "type")]
+    option_type: i64,
+    name: String,
+    description: String,
+    #[serde(default)]
+    required: bool,
+    #[serde(default)]
+    options: Vec<DiscordRegisteredCommandOption>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -494,12 +508,79 @@ async fn overwrite_discord_global_commands(
 }
 
 fn discord_global_command_payloads() -> Vec<Value> {
-    vec![json!({
-        "name": "new",
-        "type": 1,
-        "description": "Start a new BeaverKI conversation",
-        "contexts": [0, 1],
-    })]
+    vec![
+        json!({
+            "name": "new",
+            "type": 1,
+            "description": "Start a new BeaverKI conversation",
+            "contexts": [0, 1],
+        }),
+        json!({
+            "name": "approval",
+            "type": 1,
+            "description": "Inspect or resolve BeaverKI approvals",
+            "contexts": [0, 1],
+            "options": [
+                {
+                    "type": 1,
+                    "name": "list",
+                    "description": "Show pending BeaverKI approvals"
+                },
+                {
+                    "type": 1,
+                    "name": "inspect",
+                    "description": "Inspect a BeaverKI approval token",
+                    "options": [
+                        {
+                            "type": 3,
+                            "name": "token",
+                            "description": "The BeaverKI approval token",
+                            "required": true
+                        }
+                    ]
+                },
+                {
+                    "type": 1,
+                    "name": "approve",
+                    "description": "Approve a BeaverKI approval token",
+                    "options": [
+                        {
+                            "type": 3,
+                            "name": "token",
+                            "description": "The BeaverKI approval token",
+                            "required": true
+                        }
+                    ]
+                },
+                {
+                    "type": 1,
+                    "name": "deny",
+                    "description": "Deny a BeaverKI approval token",
+                    "options": [
+                        {
+                            "type": 3,
+                            "name": "token",
+                            "description": "The BeaverKI approval token",
+                            "required": true
+                        }
+                    ]
+                },
+                {
+                    "type": 1,
+                    "name": "confirm",
+                    "description": "Confirm a critical BeaverKI approval token",
+                    "options": [
+                        {
+                            "type": 3,
+                            "name": "token",
+                            "description": "The BeaverKI approval token",
+                            "required": true
+                        }
+                    ]
+                }
+            ]
+        }),
+    ]
 }
 
 fn discord_command_sets_match(commands: &[DiscordRegisteredCommand], desired_commands: &[Value]) -> bool {
@@ -528,6 +609,8 @@ fn discord_registered_command_matches_payload(
                 .unwrap_or_default()
         && normalized_discord_command_contexts(command.contexts.as_deref())
             == normalized_discord_command_contexts_from_value(desired_command.get("contexts"))
+        && command.options
+            == normalized_discord_command_options_from_value(desired_command.get("options"))
 }
 
 fn normalized_discord_command_contexts(contexts: Option<&[i64]>) -> Vec<i64> {
@@ -547,6 +630,15 @@ fn normalized_discord_command_contexts_from_value(contexts: Option<&Value>) -> V
     contexts.sort_unstable();
     contexts.dedup();
     contexts
+}
+
+fn normalized_discord_command_options_from_value(
+    options: Option<&Value>,
+) -> Vec<DiscordRegisteredCommandOption> {
+    options
+        .cloned()
+        .and_then(|value| serde_json::from_value::<Vec<DiscordRegisteredCommandOption>>(value).ok())
+        .unwrap_or_default()
 }
 
 async fn send_discord_interaction_callback(
@@ -1828,6 +1920,11 @@ fn flatten_interaction_options(
         return;
     }
 
+    if options.len() == 1 && options[0].value.is_none() {
+        path.push(options[0].name.clone());
+        return;
+    }
+
     for option in options {
         let Some(value) = option.value.as_ref() else {
             continue;
@@ -2623,6 +2720,21 @@ mod tests {
     }
 
     #[test]
+    fn interaction_command_maps_approval_list_subcommand() {
+        let command = interaction_command_text(&DiscordInteractionData {
+            name: "approval".to_owned(),
+            options: vec![DiscordInteractionOption {
+                name: "list".to_owned(),
+                value: None,
+                options: Vec::new(),
+            }],
+        })
+        .expect("command text");
+
+        assert_eq!(command, "approvals");
+    }
+
+    #[test]
     fn interaction_command_maps_new_to_session_reset() {
         let command = interaction_command_text(&DiscordInteractionData {
             name: "new".to_owned(),
@@ -2640,6 +2752,7 @@ mod tests {
             description: "Start a new BeaverKI conversation".to_owned(),
             command_type: 1,
             contexts: Some(vec![1, 0, 1]),
+            options: Vec::new(),
         };
 
         assert!(discord_registered_command_matches_payload(
@@ -2655,6 +2768,7 @@ mod tests {
             description: "Reset things".to_owned(),
             command_type: 1,
             contexts: Some(vec![0, 1]),
+            options: Vec::new(),
         };
 
         assert!(!discord_registered_command_matches_payload(
@@ -2671,12 +2785,14 @@ mod tests {
                 description: "Start a new BeaverKI conversation".to_owned(),
                 command_type: 1,
                 contexts: Some(vec![0, 1]),
+                options: Vec::new(),
             },
             DiscordRegisteredCommand {
                 name: "old-test".to_owned(),
                 description: "Old test command".to_owned(),
                 command_type: 1,
                 contexts: Some(vec![0, 1]),
+                options: Vec::new(),
             },
         ];
 
@@ -2688,14 +2804,57 @@ mod tests {
 
     #[test]
     fn command_set_match_accepts_expected_command_list() {
-        let commands = vec![DiscordRegisteredCommand {
-            name: "new".to_owned(),
-            description: "Start a new BeaverKI conversation".to_owned(),
-            command_type: 1,
-            contexts: Some(vec![1, 0]),
-        }];
+        let commands = vec![
+            DiscordRegisteredCommand {
+                name: "new".to_owned(),
+                description: "Start a new BeaverKI conversation".to_owned(),
+                command_type: 1,
+                contexts: Some(vec![1, 0]),
+                options: Vec::new(),
+            },
+            DiscordRegisteredCommand {
+                name: "approval".to_owned(),
+                description: "Inspect or resolve BeaverKI approvals".to_owned(),
+                command_type: 1,
+                contexts: Some(vec![0, 1]),
+                options: normalized_discord_command_options_from_value(
+                    discord_global_command_payloads()[1].get("options")
+                ),
+            },
+        ];
 
         assert!(discord_command_sets_match(
+            &commands,
+            &discord_global_command_payloads()
+        ));
+    }
+
+    #[test]
+    fn command_set_match_rejects_option_drift() {
+        let commands = vec![
+            DiscordRegisteredCommand {
+                name: "new".to_owned(),
+                description: "Start a new BeaverKI conversation".to_owned(),
+                command_type: 1,
+                contexts: Some(vec![0, 1]),
+                options: Vec::new(),
+            },
+            DiscordRegisteredCommand {
+                name: "approval".to_owned(),
+                description: "Inspect or resolve BeaverKI approvals".to_owned(),
+                command_type: 1,
+                contexts: Some(vec![0, 1]),
+                options: vec![DiscordRegisteredCommandOption {
+                    option_type: 1,
+                    name: "approve".to_owned(),
+                    description: "Approve a BeaverKI approval token".to_owned(),
+                    required: false,
+                    options: Vec::new(),
+                }],
+            },
+        ];
+
+        assert!(!discord_command_sets_match(
             &commands,
             &discord_global_command_payloads()
         ));
