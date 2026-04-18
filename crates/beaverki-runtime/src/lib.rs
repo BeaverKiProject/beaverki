@@ -33,6 +33,8 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
 const QUEUE_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const TASK_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(150);
 const CONNECTOR_MESSAGE_CONTEXT_EVENT: &str = "connector_message_context";
+const CLI_CONVERSATION_HISTORY_LIMIT: i64 = 4;
+const CLI_ACTIVE_CONVERSATION_WINDOW_SECS: i64 = 45 * 60;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskInspection {
@@ -1360,6 +1362,32 @@ impl Runtime {
                 user.user_id
             );
         }
+        let recent_cli_exchanges = self
+            .db
+            .list_recent_interactive_tasks_for_owner(&user.user_id, CLI_CONVERSATION_HISTORY_LIMIT)
+            .await?
+            .into_iter()
+            .filter(|task| task.initiating_identity_id == initiating_identity_id)
+            .map(|task| CliConversationExchange {
+                created_at: task.created_at.clone(),
+                state: task.state.clone(),
+                user_text: task.objective.clone(),
+                assistant_text: assistant_reply_for_context(&task),
+                task_id: task.task_id.clone(),
+            })
+            .collect::<Vec<_>>();
+        let conversation_status = recent_cli_exchanges
+            .first()
+            .map(|exchange| cli_conversation_status(&exchange.state, &exchange.created_at));
+        let parent_task_id = if matches!(conversation_status, Some(CliConversationStatus::FollowUp))
+        {
+            recent_cli_exchanges.first().map(|exchange| exchange.task_id.clone())
+        } else {
+            None
+        };
+        let task_context = (!recent_cli_exchanges.is_empty())
+            .then(|| build_cli_task_context(&recent_cli_exchanges));
+
         Ok(AgentRequest {
             owner_user_id: user.user_id.clone(),
             initiating_identity_id: initiating_identity_id.to_owned(),
@@ -1369,8 +1397,8 @@ impl Runtime {
             objective: objective.to_owned(),
             scope,
             kind: "interactive".to_owned(),
-            parent_task_id: None,
-            task_context: None,
+            parent_task_id,
+            task_context,
             visible_scopes,
             memory_mode: AgentMemoryMode::ScopedRetrieval,
             approved_shell_commands: Vec::new(),
@@ -2567,6 +2595,142 @@ fn ensure_memory_visible_to_user(
     }
 }
 
+#[derive(Debug, Clone)]
+struct CliConversationExchange {
+    created_at: String,
+    state: String,
+    user_text: String,
+    assistant_text: String,
+    task_id: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CliConversationStatus {
+    FollowUp,
+    FreshStart,
+}
+
+fn build_cli_task_context(recent_exchanges: &[CliConversationExchange]) -> String {
+    let mut context = String::new();
+    context.push_str("CLI context:\n");
+    context.push_str("- Source: CLI.\n");
+    context.push_str(
+        "- Conversation history for CLI requests is scoped to this BeaverKI user and entrypoint.\n",
+    );
+
+    let Some(latest_exchange) = recent_exchanges.first() else {
+        context.push_str(
+            "- Conversation status: new conversation. No recent prior CLI exchange is available.\n",
+        );
+        context.push_str(
+            "- Treat the current command as a new conversation unless the user explicitly refers to older context.\n",
+        );
+        return context;
+    };
+
+    let age_text = latest_exchange_age_text(&latest_exchange.created_at)
+        .unwrap_or_else(|| "at an unknown time".to_owned());
+    match cli_conversation_status(&latest_exchange.state, &latest_exchange.created_at) {
+        CliConversationStatus::FollowUp => {
+            context.push_str(&format!(
+                "- Conversation status: active follow-up. The latest CLI exchange with this user was {}.\n",
+                age_text
+            ));
+            context.push_str(
+                "- Continue the prior topic only if the new command depends on it. If the user starts a new topic, answer the new topic directly.\n",
+            );
+            context.push_str("Recent attributed CLI exchanges:\n");
+            for exchange in recent_exchanges.iter().rev() {
+                context.push_str(&format!(
+                    "- [CLI] User: {}\n",
+                    compact_message_text(&exchange.user_text)
+                ));
+                context.push_str(&format!(
+                    "- [CLI] Assistant: {}\n",
+                    compact_message_text(&exchange.assistant_text)
+                ));
+            }
+        }
+        CliConversationStatus::FreshStart => {
+            context.push_str(&format!(
+                "- Conversation status: fresh conversation. The latest CLI exchange with this user was {}.\n",
+                age_text
+            ));
+            context.push_str(
+                "- Treat the current command as a new conversation unless the user explicitly refers to the earlier topic. Keep stable facts and preferences if they are reliable.\n",
+            );
+        }
+    }
+
+    context
+}
+
+fn cli_conversation_status(state: &str, created_at: &str) -> CliConversationStatus {
+    if matches!(
+        state.parse::<TaskState>(),
+        Ok(TaskState::Pending | TaskState::Running | TaskState::WaitingApproval)
+    ) {
+        return CliConversationStatus::FollowUp;
+    }
+
+    let Some(created_at) = parse_timestamp(created_at) else {
+        return CliConversationStatus::FreshStart;
+    };
+    let age = Utc::now().signed_duration_since(created_at).num_seconds();
+    if age <= CLI_ACTIVE_CONVERSATION_WINDOW_SECS {
+        CliConversationStatus::FollowUp
+    } else {
+        CliConversationStatus::FreshStart
+    }
+}
+
+fn latest_exchange_age_text(created_at: &str) -> Option<String> {
+    let created_at = parse_timestamp(created_at)?;
+    let age = Utc::now().signed_duration_since(created_at);
+    if age.num_minutes() < 1 {
+        Some("less than a minute ago".to_owned())
+    } else if age.num_hours() < 1 {
+        Some(format!("{} minutes ago", age.num_minutes()))
+    } else if age.num_days() < 1 {
+        Some(format!("{} hours ago", age.num_hours()))
+    } else {
+        Some(format!("{} days ago", age.num_days()))
+    }
+}
+
+fn parse_timestamp(value: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|timestamp| timestamp.with_timezone(&Utc))
+}
+
+fn assistant_reply_for_context(task: &TaskRow) -> String {
+    match task.state.parse::<TaskState>() {
+        Ok(TaskState::Completed) => task
+            .result_text
+            .clone()
+            .unwrap_or_else(|| "Task completed without a recorded reply.".to_owned()),
+        Ok(TaskState::WaitingApproval) => task.result_text.clone().unwrap_or_else(|| {
+            "The assistant is waiting for approval before it can continue.".to_owned()
+        }),
+        Ok(TaskState::Pending | TaskState::Running) => {
+            "The assistant is still working on that request.".to_owned()
+        }
+        Ok(TaskState::Failed) => task
+            .result_text
+            .clone()
+            .unwrap_or_else(|| "The assistant failed without a recorded explanation.".to_owned()),
+        Ok(TaskState::Blocked) | Err(_) => task
+            .result_text
+            .clone()
+            .unwrap_or_else(|| format!("Task state: {}.", task.state)),
+    }
+}
+
+fn compact_message_text(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 fn connector_type_from_events(events: &[TaskEventRow]) -> Option<String> {
     let event = events
         .iter()
@@ -2720,6 +2884,70 @@ mod tests {
                     .map(ToOwned::to_owned)
             })
             .unwrap_or_else(|| panic!("missing token for command '{command}' in reply: {reply}"))
+    }
+
+    #[tokio::test]
+    async fn build_primary_request_adds_cli_follow_up_context() {
+        let (_tempdir, runtime) = test_runtime(vec![]).await;
+        let user = runtime.default_user().clone();
+        let initiating_identity_id = format!("cli:{}", user.user_id);
+        let primary_agent_id = user
+            .primary_agent_id
+            .clone()
+            .expect("primary agent id");
+        let prior_task = runtime
+            .db
+            .create_task_with_params(NewTask {
+                owner_user_id: &user.user_id,
+                initiating_identity_id: &initiating_identity_id,
+                primary_agent_id: &primary_agent_id,
+                assigned_agent_id: &primary_agent_id,
+                parent_task_id: None,
+                kind: "interactive",
+                objective: "How late is it?",
+                context_summary: None,
+                scope: MemoryScope::Private,
+                wake_at: None,
+            })
+            .await
+            .expect("prior task");
+        runtime
+            .db
+            .complete_task(&prior_task.task_id, "It is 08:39 CEST on 2026-04-18.")
+            .await
+            .expect("complete prior task");
+
+        let request = runtime
+            .build_primary_request(
+                &user,
+                &initiating_identity_id,
+                "That is fine, but how do you know that?",
+                MemoryScope::Private,
+            )
+            .await
+            .expect("build request");
+
+        assert_eq!(request.parent_task_id.as_deref(), Some(prior_task.task_id.as_str()));
+        let context = request.task_context.as_deref().expect("task context");
+        assert!(context.contains("Conversation status: active follow-up"));
+        assert!(context.contains("[CLI] User: How late is it?"));
+        assert!(context.contains("[CLI] Assistant: It is 08:39 CEST on 2026-04-18."));
+    }
+
+    #[test]
+    fn cli_task_context_marks_stale_exchange_as_fresh_conversation() {
+        let stale_exchange = CliConversationExchange {
+            created_at: "2024-01-01T00:00:00Z".to_owned(),
+            state: TaskState::Completed.as_str().to_owned(),
+            user_text: "Old topic".to_owned(),
+            assistant_text: "Old answer".to_owned(),
+            task_id: "task_old".to_owned(),
+        };
+
+        let context = build_cli_task_context(&[stale_exchange]);
+
+        assert!(context.contains("Conversation status: fresh conversation"));
+        assert!(!context.contains("Recent attributed CLI exchanges"));
     }
 
     #[tokio::test]
