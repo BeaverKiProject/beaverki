@@ -1903,14 +1903,8 @@ impl PrimaryAgentRunner {
         let source_text = required_string_arg(&arguments, "source_text", "lua_tool_write")?;
         let intended_behavior_summary =
             required_string_arg(&arguments, "intended_behavior_summary", "lua_tool_write")?;
-        let input_schema = arguments
-            .get("input_schema")
-            .cloned()
-            .ok_or_else(|| ToolError::Failed(anyhow!("lua_tool_write requires input_schema")))?;
-        let output_schema = arguments
-            .get("output_schema")
-            .cloned()
-            .ok_or_else(|| ToolError::Failed(anyhow!("lua_tool_write requires output_schema")))?;
+        let input_schema = required_json_arg(&arguments, "input_schema", "lua_tool_write")?;
+        let output_schema = required_json_arg(&arguments, "output_schema", "lua_tool_write")?;
         let capability_profile =
             normalize_lua_capability_profile(arguments.get("capability_profile").cloned())
                 .map_err(ToolError::Failed)?;
@@ -2254,6 +2248,7 @@ impl PrimaryAgentRunner {
             description: description.to_owned(),
             input_schema: input_schema.clone(),
         }])?;
+        validate_json_schema_contract(input_schema)?;
         validate_json_schema_contract(output_schema)?;
         let _ = capability_profile;
         Ok(())
@@ -2983,25 +2978,15 @@ fn tool_definitions(tools: &ToolRegistry) -> Vec<ToolDefinition> {
     });
     definitions.push(ToolDefinition {
         name: "lua_tool_write".to_owned(),
-        description: "Create or update a database-backed Lua-defined tool, then run blocking safety review on it. Lua-defined tools execute through `return function(ctx) ... end` and read structured arguments from `ctx.input`. They may compose approved built-in tools via `ctx.tool_call` and use the reviewed Lua host helpers, but they must return JSON that matches the declared output schema. Rewriting an already active tool keeps it active if the new version passes safety review.".to_owned(),
+        description: "Create or update a database-backed Lua-defined tool, then run blocking safety review on it. Provide `input_schema` and `output_schema` as JSON-encoded schema objects. Lua-defined tools execute through `return function(ctx) ... end` and read structured arguments from `ctx.input`. They may compose approved built-in tools via `ctx.tool_call` and use the reviewed Lua host helpers, but they must return JSON that matches the declared output schema. Rewriting an already active tool keeps it active if the new version passes safety review.".to_owned(),
         input_schema: json!({
             "type": "object",
             "properties": {
                 "tool_id": { "type": "string" },
                 "description": { "type": "string" },
                 "source_text": { "type": "string" },
-                "input_schema": {
-                    "type": "object",
-                    "properties": {},
-                    "required": [],
-                    "additionalProperties": true
-                },
-                "output_schema": {
-                    "type": "object",
-                    "properties": {},
-                    "required": [],
-                    "additionalProperties": true
-                },
+                "input_schema": { "type": "string" },
+                "output_schema": { "type": "string" },
                 "capability_profile": {
                     "type": ["object", "null"],
                     "properties": {
@@ -3238,6 +3223,22 @@ fn required_string_arg<'a>(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| ToolError::Failed(anyhow!("{tool_name} requires {key}")))
+}
+
+fn required_json_arg(
+    arguments: &Value,
+    key: &str,
+    tool_name: &str,
+) -> std::result::Result<Value, ToolError> {
+    let value = arguments
+        .get(key)
+        .cloned()
+        .ok_or_else(|| ToolError::Failed(anyhow!("{tool_name} requires {key}")))?;
+
+    match value {
+        Value::String(raw) => parse_json_field(&raw, key).map_err(ToolError::Failed),
+        other => Ok(other),
+    }
 }
 
 fn optional_string_arg<'a>(arguments: &'a Value, key: &str) -> Option<&'a str> {
@@ -5172,6 +5173,25 @@ mod tests {
     }
 
     #[test]
+    fn lua_tool_write_schema_uses_json_encoded_schema_fields() {
+        let registry = builtin_registry();
+        let schema = tool_definitions(&registry)
+            .into_iter()
+            .find(|definition| definition.name == "lua_tool_write")
+            .expect("lua_tool_write definition")
+            .input_schema;
+
+        assert_eq!(
+            schema["properties"]["input_schema"]["type"],
+            json!("string")
+        );
+        assert_eq!(
+            schema["properties"]["output_schema"]["type"],
+            json!("string")
+        );
+    }
+
+    #[test]
     fn lua_guidance_mentions_current_host_api() {
         let registry = builtin_registry();
         let description = tool_definitions(&registry)
@@ -5421,13 +5441,38 @@ end"#,
 
     #[tokio::test]
     async fn agent_can_write_activate_and_invoke_lua_defined_tool() {
+        let input_schema_json = serde_json::to_string(&json!({
+            "type": "object",
+            "properties": { "name": { "type": "string" } },
+            "required": ["name"],
+            "additionalProperties": false
+        }))
+        .expect("input schema json");
+        let output_schema_json = serde_json::to_string(&json!({
+            "type": "object",
+            "properties": { "greeting": { "type": "string" } },
+            "required": ["greeting"],
+            "additionalProperties": false
+        }))
+        .expect("output schema json");
+        let tool_write_arguments = json!({
+            "tool_id": "tool_agent_greet",
+            "description": "Return a greeting object.",
+            "source_text": "return function(ctx)\n    return { greeting = 'hello ' .. ctx.input.name }\nend",
+            "input_schema": input_schema_json.clone(),
+            "output_schema": output_schema_json.clone(),
+            "capability_profile": {},
+            "intended_behavior_summary": "Return a JSON object containing a greeting for the provided name."
+        })
+        .to_string();
+
         let provider = FakeProvider::new(vec![
             ModelTurnResponse {
                 output_items: vec![json!({
                     "type": "function_call",
                     "call_id": "call_tool_write",
                     "name": "lua_tool_write",
-                    "arguments": "{\"tool_id\":\"tool_agent_greet\",\"description\":\"Return a greeting object.\",\"source_text\":\"return function(ctx)\\n    return { greeting = 'hello ' .. ctx.input.name }\\nend\",\"input_schema\":{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"}},\"required\":[\"name\"],\"additionalProperties\":false},\"output_schema\":{\"type\":\"object\",\"properties\":{\"greeting\":{\"type\":\"string\"}},\"required\":[\"greeting\"],\"additionalProperties\":false},\"capability_profile\":{},\"intended_behavior_summary\":\"Return a JSON object containing a greeting for the provided name.\"}"
+                    "arguments": tool_write_arguments.clone()
                 })],
                 tool_calls: vec![beaverki_models::ModelToolCall {
                     call_id: "call_tool_write".to_owned(),
@@ -5436,18 +5481,8 @@ end"#,
                         "tool_id": "tool_agent_greet",
                         "description": "Return a greeting object.",
                         "source_text": "return function(ctx)\n    return { greeting = 'hello ' .. ctx.input.name }\nend",
-                        "input_schema": {
-                            "type": "object",
-                            "properties": { "name": { "type": "string" } },
-                            "required": ["name"],
-                            "additionalProperties": false
-                        },
-                        "output_schema": {
-                            "type": "object",
-                            "properties": { "greeting": { "type": "string" } },
-                            "required": ["greeting"],
-                            "additionalProperties": false
-                        },
+                        "input_schema": input_schema_json,
+                        "output_schema": output_schema_json,
                         "capability_profile": {},
                         "intended_behavior_summary": "Return a JSON object containing a greeting for the provided name."
                     }),

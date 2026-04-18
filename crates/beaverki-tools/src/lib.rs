@@ -30,11 +30,37 @@ pub fn validate_openai_tool_definitions(definitions: &[ToolDefinition]) -> Resul
 }
 
 fn validate_openai_schema_node(schema: &Value, path: &str) -> Result<()> {
-    if let Some(properties) = schema.get("properties") {
+    let schema_object = schema
+        .as_object()
+        .ok_or_else(|| anyhow!("schema path '{}' must be an object", path))?;
+
+    let is_object_schema = schema_object.contains_key("properties")
+        || schema_object
+            .get("type")
+            .map(|types| {
+                schema_type_list(types, path)
+                    .map(|type_list| type_list.into_iter().any(|entry| entry == "object"))
+            })
+            .transpose()?
+            .unwrap_or(false);
+
+    if is_object_schema {
+        match schema_object.get("additionalProperties") {
+            Some(Value::Bool(false)) => {}
+            _ => {
+                bail!(
+                    "schema path '{}' must declare additionalProperties as false",
+                    path
+                )
+            }
+        }
+    }
+
+    if let Some(properties) = schema_object.get("properties") {
         let properties = properties
             .as_object()
             .ok_or_else(|| anyhow!("schema path '{}' has non-object properties", path))?;
-        let required = schema
+        let required = schema_object
             .get("required")
             .and_then(Value::as_array)
             .ok_or_else(|| anyhow!("schema path '{}' must declare required as an array", path))?;
@@ -66,12 +92,12 @@ fn validate_openai_schema_node(schema: &Value, path: &str) -> Result<()> {
         }
     }
 
-    if let Some(items) = schema.get("items") {
+    if let Some(items) = schema_object.get("items") {
         validate_openai_schema_node(items, &format!("{}.items", path))?;
     }
 
     for keyword in ["anyOf", "allOf", "oneOf"] {
-        if let Some(variants) = schema.get(keyword) {
+        if let Some(variants) = schema_object.get(keyword) {
             let variants = variants
                 .as_array()
                 .ok_or_else(|| anyhow!("schema path '{}.{}' must be an array", path, keyword))?;
@@ -1119,6 +1145,28 @@ mod tests {
         let definitions = builtin_registry().definitions();
 
         validate_openai_tool_definitions(&definitions).expect("valid tool schemas");
+    }
+
+    #[test]
+    fn rejects_openai_object_schemas_without_closed_properties() {
+        validate_openai_tool_definitions(&[ToolDefinition {
+            name: "demo".to_owned(),
+            description: "demo".to_owned(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {},
+                        "required": [],
+                        "additionalProperties": true
+                    }
+                },
+                "required": ["input_schema"],
+                "additionalProperties": false
+            }),
+        }])
+        .expect_err("schema should be rejected");
     }
 
     #[tokio::test]
