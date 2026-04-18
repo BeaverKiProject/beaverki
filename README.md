@@ -1,88 +1,127 @@
-# BeaverKi
+# BeaverKI
 
-BeaverKi is an open-source autonomous AI agent framework for running a personal, always-on digital assistant on your own hardware. It is a Beaver with Ki (a Japanese concept of energy or life force), a small but powerful helper that lives on your machine and can assist you and your family with a wide range of tasks through natural language interaction.
+BeaverKI is an open-source, local-first autonomous agent framework for running a personal or household assistant on hardware you control. It is built as a long-lived Rust runtime rather than a chat-only interface, so it can keep operating in the background, act through local tools, and preserve durable state on your machine.
 
-The goal is to build a local-first Rust platform that can:
+The project is aimed at a practical V1 that can:
 
-- operate continuously, not only as a chat UI
-- act on the local machine through tools
+- run continuously as a local daemon
 - support multiple human users in one household or deployment
-- use different LLM providers
-- enforce permissions and approvals
-- extend behavior through skills and Lua-based automation
+- use different model roles for planning, execution, summarization, and safety review
+- enforce permissions and approvals for risky actions
+- act through shell, filesystem, browser, messaging, and automation capabilities
+- keep tasks, memory, approvals, and audit history local and inspectable
 
-Planned capabilities include:
+The longer-term goal is a trusted digital companion that stays understandable to non-technical users while still giving advanced users full control over data, policy, and automation.
 
-- terminal command execution
-- filesystem access
-- browser automation
-- messaging integration
-- recurring background work
-- persistent memory
-- dynamic sub-agents
+## Current State
 
-## Current Status
+BeaverKI already has a usable local runtime foundation. Today the repository includes:
 
-The repository now includes:
-
-- `M0 Foundation`
-- `M1 Core Multi-User`
-- `M1.5 Runtime Daemon`
-- `M2 Integrations`
-
-Implemented so far:
-
-- product design document
-- V1 technical spec
-- GitHub-native contributor workflow
-- issue and PR templates
-- Rust workspace and crate boundaries for the core runtime
+- a Rust workspace with separated crates for runtime, CLI, config, policy, memory, models, tools, automation, and storage
 - encrypted local OpenAI credential storage
-- SQLite-backed task, memory, tool-invocation, and audit persistence
-- multi-user CLI setup and task execution flow
-- built-in roles: `owner`, `adult`, `child`, `guest`, `service`
-- per-user primary agents
-- private versus household memory visibility at retrieval time
-- CLI approval flow for risky shell commands
-- bounded sub-agent spawning with explicit task slices
-- shell and filesystem tools for the primary agent
-- browser tooling with interactive and headless modes
-- Discord bot configuration and encrypted token storage
-- Discord identity mapping, DM intake, allowlisted channel intake, and approval routing
+- SQLite-backed persistence for tasks, memory, approvals, tool invocations, and audit data
+- one persistent primary agent per user plus bounded sub-agents for task slices
+- built-in household roles: `owner`, `adult`, `child`, `guest`, `service`
+- private and household memory scopes enforced at retrieval time
+- CLI-first setup, daemon lifecycle, and task execution
+- shell, filesystem, and browser tools for the primary agent
+- Discord connector setup, identity mapping, DM intake, allowlisted channel intake, and approval routing
+- Lua scripting with review and activation flow
 - CI for formatting, linting, and tests
 
-Still intentionally out of scope:
+Still intentionally out of scope for the current milestone:
 
-- Lua runtime
 - safety-agent review flows
 
-Implementation remains staged. The next platform milestone is `M3 Automation`.
+## How BeaverKI Works Today
 
-## Project Direction
+The current V1 direction is:
 
-Current decisions for V1:
-
-- Rust-based runtime
-- SQLite-first operational state
-- YAML configuration
-- Markdown exports and human-readable summaries
+- a Rust-based local runtime
+- SQLite-first operational state with YAML configuration
 - one persistent primary agent per user
-- dynamic ephemeral sub-agents
-- Discord as the first messaging connector
+- dynamic ephemeral sub-agents with bounded context handoff
 - OpenAI as the first model provider
+- Discord as the first messaging connector
 - blocking safety review for Lua scripts
-- safety review for medium/high/critical generated shell commands
+- approval gates for medium, high, and critical generated shell actions
 
-## Delivery Plan
+Operationally, that means BeaverKI is already useful as a local, multi-user assistant runtime, but it is still early-stage software and currently optimized for CLI-driven setup and operation.
 
-The milestone plan and pre-issue implementation stories live in:
+## Get BeaverKI Running For A Household
 
-- [Delivery Plan](docs/delivery-plan.md)
+The shortest path is to use the Makefile targets for setup and daily operations, then drop into the direct CLI only when you need more control.
 
-This keeps the README short while letting the delivery plan evolve separately from the product and technical specs.
+1. Install the local prerequisites.
+
+	You need a Rust toolchain with `cargo`, plus `make`. BeaverKI currently runs as a local Rust workspace and uses OpenAI for the initial provider integration.
+
+2. Export an OpenAI API key.
+
+	```bash
+	export OPENAI_API_KEY="your-openai-api-key"
+	```
+
+3. Initialize BeaverKI on the machine that will host the household runtime.
+
+	```bash
+	make setup
+	```
+
+	The setup flow creates the runtime config, provider config, integration config, encrypted secret reference, and the initial owner user. It will ask for an instance ID, owner display name, workspace root, and a master passphrase for encrypted local secrets.
+
+4. Start the daemon.
+
+	```bash
+	make daemon-start
+	```
+
+	BeaverKI keeps decrypted provider credentials only in memory for the runtime process. If `BEAVERKI_MASTER_PASSPHRASE` is not set, the daemon will prompt for it.
+
+5. Review the built-in roles and add the rest of the household.
+
+	```bash
+	make role-list
+	make user-add DISPLAY_NAME="Casey" USER_ARGS='--role adult'
+	make user-add DISPLAY_NAME="Sam" USER_ARGS='--role child'
+	make user-list
+	```
+
+	Setup creates the owner automatically. Each additional user receives a dedicated user ID and a persistent primary agent.
+
+6. Run a first task to verify the runtime.
+
+	```bash
+	make run-task OBJECTIVE="Summarize the repository status and list the docs folder."
+	```
+
+	For a household member other than the owner, pass the generated user ID through `TASK_ARGS`, for example `TASK_ARGS='--user user_casey'`.
+
+7. Inspect the recorded task and any pending approvals.
+
+	```bash
+	make show-task TASK_ID=<task-id>
+	make approval-list
+	```
+
+	If a risky action was paused for approval, approve or deny it from the CLI before the task continues.
+
+8. Optionally connect Discord for remote household use.
+
+	Store a bot token, enable the connector, then map each Discord user ID to a BeaverKI user. Direct messages are accepted by default; guild messages are accepted only from allowlisted channel IDs. For the full setup flow, see [Discord Setup Guide](docs/discord-setup.md).
+
+9. Stop the daemon when you are done.
+
+	```bash
+	make daemon-stop
+	```
+
+For the direct CLI forms of these commands, model configuration, memory inspection, Discord mapping, and automation commands, see [CLI and Operations Guide](docs/cli-operations.md).
 
 ## Documentation
 
+- [CLI and Operations Guide](docs/cli-operations.md)
+- [Discord Setup Guide](docs/discord-setup.md)
 - [Product Design](docs/design.md)
 - [V1 Technical Spec](docs/technical-spec.md)
 - [Delivery Plan](docs/delivery-plan.md)
@@ -104,76 +143,9 @@ Every material change should start from an issue with clear acceptance criteria.
 
 ## Near-Term Next Steps
 
-- add Discord and browser integrations on top of the daemon
 - expand the daemon into richer connector-driven and scheduled background work
+- deepen Discord and browser workflows on top of the existing runtime
 - add safety review flows for risky generated actions and scripts
-
-## Quick Start
-
-1. Run `make setup`.
-2. Enter an OpenAI API key and a local master passphrase when prompted.
-3. Run `make daemon-start`.
-4. Run `make user-list`.
-5. Run `make run-task OBJECTIVE="Summarize the current README and list the docs folder."`
-6. Inspect the recorded task with `make show-task TASK_ID=<task-id>`.
-7. Run `make daemon-stop` when you are done.
-
-Default storage locations are now platform-standard:
-
-- Linux: `~/.config/beaverki` for config and `~/.local/share/beaverki` or `~/.local/state/beaverki` for runtime state
-- macOS: `~/Library/Application Support/beaverki`
-- Windows: `%APPDATA%\beaverki` and `%LOCALAPPDATA%\beaverki`
-
-You can also call the CLI directly:
-
-```bash
-cargo run -p beaverki-cli -- setup verify-openai
-cargo run -p beaverki-cli -- setup init
-cargo run -p beaverki-cli -- setup show-models
-cargo run -p beaverki-cli -- setup set-models --planner-model gpt-5.4 --executor-model gpt-5.4-mini --summarizer-model gpt-5.4-mini
-cargo run -p beaverki-cli -- daemon start
-cargo run -p beaverki-cli -- daemon status
-cargo run -p beaverki-cli -- daemon stop
-cargo run -p beaverki-cli -- connector discord show
-cargo run -p beaverki-cli -- connector discord configure --enable --allow-channel 1234567890
-cargo run -p beaverki-cli -- connector discord map-user --external-user-id 111111111111111111 --mapped-user-id user_casey
-cargo run -p beaverki-cli -- connector discord list-mappings
-cargo run -p beaverki-cli -- role list
-cargo run -p beaverki-cli -- user list
-cargo run -p beaverki-cli -- user add --display-name Casey --role adult
-cargo run -p beaverki-cli -- task run --objective "Inspect the repository and summarize it."
-cargo run -p beaverki-cli -- task run --user user_casey --objective "Inspect the repository and summarize it."
-cargo run -p beaverki-cli -- task show --task-id <task-id>
-cargo run -p beaverki-cli -- memory list
-cargo run -p beaverki-cli -- memory show --memory-id <memory-id>
-cargo run -p beaverki-cli -- memory history --subject-key profile.preferred_name
-cargo run -p beaverki-cli -- memory forget --memory-id <memory-id> --reason "Wrong fact"
-cargo run -p beaverki-cli -- approval list
-cargo run -p beaverki-cli -- approval approve --approval-id <approval-id>
-```
-
-Use `--config-dir` if you want a non-default location.
-
-`setup init` verifies the OpenAI API key unless `--skip-openai-check` is passed. The API token is stored in an age-encrypted local secret file under the BeaverKI state directory. `daemon start` and `daemon run` read the master passphrase from `BEAVERKI_MASTER_PASSPHRASE` when available, otherwise they prompt for it.
-
-Enable Discord by storing a bot token with `connector discord configure --enable`, then map each Discord user ID to a BeaverKI user with `connector discord map-user`. Direct messages are accepted by default; guild messages are accepted only from allowlisted channel IDs and only when they start with the configured command prefix.
-
-The daemon keeps the decrypted provider credentials only in memory for the current runtime process. Start it once with `daemon start` or `daemon run`, then use the existing `task` and `approval` CLI commands against the local socket.
-
-The initial defaults are:
-
-- planner: `gpt-5.4`
-- executor: `gpt-5.4-mini`
-- summarizer: `gpt-5.4-mini`
-
-After setup, use `setup show-models` and `setup set-models` to inspect or change them without editing YAML manually.
-
-Multi-user notes:
-
-- each user gets one persistent primary agent
-- `task run --user <user-id>` executes as that user
-- task inspection is owner-scoped
-- `approval list`, `approval approve`, and `approval deny` operate on the selected user's pending approvals
 
 ## Repository
 
