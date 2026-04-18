@@ -232,7 +232,13 @@ impl PrimaryAgentRunner {
                 )
                 .await?;
 
-            info!("model turn finished for task {}", task.task_id);
+            info!(
+                task_id = %task.task_id,
+                model_name = %model_name,
+                input_tokens = ?response.usage.as_ref().and_then(|usage| usage.input_tokens),
+                output_tokens = ?response.usage.as_ref().and_then(|usage| usage.output_tokens),
+                "model turn finished"
+            );
 
             for item in &response.output_items {
                 conversation.push(ConversationItem::AssistantOutput(item.clone()));
@@ -246,7 +252,10 @@ impl PrimaryAgentRunner {
                     &request.assigned_agent_id,
                     json!({
                         "step": step,
+                        "model_name": model_name,
                         "tool_call_count": response.tool_calls.len(),
+                        "input_tokens": response.usage.as_ref().and_then(|usage| usage.input_tokens),
+                        "output_tokens": response.usage.as_ref().and_then(|usage| usage.output_tokens),
                         "output_text": response.output_text,
                     }),
                 )
@@ -2429,6 +2438,7 @@ mod tests {
                     arguments: json!({ "command": "mkdir /tmp/m1_approval" }),
                 }],
                 output_text: String::new(),
+                usage: None,
             },
             ModelTurnResponse {
                 output_items: vec![json!({
@@ -2440,6 +2450,7 @@ mod tests {
                 })],
                 tool_calls: vec![],
                 output_text: "{\"verdict\":\"approved\",\"risk_level\":\"high\",\"findings\":[],\"required_changes\":[],\"summary\":\"The command matches the task and is acceptable with explicit approval.\"}".to_owned(),
+                usage: None,
             },
             ModelTurnResponse {
                 output_items: vec![json!({
@@ -2454,6 +2465,7 @@ mod tests {
                     arguments: json!({ "command": "mkdir /tmp/m1_approval" }),
                 }],
                 output_text: String::new(),
+                usage: None,
             },
             ModelTurnResponse {
                 output_items: vec![json!({
@@ -2462,6 +2474,7 @@ mod tests {
                 })],
                 tool_calls: vec![],
                 output_text: "finished".to_owned(),
+                usage: None,
             },
         ]);
         let (db, runner) = test_runner(provider).await;
@@ -2563,6 +2576,7 @@ mod tests {
                     }),
                 }],
                 output_text: String::new(),
+                usage: None,
             },
             ModelTurnResponse {
                 output_items: vec![json!({
@@ -2571,6 +2585,7 @@ mod tests {
                 })],
                 tool_calls: vec![],
                 output_text: "child done".to_owned(),
+                usage: None,
             },
             ModelTurnResponse {
                 output_items: vec![json!({
@@ -2579,6 +2594,7 @@ mod tests {
                 })],
                 tool_calls: vec![],
                 output_text: "parent done".to_owned(),
+                usage: None,
             },
         ]);
         let (db, runner) = test_runner(provider).await;
@@ -2639,6 +2655,7 @@ mod tests {
                     arguments: json!({ "command": "mkdir /tmp/rejected_by_safety" }),
                 }],
                 output_text: String::new(),
+                usage: None,
             },
             ModelTurnResponse {
                 output_items: vec![json!({
@@ -2650,6 +2667,7 @@ mod tests {
                 })],
                 tool_calls: vec![],
                 output_text: "{\"verdict\":\"rejected\",\"risk_level\":\"high\",\"findings\":[\"Creates a directory without enough justification.\"],\"required_changes\":[\"Use a read-only inspection command or provide a safer plan.\"],\"summary\":\"The shell command is riskier than necessary for the task.\"}".to_owned(),
+                usage: None,
             },
         ]);
         let (db, runner) = test_runner(provider).await;
@@ -2714,6 +2732,7 @@ mod tests {
                     }),
                 }],
                 output_text: String::new(),
+                usage: None,
             },
             ModelTurnResponse {
                 output_items: vec![json!({
@@ -2725,6 +2744,7 @@ mod tests {
                 })],
                 tool_calls: vec![],
                 output_text: "{\"verdict\":\"approved\",\"risk_level\":\"low\",\"findings\":[],\"required_changes\":[],\"summary\":\"The Lua automation matches the stated intent.\"}".to_owned(),
+                usage: None,
             },
             ModelTurnResponse {
                 output_items: vec![json!({
@@ -2739,6 +2759,7 @@ mod tests {
                     arguments: json!({ "script_id": "script_agent_test" }),
                 }],
                 output_text: String::new(),
+                usage: None,
             },
             ModelTurnResponse {
                 output_items: vec![json!({
@@ -2753,6 +2774,7 @@ mod tests {
                     arguments: json!({ "script_id": "script_agent_test" }),
                 }],
                 output_text: String::new(),
+                usage: None,
             },
             ModelTurnResponse {
                 output_items: vec![json!({
@@ -2767,6 +2789,7 @@ mod tests {
                     arguments: json!({ "script_id": "script_agent_test" }),
                 }],
                 output_text: String::new(),
+                usage: None,
             },
             ModelTurnResponse {
                 output_items: vec![json!({
@@ -2775,6 +2798,7 @@ mod tests {
                 })],
                 tool_calls: vec![],
                 output_text: "automation complete".to_owned(),
+                usage: None,
             },
         ]);
         let (db, runner) = test_runner(provider).await;
@@ -2895,6 +2919,7 @@ mod tests {
                     }),
                 }],
                 output_text: String::new(),
+                usage: None,
             },
             ModelTurnResponse {
                 output_items: vec![json!({
@@ -2906,6 +2931,7 @@ mod tests {
                 })],
                 tool_calls: vec![],
                 output_text: "{\"verdict\":\"approved\",\"risk_level\":\"low\",\"findings\":[],\"required_changes\":[],\"summary\":\"The rewritten Lua automation matches the stated intent.\"}".to_owned(),
+                usage: None,
             },
             ModelTurnResponse {
                 output_items: vec![json!({
@@ -2914,6 +2940,7 @@ mod tests {
                 })],
                 tool_calls: vec![],
                 output_text: "rewrite complete".to_owned(),
+                usage: None,
             },
         ]);
         let (db, runner) = test_runner(provider).await;
@@ -2998,6 +3025,7 @@ mod tests {
                     }),
                 }],
                 output_text: String::new(),
+                usage: None,
             },
             ModelTurnResponse {
                 output_items: vec![json!({
@@ -3009,6 +3037,7 @@ mod tests {
                 })],
                 tool_calls: vec![],
                 output_text: "{\"verdict\":\"needs_changes\",\"risk_level\":\"medium\",\"findings\":[\"The script behavior is still too broad.\"],\"required_changes\":[\"Constrain the script before activation.\"],\"summary\":\"The automation needs changes before it can be trusted.\"}".to_owned(),
+                usage: None,
             },
             ModelTurnResponse {
                 output_items: vec![json!({
@@ -3017,6 +3046,7 @@ mod tests {
                 })],
                 tool_calls: vec![],
                 output_text: "write complete".to_owned(),
+                usage: None,
             },
         ]);
         let (db, runner) = test_runner(provider).await;
@@ -3080,6 +3110,7 @@ mod tests {
                     }),
                 }],
                 output_text: String::new(),
+                usage: None,
             },
             ModelTurnResponse {
                 output_items: vec![json!({
@@ -3099,6 +3130,7 @@ mod tests {
                     }),
                 }],
                 output_text: String::new(),
+                usage: None,
             },
             ModelTurnResponse {
                 output_items: vec![json!({
@@ -3107,6 +3139,7 @@ mod tests {
                 })],
                 tool_calls: vec![],
                 output_text: "schedule complete".to_owned(),
+                usage: None,
             },
         ]);
         let (db, runner) = test_runner(provider).await;
@@ -3228,6 +3261,7 @@ mod tests {
                     }),
                 }],
                 output_text: String::new(),
+                usage: None,
             },
             ModelTurnResponse {
                 output_items: vec![json!({
@@ -3239,6 +3273,7 @@ mod tests {
                 })],
                 tool_calls: vec![],
                 output_text: "{\"verdict\":\"approved\",\"risk_level\":\"low\",\"findings\":[],\"required_changes\":[],\"summary\":\"The Lua automation matches the stated intent.\"}".to_owned(),
+                usage: None,
             },
             ModelTurnResponse {
                 output_items: vec![json!({
@@ -3253,6 +3288,7 @@ mod tests {
                     arguments: json!({ "script_id": "script_guest_test" }),
                 }],
                 output_text: String::new(),
+                usage: None,
             },
         ]);
         let (db, runner) = test_runner(provider).await;
@@ -3324,6 +3360,7 @@ mod tests {
                     arguments: json!({ "command": "mkdir /tmp/non_approver_shell" }),
                 }],
                 output_text: String::new(),
+                usage: None,
             },
             ModelTurnResponse {
                 output_items: vec![json!({
@@ -3335,6 +3372,7 @@ mod tests {
                 })],
                 tool_calls: vec![],
                 output_text: "{\"verdict\":\"approved\",\"risk_level\":\"high\",\"findings\":[],\"required_changes\":[],\"summary\":\"The command matches the task and is acceptable with explicit approval.\"}".to_owned(),
+                usage: None,
             },
         ]);
         let (db, runner) = test_runner(provider).await;
@@ -3406,6 +3444,7 @@ mod tests {
                     }),
                 }],
                 output_text: String::new(),
+                usage: None,
             },
             ModelTurnResponse {
                 output_items: vec![json!({
@@ -3414,6 +3453,7 @@ mod tests {
                 })],
                 tool_calls: vec![],
                 output_text: "remembered".to_owned(),
+                usage: None,
             },
         ]);
         let (db, runner) = test_runner(provider).await;
@@ -3490,6 +3530,7 @@ mod tests {
                     }),
                 }],
                 output_text: String::new(),
+                usage: None,
             },
             ModelTurnResponse {
                 output_items: vec![json!({
@@ -3498,6 +3539,7 @@ mod tests {
                 })],
                 tool_calls: vec![],
                 output_text: "updated".to_owned(),
+                usage: None,
             },
         ]);
         let (db, runner) = test_runner(provider).await;
@@ -3599,6 +3641,7 @@ mod tests {
                     }),
                 }],
                 output_text: String::new(),
+                usage: None,
             },
             ModelTurnResponse {
                 output_items: vec![json!({
@@ -3621,6 +3664,7 @@ mod tests {
                     }),
                 }],
                 output_text: String::new(),
+                usage: None,
             },
             ModelTurnResponse {
                 output_items: vec![json!({
@@ -3630,6 +3674,7 @@ mod tests {
                 tool_calls: vec![],
                 output_text: "Added Milch and persisted the updated household shopping list."
                     .to_owned(),
+                usage: None,
             },
         ]);
         let (db, runner) = test_runner(provider).await;
@@ -3742,6 +3787,7 @@ mod tests {
                     }),
                 }],
                 output_text: String::new(),
+                usage: None,
             },
             ModelTurnResponse {
                 output_items: vec![json!({
@@ -3750,6 +3796,7 @@ mod tests {
                 })],
                 tool_calls: vec![],
                 output_text: "could not store household memory".to_owned(),
+                usage: None,
             },
         ]);
         let (db, runner) = test_runner(provider).await;
@@ -3821,6 +3868,7 @@ mod tests {
                     }),
                 }],
                 output_text: String::new(),
+                usage: None,
             },
             ModelTurnResponse {
                 output_items: vec![json!({
@@ -3843,6 +3891,7 @@ mod tests {
                     }),
                 }],
                 output_text: String::new(),
+                usage: None,
             },
             ModelTurnResponse {
                 output_items: vec![json!({
@@ -3851,6 +3900,7 @@ mod tests {
                 })],
                 tool_calls: vec![],
                 output_text: "stored household memory".to_owned(),
+                usage: None,
             },
         ]);
         let (db, runner) = test_runner(provider).await;
@@ -4019,6 +4069,7 @@ mod tests {
             })],
             tool_calls: vec![],
             output_text: "ok".to_owned(),
+            usage: None,
         }]);
         let prompts = provider.prompts();
         let (db, runner) = test_runner_with_provider(Arc::new(provider)).await;

@@ -12,6 +12,7 @@ beaverki-tools = { path = "../beaverki-tools" }
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+tracing.workspace = true
 
 [lints]
 workspace = true

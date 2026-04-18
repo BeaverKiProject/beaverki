@@ -4002,6 +4002,7 @@ mod tests {
             })],
             tool_calls: vec![],
             output_text: "daemon done".to_owned(),
+            usage: None,
         }])
         .await;
         let db = runtime.db.clone();
@@ -4050,6 +4051,7 @@ mod tests {
             })],
             tool_calls: vec![],
             output_text: "recovered".to_owned(),
+            usage: None,
         }])
         .await;
         let queued = runtime
@@ -4090,6 +4092,7 @@ mod tests {
             })],
             tool_calls: vec![],
             output_text: "{\"verdict\":\"approved\",\"risk_level\":\"low\",\"findings\":[],\"required_changes\":[],\"summary\":\"The Lua automation matches the stated intent.\"}".to_owned(),
+            usage: None,
         }])
         .await;
         let db = runtime.db.clone();
@@ -4157,6 +4160,7 @@ end"#,
             })],
             tool_calls: vec![],
             output_text: "{\"verdict\":\"approved\",\"risk_level\":\"low\",\"findings\":[],\"required_changes\":[],\"summary\":\"The Lua automation matches the stated intent.\"}".to_owned(),
+            usage: None,
         }])
         .await;
         let db = runtime.db.clone();
@@ -4222,6 +4226,7 @@ return "top level ok""#,
             })],
             tool_calls: vec![],
             output_text: "{\"verdict\":\"needs_changes\",\"risk_level\":\"medium\",\"findings\":[\"Writes files more broadly than needed.\"],\"required_changes\":[\"Limit writes to the intended target.\"],\"summary\":\"The script needs a narrower scope before it can be trusted.\"}".to_owned(),
+            usage: None,
         }])
         .await;
 
@@ -4315,6 +4320,7 @@ end"#,
             })],
             tool_calls: vec![],
             output_text: "{\"verdict\":\"approved\",\"risk_level\":\"low\",\"findings\":[],\"required_changes\":[],\"summary\":\"The Lua automation matches the stated intent.\"}".to_owned(),
+            usage: None,
         }])
         .await;
         let db = runtime.db.clone();
@@ -4399,6 +4405,7 @@ end"#,
             })],
             tool_calls: vec![],
             output_text: "{\"verdict\":\"approved\",\"risk_level\":\"low\",\"findings\":[],\"required_changes\":[],\"summary\":\"The Lua automation matches the stated intent.\"}".to_owned(),
+            usage: None,
         }])
         .await;
         let script = runtime
@@ -4479,6 +4486,7 @@ end"#,
             })],
             tool_calls: vec![],
             output_text: "discord done".to_owned(),
+            usage: None,
         }])
         .await;
         runtime.config.integrations.discord.allowed_channel_ids = vec!["channel-1".to_owned()];
@@ -4532,6 +4540,7 @@ end"#,
                 })],
                 tool_calls: vec![],
                 output_text: "channel reply".to_owned(),
+                usage: None,
             },
             ModelTurnResponse {
                 output_items: vec![json!({
@@ -4540,6 +4549,7 @@ end"#,
                 })],
                 tool_calls: vec![],
                 output_text: "dm reply".to_owned(),
+                usage: None,
             },
         ])
         .await;
@@ -4627,6 +4637,7 @@ end"#,
                     arguments: json!({ "command": "mkdir approved-dir" }),
                 }],
                 output_text: String::new(),
+                usage: None,
             },
             ModelTurnResponse {
                 output_items: vec![json!({
@@ -4638,6 +4649,7 @@ end"#,
                 })],
                 tool_calls: vec![],
                 output_text: "{\"verdict\":\"approved\",\"risk_level\":\"high\",\"findings\":[],\"required_changes\":[],\"summary\":\"The command matches the task and is acceptable with explicit approval.\"}".to_owned(),
+                usage: None,
             },
             ModelTurnResponse {
                 output_items: vec![json!({
@@ -4652,6 +4664,7 @@ end"#,
                     arguments: json!({ "command": "mkdir approved-dir" }),
                 }],
                 output_text: String::new(),
+                usage: None,
             },
             ModelTurnResponse {
                 output_items: vec![json!({
@@ -4660,6 +4673,7 @@ end"#,
                 })],
                 tool_calls: vec![],
                 output_text: "approved through discord".to_owned(),
+                usage: None,
             },
         ])
         .await;
@@ -4756,6 +4770,7 @@ end"#,
                     arguments: json!({ "command": "mkdir approved-dir" }),
                 }],
                 output_text: String::new(),
+                usage: None,
             },
             ModelTurnResponse {
                 output_items: vec![json!({
@@ -4767,6 +4782,7 @@ end"#,
                 })],
                 tool_calls: vec![],
                 output_text: "{\"verdict\":\"approved\",\"risk_level\":\"high\",\"findings\":[],\"required_changes\":[],\"summary\":\"The command matches the task and is acceptable with explicit approval.\"}".to_owned(),
+                usage: None,
             },
             ModelTurnResponse {
                 output_items: vec![json!({
@@ -4781,6 +4797,7 @@ end"#,
                     arguments: json!({ "command": "mkdir approved-dir" }),
                 }],
                 output_text: String::new(),
+                usage: None,
             },
             ModelTurnResponse {
                 output_items: vec![json!({
@@ -4789,6 +4806,7 @@ end"#,
                 })],
                 tool_calls: vec![],
                 output_text: "approved from dm inbox".to_owned(),
+                usage: None,
             },
         ])
         .await;
@@ -4899,6 +4917,7 @@ end"#,
                     arguments: json!({ "command": "mkdir approved-dir" }),
                 }],
                 output_text: String::new(),
+                usage: None,
             },
             ModelTurnResponse {
                 output_items: vec![json!({
@@ -4910,6 +4929,7 @@ end"#,
                 })],
                 tool_calls: vec![],
                 output_text: "{\"verdict\":\"approved\",\"risk_level\":\"high\",\"findings\":[],\"required_changes\":[],\"summary\":\"The command matches the task and is acceptable with explicit approval.\"}".to_owned(),
+                usage: None,
             },
             ModelTurnResponse {
                 output_items: vec![json!({
@@ -4924,6 +4944,7 @@ end"#,
                     arguments: json!({ "command": "mkdir approved-dir" }),
                 }],
                 output_text: String::new(),
+                usage: None,
             },
             ModelTurnResponse {
                 output_items: vec![json!({
@@ -4932,6 +4953,7 @@ end"#,
                 })],
                 tool_calls: vec![],
                 output_text: "approved through discord".to_owned(),
+                usage: None,
             },
         ])
         .await;
@@ -5024,6 +5046,7 @@ end"#,
                     arguments: json!({ "command": "mkdir approved-dir" }),
                 }],
                 output_text: String::new(),
+                usage: None,
             },
             ModelTurnResponse {
                 output_items: vec![json!({
@@ -5035,6 +5058,7 @@ end"#,
                 })],
                 tool_calls: vec![],
                 output_text: "{\"verdict\":\"approved\",\"risk_level\":\"high\",\"findings\":[],\"required_changes\":[],\"summary\":\"The command matches the task and is acceptable with explicit approval.\"}".to_owned(),
+                usage: None,
             },
         ])
         .await;
@@ -5126,6 +5150,7 @@ end"#,
                     arguments: json!({ "command": "rm critical-dir" }),
                 }],
                 output_text: String::new(),
+                usage: None,
             },
             ModelTurnResponse {
                 output_items: vec![json!({
@@ -5137,6 +5162,7 @@ end"#,
                 })],
                 tool_calls: vec![],
                 output_text: "{\"verdict\":\"approved\",\"risk_level\":\"critical\",\"findings\":[],\"required_changes\":[],\"summary\":\"The command is acceptable only with explicit confirmation.\"}".to_owned(),
+                usage: None,
             },
             ModelTurnResponse {
                 output_items: vec![json!({
@@ -5151,6 +5177,7 @@ end"#,
                     arguments: json!({ "command": "rm critical-dir" }),
                 }],
                 output_text: String::new(),
+                usage: None,
             },
             ModelTurnResponse {
                 output_items: vec![json!({
@@ -5159,6 +5186,7 @@ end"#,
                 })],
                 tool_calls: vec![],
                 output_text: "critical approval completed".to_owned(),
+                usage: None,
             },
         ])
         .await;

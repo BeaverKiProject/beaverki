@@ -5,6 +5,7 @@ use beaverki_tools::ToolDefinition;
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use tracing::info;
 
 #[derive(Debug, Clone)]
 pub enum ConversationItem {
@@ -25,6 +26,13 @@ pub struct ModelTurnResponse {
     pub output_items: Vec<Value>,
     pub tool_calls: Vec<ModelToolCall>,
     pub output_text: String,
+    pub usage: Option<ModelTokenUsage>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ModelTokenUsage {
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
 }
 
 #[async_trait]
@@ -44,6 +52,8 @@ pub trait ModelProvider: Send + Sync {
 pub struct OpenAiProvider {
     client: Client,
     api_token: String,
+    provider_id: String,
+    provider_kind: String,
     models: ProviderModels,
 }
 
@@ -56,6 +66,8 @@ impl OpenAiProvider {
         Ok(Self {
             client: Client::new(),
             api_token,
+            provider_id: entry.provider_id.clone(),
+            provider_kind: entry.kind.clone(),
             models: entry.models.clone(),
         })
     }
@@ -126,10 +138,25 @@ impl ModelProvider for OpenAiProvider {
             .filter_map(parse_tool_call)
             .collect::<Result<Vec<_>>>()?;
 
+        let usage = parsed.usage.map(|usage| ModelTokenUsage {
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+        });
+
+        info!(
+            provider_id = %self.provider_id,
+            provider_kind = %self.provider_kind,
+            model_name = %model_name,
+            input_tokens = ?usage.as_ref().and_then(|item| item.input_tokens),
+            output_tokens = ?usage.as_ref().and_then(|item| item.output_tokens),
+            "model turn completed"
+        );
+
         Ok(ModelTurnResponse {
             output_text: extract_output_text(&parsed.output),
             output_items: parsed.output,
             tool_calls,
+            usage,
         })
     }
 }
@@ -137,6 +164,13 @@ impl ModelProvider for OpenAiProvider {
 #[derive(Debug, Deserialize)]
 struct ResponsesApiResponse {
     output: Vec<Value>,
+    usage: Option<ResponsesApiUsage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResponsesApiUsage {
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
 }
 
 fn render_conversation(conversation: &[ConversationItem]) -> Vec<Value> {
@@ -298,5 +332,28 @@ mod tests {
 
         assert_eq!(parsed.name, "filesystem_read_text");
         assert_eq!(parsed.arguments["path"], "README.md");
+    }
+
+    #[test]
+    fn deserializes_usage_from_response_payload() {
+        let parsed: ResponsesApiResponse = serde_json::from_value(json!({
+            "output": [],
+            "usage": {
+                "input_tokens": 123,
+                "output_tokens": 45
+            }
+        }))
+        .expect("response payload");
+
+        assert_eq!(
+            parsed.usage.map(|usage| ModelTokenUsage {
+                input_tokens: usage.input_tokens,
+                output_tokens: usage.output_tokens,
+            }),
+            Some(ModelTokenUsage {
+                input_tokens: Some(123),
+                output_tokens: Some(45),
+            })
+        );
     }
 }
