@@ -253,7 +253,95 @@ Exit criteria:
 - guests cannot retrieve household brain/memory
 - semantic memory behavior is auditable end to end
 
-## 3.8 M4.5 Lua-Defined Tools
+## 3.8 M4.5 Session-Scoped Conversation Context
+
+Goal:
+
+Introduce first-class conversation sessions so BeaverKI separates transcript continuity from durable memory and task audit history.
+
+Status:
+
+- proposed as the next milestone after M4
+
+Implementation notes:
+
+- add a first-class `conversation_sessions` model and attach every new interactive or scheduled task to one session
+- session kinds should start with `direct_message`, `group_room`, `cli`, and `cron_run`
+- direct-message sessions should be keyed to the mapped BeaverKI user and shared across DM entrypoints for that user rather than tied to a single raw DM channel identifier
+- group or room sessions should be keyed to the shared connector target, such as connector plus workspace plus channel or thread, and should carry audience policy plus a maximum memory scope cap
+- the effective memory scope for a session should be the intersection of the acting user's visible scopes and the session's maximum memory scope
+- cron jobs should create a fresh session per run and should not inherit transcript continuity from prior runs
+- user-facing session reset commands such as `/new` should be intercepted by the intake layer and handled directly by the runtime rather than passed through the agent as tool calls or normal objectives
+- clearing conversation history should reset or archive the session transcript window without deleting task audit rows or durable semantic memory
+- session rows should carry lifecycle-ready state such as `last_activity_at`, `last_reset_at`, `archived_at`, and a coarse lifecycle reason, but they should not yet embed configurable cleanup policy; `M4.6` adds policy definition and operator controls on top of that state
+- the first slice should reconstruct transcript continuity from tasks linked to a session and bounded by the session's active transcript window, rather than introducing a second transcript-copy store up front
+- session resolution and reset logic should live in shared runtime helpers used by CLI intake, connector intake, scheduled runs, deferred follow-up routing, and approval resume so `M4.6` can reuse the same reset or archive primitive for automatic cleanup
+- to simplify rollout, the migration may drop current task-derived conversation continuity instead of backfilling it; legacy tasks can remain as audit records without participating in future transcript reconstruction
+- the first implementation slice should resolve sessions for CLI, Discord DMs, Discord channels, and scheduled automation runs
+- a practical delivery order is: add schema and indexes, add shared session resolution helpers, wire intake paths, switch prompt assembly and resume paths to `session_id`, then add runtime-handled reset flows and end-to-end tests
+
+Out of scope:
+
+- transcript summarization or compression beyond bounded recent-session retrieval
+- richer room membership policy expressions beyond the initial audience and max-scope caps
+- web or connector-native history management UIs beyond the existing administrative surfaces
+
+Stories:
+
+- `M4.5-001` Add persistent conversation-session storage and task linkage, including session kind, stable session key, audience policy, maximum memory scope, lifecycle-ready timestamps and markers, and originating connector metadata.
+- `M4.5-002` Resolve or create sessions during task intake for CLI, direct-message, group-room, and cron-run paths, with direct-message continuity tied to BeaverKI user identity rather than a raw channel ID.
+- `M4.5-003` Replace owner-wide recent-task prompt assembly with session-scoped transcript retrieval and follow-up handling for prompt construction, completion routing, and approval resume paths, carrying persisted `session_id` forward instead of re-resolving continuity from owner lookup.
+- `M4.5-004` Add runtime-intercepted session reset flows, including a user-facing `/new` command, so operators can clear conversation history without forgetting durable memory or deleting audit and task rows, using the same reset or archive primitive that later lifecycle automation will call.
+- `M4.5-005` Enforce session audience and maximum-scope caps so shared rooms can be configured as household-level or guest-level contexts independent of the initiating user's broader personal entitlements.
+- `M4.5-006` Add audit coverage and end-to-end tests for session creation, transcript reset, DM continuity, group isolation, cron freshness, and the no-backfill legacy-history migration path.
+
+Exit criteria:
+
+- follow-up continuity comes from explicit session-scoped transcript state rather than owner-wide task lookup
+- direct-message conversations keep continuity across DM entrypoints for the same mapped BeaverKI user
+- group or room conversations have isolated shared context with explicit household-versus-guest policy
+- cron jobs always start with fresh transcript state per run
+- operators can clear conversation history through a runtime-handled `/new` style command without affecting semantic memory or deleting audit records
+- existing legacy task history may remain in the database but is not required for transcript continuity after the migration
+
+## 3.9 M4.6 Session Management
+
+Goal:
+
+Add policy-driven lifecycle management for conversation sessions after first-class session scoping is in place.
+
+Status:
+
+- proposed after M4.5
+
+Implementation notes:
+
+- session lifecycle rules should remain runtime-managed rather than agent-managed
+- automatic clearing or archival should be configurable by session kind, connector context, and inactivity thresholds
+- scheduled cleanup should call the same reset or archive primitive introduced in `M4.5` rather than adding a second cleanup mechanism
+- scheduled cleanup should reset transcript continuity without deleting audit rows or durable memory
+- the first implementation should favor simple deterministic policies such as inactivity TTLs or fixed cleanup windows over semantic heuristics
+- manual reset through `/new` remains part of M4.5; this milestone adds automatic policies and operator controls around them
+
+Out of scope:
+
+- LLM-driven decisions about whether a session should be reset
+- rich end-user UI for browsing historical sessions beyond existing CLI and connector control surfaces
+
+Stories:
+
+- `M4.6-001` Add configurable session lifecycle policies, including inactivity-based reset or archive thresholds by session kind.
+- `M4.6-002` Implement scheduled runtime cleanup that automatically resets or archives eligible sessions without deleting tasks, audits, or durable memory.
+- `M4.6-003` Add operator-facing inspection and policy controls for session state, including visibility into last activity, reset markers, and lifecycle reason.
+- `M4.6-004` Add audit coverage and end-to-end tests for timed session clearing, policy exemptions, repeated cleanup idempotency, and separation between transcript reset versus memory forgetting.
+
+Exit criteria:
+
+- sessions can be automatically reset or archived at configured time points or inactivity thresholds
+- automatic cleanup is deterministic, auditable, and does not delete durable memory or task history
+- operators can inspect why a session was reset or archived and which lifecycle policy applied
+
+## 3.10 M4.7 Lua-Defined Tools
 
 Goal:
 
@@ -261,7 +349,7 @@ Add reviewed, activatable Lua-defined agent tools on top of the existing Lua aut
 
 Status:
 
-- proposed as the next milestone after M4
+- proposed after M4.6
 
 Implementation notes:
 
@@ -279,12 +367,12 @@ Out of scope:
 
 Stories:
 
-- `M4.5-001` Add persistent storage for database-backed Lua-defined tools, including source text, ownership, input schema, output schema, capability profile, lifecycle status, and originating task metadata.
-- `M4.5-002` Load active filesystem-packaged and database-backed Lua-defined tools through a shared runtime registration path so the agent can discover and invoke them like built-in tools.
-- `M4.5-003` Execute Lua-defined tools through the reviewed Lua runtime with Rust-controlled host APIs, initially limited to safe composition of existing built-in tools and already-approved Lua host functions.
-- `M4.5-004` Add blocking safety review and activation gating for newly created or modified database-backed Lua-defined tools, preserving actionable review findings and denial states.
-- `M4.5-005` Enforce schema validation, capability-profile checks, ownership rules, and fail-closed behavior when a Lua-defined tool requests disallowed operations.
-- `M4.5-006` Add audit coverage and end-to-end tests for tool registration, invocation, denial paths, review and activation flow, and parity between filesystem-packaged versus database-backed tool loading.
+- `M4.7-001` Add persistent storage for database-backed Lua-defined tools, including source text, ownership, input schema, output schema, capability profile, lifecycle status, and originating task metadata.
+- `M4.7-002` Load active filesystem-packaged and database-backed Lua-defined tools through a shared runtime registration path so the agent can discover and invoke them like built-in tools.
+- `M4.7-003` Execute Lua-defined tools through the reviewed Lua runtime with Rust-controlled host APIs, initially limited to safe composition of existing built-in tools and already-approved Lua host functions.
+- `M4.7-004` Add blocking safety review and activation gating for newly created or modified database-backed Lua-defined tools, preserving actionable review findings and denial states.
+- `M4.7-005` Enforce schema validation, capability-profile checks, ownership rules, and fail-closed behavior when a Lua-defined tool requests disallowed operations.
+- `M4.7-006` Add audit coverage and end-to-end tests for tool registration, invocation, denial paths, review and activation flow, and parity between filesystem-packaged versus database-backed tool loading.
 
 Exit criteria:
 
@@ -294,7 +382,7 @@ Exit criteria:
 - Lua-defined tools remain constrained to Rust-controlled capabilities and fail closed on disallowed operations
 - schema validation, safety review, and auditability work end to end for both storage modes
 
-## 3.9 M5 Household Delivery And Reminders
+## 3.11 M5 Household Delivery And Reminders
 
 Goal:
 
@@ -302,7 +390,7 @@ Add first-class targeted household reminders and notifications so one user's age
 
 Status:
 
-- proposed after M4.5
+- proposed after M4.7
 
 Implementation notes:
 
@@ -329,11 +417,11 @@ Exit criteria:
 - cross-user reminder delivery is policy-gated and fully auditable
 - natural-language reminder requests are normalized into structured scheduled work rather than handled as ad hoc connector replies
 
-## 3.10 Post-V1
+## 3.12 Post-V1
 
 Candidate follow-up work:
 
-- Better context management and retrieval optimization (including status for context windows and token usage per user)
+- Further context-window optimization, transcript summarization, and token-budget visibility per user and session
 - additional model providers
 - WhatsApp and Telegram connectors
 - local web UI
