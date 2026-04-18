@@ -106,7 +106,7 @@ The workspace should be split into focused crates.
   Provider abstraction, model-role routing, request/response normalization, and auth adapters.
 
 - `beaverki-tools`
-  Tool trait definitions and built-in implementations for shell, filesystem, browser, HTTP, messaging, and scripts.
+  Tool trait definitions and built-in implementations for shell, filesystem, the current browser-visit baseline, and future web/browser, messaging, and script-facing tool surfaces.
 
 - `beaverki-skills`
   Skill manifests, registry, activation state, capability declarations, and skill loading.
@@ -151,13 +151,19 @@ Expected config directory:
 ```text
 config/
   runtime.yaml
+  providers.yaml
+  integrations.yaml
   users.yaml
   roles.yaml
-  providers.yaml
-  connectors.yaml
   permissions.yaml
   schedules.yaml
 ```
+
+Current repository baseline:
+
+- the runtime currently loads `runtime.yaml`, `providers.yaml`, and `integrations.yaml`
+- browser and Discord integration settings already live under `integrations.yaml`
+- the additional user, role, policy, and schedule manifests remain valid architectural targets when those concerns are externalized further
 
 ### 5.2 `runtime.yaml`
 
@@ -243,7 +249,7 @@ roles:
     inherits: []
     permissions:
       invoke_agents: ["personal"]
-      tools: ["filesystem.read", "discord.read", "browser.basic"]
+      tools: ["filesystem_read_text", "filesystem_search", "browser_visit"]
       skills:
         create: false
         edit: false
@@ -291,29 +297,31 @@ providers:
         safety_reviewer: "gpt-5.4-mini"
 ```
 
-### 5.6 `connectors.yaml`
+### 5.6 `integrations.yaml`
 
 Purpose:
 
-- connector enablement
-- identity mapping
-- allowed channels
+- browser launcher and headless browser settings
+- Discord connector enablement
+- allowed channels and approval UX settings
 
 Example:
 
 ```yaml
-connectors:
+integrations:
+  browser:
+    interactive_launcher: null
+    headless_browser: "chromium"
+    headless_args: []
   discord:
     enabled: true
-    token_secret_ref: "secret://connectors/discord/token"
-    allowed_guilds: ["1234567890"]
-    allowed_channels: ["111", "222"]
-    allow_direct_messages: true
-    users:
-      - external_user_id: "discord_abc"
-        maps_to_user_id: "u_owner"
-      - external_user_id: "discord_xyz"
-        maps_to_user_id: "u_child_1"
+    bot_token_secret_ref: "secret://connectors/discord/token"
+    command_prefix: "!bk"
+    allowed_channel_ids: ["111", "222"]
+    task_wait_timeout_secs: 5
+    approval_action_ttl_secs: 900
+    approval_dm_only: true
+    critical_confirmation_ttl_secs: 300
 ```
 
 ### 5.7 `permissions.yaml`
@@ -957,27 +965,32 @@ trait Tool {
 
 ### 13.2 V1 Tools
 
+Current repository baseline:
+
 - `shell_exec`
-- `fs.read`
-- `fs.write`
-- `fs.search`
-- `browser.open`
-- `browser.run`
-- `http.request`
-- `discord.read`
-- `discord.send`
-- `lua.run`
+- `filesystem_list`
+- `filesystem_read_text`
+- `filesystem_write_text`
+- `filesystem_search`
+- `browser_visit`
+
+Planned expansion after the current baseline:
+
+- `website_read` for lightweight page retrieval and normalization
+- stateful browser session tools for navigation, extraction, and bounded interaction
+- connector- or Lua-provided higher-level tools layered on the same registry contract
 
 ### 13.3 Tool Context
 
 Every tool execution should receive:
 
-- task ID
-- acting agent ID
-- acting user ID
-- connector origin if any
-- allowed scope
-- timeout budget
+- working directory
+- allowed filesystem roots
+- output-size budget
+- approved shell-command overrides
+- browser launcher and headless-browser settings
+
+Runtime-owned metadata such as task ID, acting user, connector origin, and conversation session should still be available to policy and audit layers even if the minimal tool context struct does not yet carry every field directly.
 
 ## 14. Lua Runtime
 
@@ -1038,13 +1051,14 @@ Storage recommendation:
 - packaged assets and database-managed local artifacts may share the same runtime tool interface, but they should not share the same persistence model
 - import/export between filesystem assets and database-managed tools is optional, but runtime-owned mutable artifacts should not depend on ad hoc files as their primary source of truth
 
-### 14.4 Capability-Gated File and Network Access
+### 14.4 Capability-Gated File and Web Access
 
-Lua should not receive raw `os`, `io`, or unrestricted socket access by default. Instead, if a Lua script or Lua-defined tool needs file or network access, it should receive capability-scoped host functions such as:
+Lua should not receive raw `os`, `io`, or unrestricted socket access by default. Instead, if a Lua script or Lua-defined tool needs file or web access, it should receive capability-scoped host functions such as:
 
 - `fs.read_text(path)`
 - `fs.write_text(path, content)`
-- `net.http_request(method, url, headers, body)`
+- `web.read_page(url)`
+- `browser.visit(url, mode)`
 
 These host functions must enforce:
 

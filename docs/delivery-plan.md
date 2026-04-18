@@ -387,7 +387,60 @@ Exit criteria:
 - Lua-defined tools remain constrained to Rust-controlled capabilities and fail closed on disallowed operations
 - schema validation, safety review, and auditability work end to end for both storage modes
 
-## 3.11 M5 Household Delivery And Reminders
+## 3.11 M4.8 Web Reach And Browser Interaction
+
+Goal:
+
+Add first-class tools for reading websites and performing bounded browser interactions so BeaverKI can do reliable web research and web-app task execution before household reminder delivery is expanded.
+
+Status:
+
+- proposed after M4.7
+
+Why this stage exists:
+
+- the runtime already has initial browser support, but the current agent-facing surface is too coarse for dependable website reading or multi-step browser work
+- many practical tasks require both a lightweight path for reading ordinary web pages and a browser-backed path for JavaScript-rendered sites
+- M5 reminder and notification workflows will benefit from stronger web reach for lookups, status checks, and service interactions, but that foundation should exist first
+
+Implementation notes:
+
+- split web access into two tool classes: read-oriented website retrieval and stateful browser interaction
+- provide a lightweight website-read path that can fetch public pages, follow safe redirects, extract titles and links, and normalize content into agent-usable text or Markdown without requiring a full browser launch
+- provide a browser-backed inspection path for JavaScript-heavy sites that can expose rendered DOM views, accessibility snapshots, screenshots, and page metadata through a stable tool contract
+- browser interactions should be session-scoped and stateful within one task or conversation session so navigation, cookies, and temporary login state can persist across multiple tool calls without becoming global runtime state
+- add bounded interaction primitives such as navigate, click, type, select, wait, and extract, with explicit distinction between read-only observation and state-changing actions
+- risky browser actions such as authenticated writes, destructive clicks, downloads, uploads, or disallowed cross-origin transitions should route through the existing approval and policy machinery rather than being treated as ordinary low-risk reads
+- desktop and headless modes should share the same logical tool surface so prompt construction, policy checks, and audit behavior do not fork by deployment mode
+- the first slice should favor targeted page access and bounded workflows over open-ended crawling or high-volume scraping
+
+Out of scope:
+
+- unrestricted internet crawling or search-engine style indexing
+- long-running multi-site scraping campaigns
+- credential-vaulting or secret-entry UX beyond existing config and approval surfaces
+- a local web UI for humans to drive browser sessions directly
+
+Stories:
+
+- `M4.8-001` Add a first-class website-read tool that can fetch public pages, normalize content into agent-usable text or Markdown, expose titles and outbound links, and fail clearly on unsupported content types.
+- `M4.8-002` Add rendered-page inspection tooling that can read JavaScript-heavy sites through the browser backend and return stable DOM, accessibility, or screenshot-derived views for the agent.
+- `M4.8-003` Introduce session-scoped browser handles so multiple tool calls can share navigation state, cookies, and page context within one bounded conversation or task.
+- `M4.8-004` Add bounded browser interaction tools for navigation and form-style actions, including click, type, select, wait, and element extraction under a consistent schema.
+- `M4.8-005` Enforce policy and approval gates for state-changing browser actions, authenticated contexts, downloads or uploads, and disallowed destinations, with fail-closed behavior when policy cannot decide.
+- `M4.8-006` Add runtime configuration and capability controls for browser mode, timeouts, user-agent or profile isolation, and allowed network destinations so deployments can tighten web reach by environment.
+- `M4.8-007` Add audit coverage and artifact capture for web fetches, rendered page reads, browser session creation, navigation steps, interaction attempts, approvals, and cleanup.
+- `M4.8-008` Add end-to-end tests covering static website reading, JavaScript-rendered page inspection, multi-step browser interaction, denied high-risk actions, and session cleanup across restart or timeout boundaries.
+
+Exit criteria:
+
+- the agent can read ordinary public websites through a lightweight tool without requiring a full browser launch
+- the agent can inspect and interact with JavaScript-heavy websites through a bounded browser session in desktop and headless modes
+- browser state is isolated to an explicit task or conversation session rather than leaking across unrelated work
+- risky browser-side actions are policy-gated, approval-aware, and auditable end to end
+- BeaverKI has a reliable web-access foundation in place before M5 reminder and notification delivery expands
+
+## 3.12 M5 Household Delivery And Reminders
 
 Goal:
 
@@ -395,7 +448,7 @@ Add first-class targeted household reminders and notifications so one user's age
 
 Status:
 
-- proposed after M4.7
+- proposed after M4.8
 
 Implementation notes:
 
@@ -422,7 +475,7 @@ Exit criteria:
 - cross-user reminder delivery is policy-gated and fully auditable
 - natural-language reminder requests are normalized into structured scheduled work rather than handled as ad hoc connector replies
 
-## 3.12 Post-V1
+## 3.13 Post-V1
 
 Candidate follow-up work:
 

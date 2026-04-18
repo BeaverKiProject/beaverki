@@ -439,8 +439,8 @@ The tool execution layer provides structured, auditable actions the agent can pe
 
 - terminal command execution
 - filesystem read/write/search
-- browser automation
-- HTTP/API requests
+- website reading
+- browser automation and bounded browser interaction
 - messaging connectors
 - scheduler and timer control
 - local notifications
@@ -479,6 +479,10 @@ Filesystem actions should separate read, write, move, and delete permissions. Se
 Browser control should likely use a stable backend such as Playwright or a compatible automation layer. The framework should abstract browser actions behind a tool interface so the core runtime remains decoupled from a specific library.
 
 V1 should support both interactive desktop browser control and headless browser sessions for VPS deployments.
+
+The current repository baseline is intentionally narrower than the final web vision: it exposes a single `browser_visit` tool that either launches a URL in an interactive browser or returns a headless `--dump-dom` snapshot. That is enough for initial browser reach, but it is not yet a full web-reading or stateful browser-interaction surface.
+
+The next expansion step should separate read-oriented website retrieval from stateful browser interaction. Ordinary public pages should be readable through a lightweight website-read path that extracts normalized text, titles, and links without requiring a full browser launch. JavaScript-heavy or authenticated flows should use a bounded browser session with explicit navigation and interaction primitives, approval gates for risky actions, and per-session state isolation.
 
 ### 10.6 Messaging Connectors
 
@@ -900,7 +904,7 @@ The full vision is broad. A disciplined MVP should prove the architecture withou
 - provider abstraction plus one additional provider
 - terminal tool with policy controls
 - filesystem tools with scoped permissions
-- basic browser automation integration
+- basic browser visit integration with interactive launch and headless DOM capture
 - heartbeat scheduler
 - durable task queue
 - RBAC and approval engine
@@ -954,7 +958,7 @@ Recommended order of work:
 6. Add the base agent execution loop, persistent per-user agents, and dynamic sub-agent spawning.
 7. Add durable tasks and heartbeat scheduling.
 8. Add skill manifests and Lua host runtime, including script metadata, safety review, and schedule registration.
-9. Add browser integration with both interactive and headless execution modes.
+9. Add initial browser integration with interactive launch and headless DOM capture, then expand it into first-class website reading and stateful browser interaction.
 10. Add the Discord connector as the first remote control surface.
 11. Add local web UI after CLI workflows are stable.
 
