@@ -166,6 +166,7 @@ pub async fn review_lua_script(
     });
     review_with_prompt(
         provider,
+        "safety_review",
         provider.model_names().safety_review.as_str(),
         LUA_REVIEW_INSTRUCTIONS,
         &request,
@@ -175,12 +176,14 @@ pub async fn review_lua_script(
 
 async fn review_with_prompt(
     provider: &Arc<dyn ModelProvider>,
+    model_role: &str,
     model_name: &str,
     instructions: &str,
     request: &Value,
 ) -> Result<SafetyReviewOutcome> {
     let response = provider
         .generate_turn(
+            model_role,
             model_name,
             instructions,
             &[ConversationItem::UserText(request.to_string())],

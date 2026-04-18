@@ -3255,6 +3255,7 @@ mod tests {
 
         async fn generate_turn(
             &self,
+            _model_role: &str,
             _model_name: &str,
             _instructions: &str,
             _conversation: &[ConversationItem],

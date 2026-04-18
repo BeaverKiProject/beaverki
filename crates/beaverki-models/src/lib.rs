@@ -41,6 +41,7 @@ pub trait ModelProvider: Send + Sync {
 
     async fn generate_turn(
         &self,
+        model_role: &str,
         model_name: &str,
         instructions: &str,
         conversation: &[ConversationItem],
@@ -100,6 +101,7 @@ impl ModelProvider for OpenAiProvider {
 
     async fn generate_turn(
         &self,
+        model_role: &str,
         model_name: &str,
         instructions: &str,
         conversation: &[ConversationItem],
@@ -146,6 +148,7 @@ impl ModelProvider for OpenAiProvider {
         info!(
             provider_id = %self.provider_id,
             provider_kind = %self.provider_kind,
+            model_role = %model_role,
             model_name = %model_name,
             input_tokens = ?usage.as_ref().and_then(|item| item.input_tokens),
             output_tokens = ?usage.as_ref().and_then(|item| item.output_tokens),

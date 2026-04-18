@@ -217,14 +217,15 @@ impl PrimaryAgentRunner {
         tool_context.approved_shell_commands = request.approved_shell_commands.clone();
 
         for step in 0..self.max_steps {
-            let model_name = if step == 0 {
-                self.provider.model_names().planner.as_str()
+            let (model_role, model_name) = if step == 0 {
+                ("planner", self.provider.model_names().planner.as_str())
             } else {
-                self.provider.model_names().executor.as_str()
+                ("executor", self.provider.model_names().executor.as_str())
             };
             let response = self
                 .provider
                 .generate_turn(
+                    model_role,
                     model_name,
                     &instructions,
                     &conversation,
@@ -234,6 +235,7 @@ impl PrimaryAgentRunner {
 
             info!(
                 task_id = %task.task_id,
+                model_role = %model_role,
                 model_name = %model_name,
                 input_tokens = ?response.usage.as_ref().and_then(|usage| usage.input_tokens),
                 output_tokens = ?response.usage.as_ref().and_then(|usage| usage.output_tokens),
@@ -252,6 +254,7 @@ impl PrimaryAgentRunner {
                     &request.assigned_agent_id,
                     json!({
                         "step": step,
+                        "model_role": model_role,
                         "model_name": model_name,
                         "tool_call_count": response.tool_calls.len(),
                         "input_tokens": response.usage.as_ref().and_then(|usage| usage.input_tokens),
@@ -1730,6 +1733,7 @@ impl PrimaryAgentRunner {
         let response = self
             .provider
             .generate_turn(
+                "safety_review",
                 self.provider.model_names().safety_review.as_str(),
                 SHELL_REVIEW_INSTRUCTIONS,
                 &[ConversationItem::UserText(request.to_string())],
@@ -2312,6 +2316,7 @@ mod tests {
 
         async fn generate_turn(
             &self,
+            _model_role: &str,
             _model_name: &str,
             _instructions: &str,
             _conversation: &[ConversationItem],
@@ -2359,6 +2364,7 @@ mod tests {
 
         async fn generate_turn(
             &self,
+            _model_role: &str,
             _model_name: &str,
             _instructions: &str,
             conversation: &[ConversationItem],
