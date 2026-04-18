@@ -98,6 +98,7 @@ impl PrimaryAgentRunner {
                 primary_agent_id: &request.primary_agent_id,
                 assigned_agent_id: &request.assigned_agent_id,
                 parent_task_id: request.parent_task_id.as_deref(),
+                session_id: None,
                 kind: &request.kind,
                 objective: &request.objective,
                 context_summary: request.task_context.as_deref(),
@@ -794,8 +795,7 @@ impl PrimaryAgentRunner {
         let subject_key = required_string_arg(&arguments, "subject_key", "memory_remember")?;
         let content_text = required_string_arg(&arguments, "content_text", "memory_remember")?;
         let source_type = required_string_arg(&arguments, "source_type", "memory_remember")?;
-        let source_summary =
-            required_string_arg(&arguments, "source_summary", "memory_remember")?;
+        let source_summary = required_string_arg(&arguments, "source_summary", "memory_remember")?;
         let source_ref = arguments
             .get("source_ref")
             .and_then(Value::as_str)
@@ -1189,7 +1189,8 @@ impl PrimaryAgentRunner {
         } else {
             "draft"
         };
-        let application = automation::apply_script_review(&review, approved_status, prior_status.as_deref());
+        let application =
+            automation::apply_script_review(&review, approved_status, prior_status.as_deref());
 
         self.db
             .update_script_safety(
@@ -1357,7 +1358,8 @@ impl PrimaryAgentRunner {
         let execution = match execution {
             Ok(execution) => execution,
             Err(error) => {
-                if let Some(policy_error) = error.downcast_ref::<automation::LuaToolPolicyDenied>() {
+                if let Some(policy_error) = error.downcast_ref::<automation::LuaToolPolicyDenied>()
+                {
                     self.db
                         .append_task_event(
                             &task.task_id,
@@ -1426,6 +1428,7 @@ impl PrimaryAgentRunner {
                     primary_agent_id: &request.primary_agent_id,
                     assigned_agent_id: &request.assigned_agent_id,
                     parent_task_id: Some(&task.task_id),
+                    session_id: task.session_id.as_deref(),
                     kind: "lua_script",
                     objective: &format!("Run Lua script {}", script.script_id),
                     context_summary: Some(&task_context),
@@ -1634,6 +1637,7 @@ impl PrimaryAgentRunner {
                 primary_agent_id: &parent_request.primary_agent_id,
                 assigned_agent_id: &subagent.agent_id,
                 parent_task_id: Some(&parent_task.task_id),
+                session_id: parent_task.session_id.as_deref(),
                 kind: "subagent",
                 objective,
                 context_summary: task_slice.as_deref(),
@@ -2088,7 +2092,10 @@ mod tests {
             _tools: &[ToolDefinition],
         ) -> Result<ModelTurnResponse> {
             if let Some(ConversationItem::UserText(prompt)) = conversation.first() {
-                self.prompts.lock().expect("prompt lock").push(prompt.clone());
+                self.prompts
+                    .lock()
+                    .expect("prompt lock")
+                    .push(prompt.clone());
             }
             self.responses
                 .lock()
@@ -3188,9 +3195,11 @@ mod tests {
         assert_eq!(memory.content_text, "Alex");
         assert_eq!(memory.source_type, "user_statement");
         let audit_events = db.list_audit_events(10).await.expect("audit events");
-        assert!(audit_events
-            .iter()
-            .any(|event| event.event_type == "semantic_memory_created"));
+        assert!(
+            audit_events
+                .iter()
+                .any(|event| event.event_type == "semantic_memory_created")
+        );
     }
 
     #[tokio::test]
@@ -3236,7 +3245,8 @@ mod tests {
             .into_iter()
             .map(|row| row.role_id)
             .collect::<Vec<_>>();
-        let original_metadata = json!({ "source_summary": "User said their favorite drink is coffee." });
+        let original_metadata =
+            json!({ "source_summary": "User said their favorite drink is coffee." });
         let original_memory_id = db
             .insert_memory(beaverki_db::NewMemory {
                 owner_user_id: Some(&default_user.user_id),
@@ -3297,9 +3307,11 @@ mod tests {
             Some(current.memory_id.as_str())
         );
         let audit_events = db.list_audit_events(10).await.expect("audit events");
-        assert!(audit_events
-            .iter()
-            .any(|event| event.event_type == "semantic_memory_corrected"));
+        assert!(
+            audit_events
+                .iter()
+                .any(|event| event.event_type == "semantic_memory_corrected")
+        );
     }
 
     #[tokio::test]
@@ -3377,9 +3389,11 @@ mod tests {
             .expect("lookup household memory");
         assert!(household_memory.is_none());
         let audit_events = db.list_audit_events(10).await.expect("audit events");
-        assert!(audit_events
-            .iter()
-            .any(|event| event.event_type == "semantic_memory_write_denied"));
+        assert!(
+            audit_events
+                .iter()
+                .any(|event| event.event_type == "semantic_memory_write_denied")
+        );
     }
 
     #[tokio::test]
@@ -3394,8 +3408,7 @@ mod tests {
             .into_iter()
             .map(|row| row.role_id)
             .collect::<Vec<_>>();
-        let metadata =
-            json!({ "source_summary": "User gave a wrong Wi-Fi password candidate." });
+        let metadata = json!({ "source_summary": "User gave a wrong Wi-Fi password candidate." });
         let task = db
             .create_task_with_params(NewTask {
                 owner_user_id: &default_user.user_id,
@@ -3403,6 +3416,7 @@ mod tests {
                 primary_agent_id: default_user.primary_agent_id.as_deref().expect("agent"),
                 assigned_agent_id: default_user.primary_agent_id.as_deref().expect("agent"),
                 parent_task_id: None,
+                session_id: None,
                 kind: "interactive",
                 objective: "Forget the wrong Wi-Fi password memory.",
                 context_summary: None,
@@ -3470,9 +3484,11 @@ mod tests {
             .expect("active memories");
         assert!(!active.iter().any(|row| row.memory_id == memory_id));
         let audit_events = db.list_audit_events(10).await.expect("audit events");
-        assert!(audit_events
-            .iter()
-            .any(|event| event.event_type == "memory_forgotten"));
+        assert!(
+            audit_events
+                .iter()
+                .any(|event| event.event_type == "memory_forgotten")
+        );
     }
 
     #[tokio::test]
@@ -3677,6 +3693,7 @@ mod tests {
                 primary_agent_id: default_user.primary_agent_id.as_deref().expect("agent"),
                 assigned_agent_id: default_user.primary_agent_id.as_deref().expect("agent"),
                 parent_task_id: None,
+                session_id: None,
                 kind: "interactive",
                 objective: "Run a Lua script with risky shell",
                 context_summary: None,

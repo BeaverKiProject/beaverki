@@ -134,7 +134,8 @@ pub fn apply_script_review(
         return ScriptReviewApplication {
             safety_status: review.verdict.clone(),
             resulting_status: approved_status.to_owned(),
-            reactivated_after_rewrite: prior_status == Some("active") && approved_status == "active",
+            reactivated_after_rewrite: prior_status == Some("active")
+                && approved_status == "active",
         };
     }
 
@@ -325,8 +326,7 @@ pub async fn execute_lua_script(input: LuaExecutionInput) -> Result<LuaExecution
                     .unwrap_or("private")
                     .parse::<MemoryScope>()
                     .map_err(mlua::Error::external)?;
-                if matches!(scope, MemoryScope::Household)
-                    && !can_write_household_memory(&role_ids)
+                if matches!(scope, MemoryScope::Household) && !can_write_household_memory(&role_ids)
                 {
                     return Err(mlua::Error::external(anyhow!(
                         "household memory writes are not allowed for this user"
@@ -472,7 +472,9 @@ pub async fn execute_lua_script(input: LuaExecutionInput) -> Result<LuaExecution
         .eval::<LuaValue>()
         .map_err(map_lua_runtime_error)?;
     let value = match entry {
-        LuaValue::Function(function) => function.call::<LuaValue>(ctx).map_err(map_lua_runtime_error)?,
+        LuaValue::Function(function) => function
+            .call::<LuaValue>(ctx)
+            .map_err(map_lua_runtime_error)?,
         other => other,
     };
     let result_text = match value {

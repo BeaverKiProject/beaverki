@@ -958,7 +958,10 @@ async fn memory_history(args: MemoryHistoryArgs) -> Result<()> {
     };
 
     if memories.is_empty() {
-        println!("No memory history found for subject key '{}'.", args.subject_key);
+        println!(
+            "No memory history found for subject key '{}'.",
+            args.subject_key
+        );
         return Ok(());
     }
 
@@ -973,7 +976,11 @@ async fn memory_forget(args: MemoryForgetArgs) -> Result<()> {
     let config_dir = resolve_config_dir(args.config_dir)?;
     let memory = if let Ok(client) = try_daemon_client(&config_dir).await {
         client
-            .forget_memory(args.user.clone(), args.memory_id.clone(), args.reason.clone())
+            .forget_memory(
+                args.user.clone(),
+                args.memory_id.clone(),
+                args.reason.clone(),
+            )
             .await?
             .memory
     } else {
@@ -1347,7 +1354,9 @@ fn print_script_review_details(review: &beaverki_db::ScriptReviewRow) {
         Err(_) => return,
     };
 
-    if let Some(findings) = findings_json.get("findings").and_then(serde_json::Value::as_array)
+    if let Some(findings) = findings_json
+        .get("findings")
+        .and_then(serde_json::Value::as_array)
         && !findings.is_empty()
     {
         println!("  Findings:");
@@ -1362,7 +1371,10 @@ fn print_script_review_details(review: &beaverki_db::ScriptReviewRow) {
         && !required_changes.is_empty()
     {
         println!("  Required changes:");
-        for required_change in required_changes.iter().filter_map(serde_json::Value::as_str) {
+        for required_change in required_changes
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+        {
             println!("    - {required_change}");
         }
     }
@@ -1694,11 +1706,16 @@ async fn forget_memory_for_user(
         .await?
         .ok_or_else(|| anyhow!("memory '{memory_id}' not found"))?;
     ensure_memory_visible_to_user(&memory, &user.user_id, &visible_scopes)?;
-    let scope = memory
-        .scope
-        .parse::<MemoryScope>()
-        .map_err(|_| anyhow!("memory '{}' has unsupported scope '{}'", memory.memory_id, memory.scope))?;
-    if matches!(scope, MemoryScope::Household) && !beaverki_policy::can_write_household_memory(&role_ids) {
+    let scope = memory.scope.parse::<MemoryScope>().map_err(|_| {
+        anyhow!(
+            "memory '{}' has unsupported scope '{}'",
+            memory.memory_id,
+            memory.scope
+        )
+    })?;
+    if matches!(scope, MemoryScope::Household)
+        && !beaverki_policy::can_write_household_memory(&role_ids)
+    {
         bail!(
             "user '{}' is not allowed to forget household memory",
             user.user_id
@@ -1728,14 +1745,17 @@ async fn forget_memory_for_user(
         .ok_or_else(|| anyhow!("memory '{memory_id}' disappeared after forget"))
 }
 
-fn resolve_visible_scope_filter(role_ids: &[String], scope: Option<&str>) -> Result<Vec<MemoryScope>> {
+fn resolve_visible_scope_filter(
+    role_ids: &[String],
+    scope: Option<&str>,
+) -> Result<Vec<MemoryScope>> {
     let visible_scopes = visible_memory_scopes(role_ids);
     match scope {
         None | Some("all") => Ok(visible_scopes),
         Some(scope_value) => {
-            let scope = scope_value
-                .parse::<MemoryScope>()
-                .map_err(|_| anyhow!("unsupported scope '{scope_value}', expected private or household"))?;
+            let scope = scope_value.parse::<MemoryScope>().map_err(|_| {
+                anyhow!("unsupported scope '{scope_value}', expected private or household")
+            })?;
             if !visible_scopes.contains(&scope) {
                 bail!("scope '{scope}' is not visible to the selected user");
             }
@@ -1747,10 +1767,9 @@ fn resolve_visible_scope_filter(role_ids: &[String], scope: Option<&str>) -> Res
 fn parse_memory_kind_filter(kind: Option<&str>) -> Result<Option<MemoryKind>> {
     match kind {
         None | Some("all") => Ok(None),
-        Some(kind_value) => kind_value
-            .parse::<MemoryKind>()
-            .map(Some)
-            .map_err(|_| anyhow!("unsupported memory kind '{kind_value}', expected semantic or episodic")),
+        Some(kind_value) => kind_value.parse::<MemoryKind>().map(Some).map_err(|_| {
+            anyhow!("unsupported memory kind '{kind_value}', expected semantic or episodic")
+        }),
     }
 }
 
@@ -1759,17 +1778,26 @@ fn ensure_memory_visible_to_user(
     user_id: &str,
     visible_scopes: &[MemoryScope],
 ) -> Result<()> {
-    let scope = memory
-        .scope
-        .parse::<MemoryScope>()
-        .map_err(|_| anyhow!("memory '{}' has unsupported scope '{}'", memory.memory_id, memory.scope))?;
+    let scope = memory.scope.parse::<MemoryScope>().map_err(|_| {
+        anyhow!(
+            "memory '{}' has unsupported scope '{}'",
+            memory.memory_id,
+            memory.scope
+        )
+    })?;
     if !visible_scopes.contains(&scope) {
-        bail!("memory '{}' is not visible to the selected user", memory.memory_id);
+        bail!(
+            "memory '{}' is not visible to the selected user",
+            memory.memory_id
+        );
     }
     match memory.owner_user_id.as_deref() {
         Some(owner_user_id) if owner_user_id == user_id => Ok(()),
         None => Ok(()),
-        _ => bail!("memory '{}' is not visible to the selected user", memory.memory_id),
+        _ => bail!(
+            "memory '{}' is not visible to the selected user",
+            memory.memory_id
+        ),
     }
 }
 
@@ -1783,7 +1811,10 @@ fn print_memory_summary(memory: &MemoryRow) {
         memory.subject_key.as_deref().unwrap_or("<none>"),
         memory.owner_user_id.as_deref().unwrap_or("<shared>"),
         memory.updated_at,
-        memory.superseded_by_memory_id.as_deref().unwrap_or("<active>"),
+        memory
+            .superseded_by_memory_id
+            .as_deref()
+            .unwrap_or("<active>"),
         memory.forgotten_at.as_deref().unwrap_or("<active>"),
         memory.content_text
     );
@@ -1791,7 +1822,10 @@ fn print_memory_summary(memory: &MemoryRow) {
 
 fn print_memory_detail(memory: &MemoryRow) {
     println!("Memory: {}", memory.memory_id);
-    println!("Owner: {}", memory.owner_user_id.as_deref().unwrap_or("<shared>"));
+    println!(
+        "Owner: {}",
+        memory.owner_user_id.as_deref().unwrap_or("<shared>")
+    );
     println!("Scope: {}", memory.scope);
     println!("Kind: {}", memory.memory_kind);
     println!("Subject Type: {}", memory.subject_type);

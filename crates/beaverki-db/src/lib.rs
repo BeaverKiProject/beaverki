@@ -189,6 +189,135 @@ impl Database {
         Ok(roles)
     }
 
+    pub async fn ensure_conversation_session(
+        &self,
+        input: NewConversationSession<'_>,
+    ) -> Result<ConversationSessionRow> {
+        let timestamp = now_rfc3339();
+        let session_id = new_prefixed_id("conversation_session");
+        sqlx::query(
+            "INSERT OR IGNORE INTO conversation_sessions
+             (session_id, session_kind, session_key, audience_policy, max_memory_scope, originating_connector_type, originating_connector_target, last_activity_at, last_reset_at, archived_at, lifecycle_reason, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?)",
+        )
+        .bind(&session_id)
+        .bind(input.session_kind)
+        .bind(input.session_key)
+        .bind(input.audience_policy)
+        .bind(input.max_memory_scope.as_str())
+        .bind(input.originating_connector_type)
+        .bind(input.originating_connector_target)
+        .bind(&timestamp)
+        .bind(&timestamp)
+        .bind(&timestamp)
+        .execute(&self.pool)
+        .await
+        .context("failed to ensure conversation session")?;
+
+        self.fetch_conversation_session_by_key(input.session_key)
+            .await?
+            .ok_or_else(|| anyhow!("conversation session missing after insert"))
+    }
+
+    pub async fn fetch_conversation_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<ConversationSessionRow>> {
+        let row = sqlx::query_as::<_, ConversationSessionRow>(
+            "SELECT session_id, session_kind, session_key, audience_policy, max_memory_scope, originating_connector_type, originating_connector_target, last_activity_at, last_reset_at, archived_at, lifecycle_reason, created_at, updated_at
+             FROM conversation_sessions
+             WHERE session_id = ?",
+        )
+        .bind(session_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to fetch conversation session")?;
+        Ok(row)
+    }
+
+    pub async fn fetch_conversation_session_by_key(
+        &self,
+        session_key: &str,
+    ) -> Result<Option<ConversationSessionRow>> {
+        let row = sqlx::query_as::<_, ConversationSessionRow>(
+            "SELECT session_id, session_kind, session_key, audience_policy, max_memory_scope, originating_connector_type, originating_connector_target, last_activity_at, last_reset_at, archived_at, lifecycle_reason, created_at, updated_at
+             FROM conversation_sessions
+             WHERE session_key = ?",
+        )
+        .bind(session_key)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to fetch conversation session by key")?;
+        Ok(row)
+    }
+
+    pub async fn touch_conversation_session(
+        &self,
+        session_id: &str,
+        lifecycle_reason: Option<&str>,
+    ) -> Result<()> {
+        let timestamp = now_rfc3339();
+        sqlx::query(
+            "UPDATE conversation_sessions
+             SET last_activity_at = ?, lifecycle_reason = COALESCE(?, lifecycle_reason), updated_at = ?
+             WHERE session_id = ?",
+        )
+        .bind(&timestamp)
+        .bind(lifecycle_reason)
+        .bind(&timestamp)
+        .bind(session_id)
+        .execute(&self.pool)
+        .await
+        .context("failed to touch conversation session")?;
+        Ok(())
+    }
+
+    pub async fn reset_conversation_session(
+        &self,
+        session_id: &str,
+        lifecycle_reason: &str,
+    ) -> Result<()> {
+        let timestamp = now_rfc3339();
+        sqlx::query(
+            "UPDATE conversation_sessions
+             SET last_activity_at = ?, last_reset_at = ?, lifecycle_reason = ?, updated_at = ?
+             WHERE session_id = ?",
+        )
+        .bind(&timestamp)
+        .bind(&timestamp)
+        .bind(lifecycle_reason)
+        .bind(&timestamp)
+        .bind(session_id)
+        .execute(&self.pool)
+        .await
+        .context("failed to reset conversation session")?;
+        Ok(())
+    }
+
+    pub async fn update_conversation_session_policy(
+        &self,
+        session_id: &str,
+        audience_policy: &str,
+        max_memory_scope: MemoryScope,
+        lifecycle_reason: Option<&str>,
+    ) -> Result<()> {
+        let timestamp = now_rfc3339();
+        sqlx::query(
+            "UPDATE conversation_sessions
+             SET audience_policy = ?, max_memory_scope = ?, lifecycle_reason = COALESCE(?, lifecycle_reason), updated_at = ?
+             WHERE session_id = ?",
+        )
+        .bind(audience_policy)
+        .bind(max_memory_scope.as_str())
+        .bind(lifecycle_reason)
+        .bind(&timestamp)
+        .bind(session_id)
+        .execute(&self.pool)
+        .await
+        .context("failed to update conversation session policy")?;
+        Ok(())
+    }
+
     pub async fn assign_role(&self, user_id: &str, role_id: &str) -> Result<()> {
         sqlx::query(
             "INSERT OR IGNORE INTO user_roles (user_id, role_id, created_at)
@@ -261,6 +390,7 @@ impl Database {
             primary_agent_id,
             assigned_agent_id: primary_agent_id,
             parent_task_id: None,
+            session_id: None,
             kind: "interactive",
             objective,
             context_summary: None,
@@ -276,8 +406,8 @@ impl Database {
 
         sqlx::query(
             "INSERT INTO tasks
-             (task_id, owner_user_id, initiating_identity_id, primary_agent_id, assigned_agent_id, parent_task_id, kind, state, objective, context_summary, result_text, scope, wake_at, created_at, updated_at, completed_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, NULL)",
+             (task_id, owner_user_id, initiating_identity_id, primary_agent_id, assigned_agent_id, parent_task_id, session_id, kind, state, objective, context_summary, result_text, scope, wake_at, created_at, updated_at, completed_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, NULL)",
         )
         .bind(&task_id)
         .bind(input.owner_user_id)
@@ -285,6 +415,7 @@ impl Database {
         .bind(input.primary_agent_id)
         .bind(input.assigned_agent_id)
         .bind(input.parent_task_id)
+        .bind(input.session_id)
         .bind(input.kind)
         .bind(TaskState::Pending.as_str())
         .bind(input.objective)
@@ -297,19 +428,26 @@ impl Database {
         .await
         .context("failed to insert task")?;
 
+        if let Some(session_id) = input.session_id {
+            self.touch_conversation_session(session_id, Some("task_created"))
+                .await?;
+        }
+
         self.fetch_task_for_owner(input.owner_user_id, &task_id)
             .await?
             .context("task missing after insert")
     }
 
     pub async fn update_task_state(&self, task_id: &str, state: TaskState) -> Result<()> {
+        let timestamp = now_rfc3339();
         sqlx::query("UPDATE tasks SET state = ?, updated_at = ? WHERE task_id = ?")
             .bind(state.as_str())
-            .bind(now_rfc3339())
+            .bind(&timestamp)
             .bind(task_id)
             .execute(&self.pool)
             .await
             .context("failed to update task state")?;
+        self.touch_session_for_task(task_id, &timestamp).await?;
         Ok(())
     }
 
@@ -327,16 +465,19 @@ impl Database {
         .execute(&self.pool)
         .await
         .context("failed to mark task waiting approval")?;
+        self.touch_session_for_task(task_id, &timestamp).await?;
         Ok(())
     }
 
     pub async fn clear_task_result(&self, task_id: &str) -> Result<()> {
+        let timestamp = now_rfc3339();
         sqlx::query("UPDATE tasks SET result_text = NULL, completed_at = NULL, updated_at = ? WHERE task_id = ?")
-            .bind(now_rfc3339())
+            .bind(&timestamp)
             .bind(task_id)
             .execute(&self.pool)
             .await
             .context("failed to clear task result")?;
+        self.touch_session_for_task(task_id, &timestamp).await?;
         Ok(())
     }
 
@@ -355,6 +496,7 @@ impl Database {
         .execute(&self.pool)
         .await
         .context("failed to complete task")?;
+        self.touch_session_for_task(task_id, &timestamp).await?;
         Ok(())
     }
 
@@ -373,6 +515,7 @@ impl Database {
         .execute(&self.pool)
         .await
         .context("failed to fail task")?;
+        self.touch_session_for_task(task_id, &timestamp).await?;
         Ok(())
     }
 
@@ -385,6 +528,7 @@ impl Database {
         payload: Value,
     ) -> Result<String> {
         let event_id = new_prefixed_id("evt");
+        let timestamp = now_rfc3339();
         sqlx::query(
             "INSERT INTO task_events
              (event_id, task_id, event_type, actor_type, actor_id, payload_json, created_at)
@@ -396,11 +540,32 @@ impl Database {
         .bind(actor_type)
         .bind(actor_id)
         .bind(payload.to_string())
-        .bind(now_rfc3339())
+        .bind(&timestamp)
         .execute(&self.pool)
         .await
         .context("failed to append task event")?;
+        self.touch_session_for_task(task_id, &timestamp).await?;
         Ok(event_id)
+    }
+
+    async fn touch_session_for_task(&self, task_id: &str, timestamp: &str) -> Result<()> {
+        sqlx::query(
+            "UPDATE conversation_sessions
+             SET last_activity_at = ?, updated_at = ?
+             WHERE session_id = (
+               SELECT session_id
+               FROM tasks
+               WHERE task_id = ?
+                 AND session_id IS NOT NULL
+             )",
+        )
+        .bind(timestamp)
+        .bind(timestamp)
+        .bind(task_id)
+        .execute(&self.pool)
+        .await
+        .context("failed to touch conversation session for task")?;
+        Ok(())
     }
 
     pub async fn start_tool_invocation(
@@ -1781,7 +1946,7 @@ impl Database {
         task_id: &str,
     ) -> Result<Option<TaskRow>> {
         let row = sqlx::query_as::<_, TaskRow>(
-            "SELECT task_id, owner_user_id, initiating_identity_id, primary_agent_id, assigned_agent_id, parent_task_id, kind, state, objective, context_summary, result_text, scope, wake_at, created_at, updated_at, completed_at
+            "SELECT task_id, owner_user_id, initiating_identity_id, primary_agent_id, assigned_agent_id, parent_task_id, session_id, kind, state, objective, context_summary, result_text, scope, wake_at, created_at, updated_at, completed_at
              FROM tasks
              WHERE owner_user_id = ? AND task_id = ?",
         )
@@ -1799,7 +1964,7 @@ impl Database {
         limit: i64,
     ) -> Result<Vec<TaskRow>> {
         let rows = sqlx::query_as::<_, TaskRow>(
-            "SELECT task_id, owner_user_id, initiating_identity_id, primary_agent_id, assigned_agent_id, parent_task_id, kind, state, objective, context_summary, result_text, scope, wake_at, created_at, updated_at, completed_at
+            "SELECT task_id, owner_user_id, initiating_identity_id, primary_agent_id, assigned_agent_id, parent_task_id, session_id, kind, state, objective, context_summary, result_text, scope, wake_at, created_at, updated_at, completed_at
              FROM tasks
              WHERE owner_user_id = ?
                AND kind = 'interactive'
@@ -1814,9 +1979,48 @@ impl Database {
         Ok(rows)
     }
 
+    pub async fn list_recent_interactive_tasks_for_session(
+        &self,
+        session_id: &str,
+        since_inclusive: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<TaskRow>> {
+        let rows = if let Some(since_inclusive) = since_inclusive {
+            sqlx::query_as::<_, TaskRow>(
+                "SELECT task_id, owner_user_id, initiating_identity_id, primary_agent_id, assigned_agent_id, parent_task_id, session_id, kind, state, objective, context_summary, result_text, scope, wake_at, created_at, updated_at, completed_at
+                 FROM tasks
+                 WHERE session_id = ?
+                   AND kind = 'interactive'
+                   AND created_at >= ?
+                 ORDER BY created_at DESC
+                 LIMIT ?",
+            )
+            .bind(session_id)
+            .bind(since_inclusive)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await
+        } else {
+            sqlx::query_as::<_, TaskRow>(
+                "SELECT task_id, owner_user_id, initiating_identity_id, primary_agent_id, assigned_agent_id, parent_task_id, session_id, kind, state, objective, context_summary, result_text, scope, wake_at, created_at, updated_at, completed_at
+                 FROM tasks
+                 WHERE session_id = ?
+                   AND kind = 'interactive'
+                 ORDER BY created_at DESC
+                 LIMIT ?",
+            )
+            .bind(session_id)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await
+        }
+        .context("failed to list recent interactive tasks for session")?;
+        Ok(rows)
+    }
+
     pub async fn fetch_task(&self, task_id: &str) -> Result<Option<TaskRow>> {
         let row = sqlx::query_as::<_, TaskRow>(
-            "SELECT task_id, owner_user_id, initiating_identity_id, primary_agent_id, assigned_agent_id, parent_task_id, kind, state, objective, context_summary, result_text, scope, wake_at, created_at, updated_at, completed_at
+            "SELECT task_id, owner_user_id, initiating_identity_id, primary_agent_id, assigned_agent_id, parent_task_id, session_id, kind, state, objective, context_summary, result_text, scope, wake_at, created_at, updated_at, completed_at
              FROM tasks
              WHERE task_id = ?",
         )
@@ -1830,7 +2034,7 @@ impl Database {
     pub async fn fetch_next_runnable_task(&self) -> Result<Option<TaskRow>> {
         let now = now_rfc3339();
         let row = sqlx::query_as::<_, TaskRow>(
-            "SELECT task_id, owner_user_id, initiating_identity_id, primary_agent_id, assigned_agent_id, parent_task_id, kind, state, objective, context_summary, result_text, scope, wake_at, created_at, updated_at, completed_at
+            "SELECT task_id, owner_user_id, initiating_identity_id, primary_agent_id, assigned_agent_id, parent_task_id, session_id, kind, state, objective, context_summary, result_text, scope, wake_at, created_at, updated_at, completed_at
              FROM tasks
              WHERE state = ?
                AND (wake_at IS NULL OR wake_at <= ?)
@@ -1881,6 +2085,20 @@ impl Database {
         Ok(events)
     }
 
+    pub async fn fetch_task_events(&self, task_id: &str) -> Result<Vec<TaskEventRow>> {
+        let events = sqlx::query_as::<_, TaskEventRow>(
+            "SELECT event_id, task_id, event_type, actor_type, actor_id, payload_json, created_at
+             FROM task_events
+             WHERE task_id = ?
+             ORDER BY created_at ASC",
+        )
+        .bind(task_id)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to fetch task events")?;
+        Ok(events)
+    }
+
     pub async fn fetch_tool_invocations_for_owner(
         &self,
         owner_user_id: &str,
@@ -1912,12 +2130,23 @@ pub struct BootstrapState {
 }
 
 #[derive(Debug, Clone, Copy)]
+pub struct NewConversationSession<'a> {
+    pub session_kind: &'a str,
+    pub session_key: &'a str,
+    pub audience_policy: &'a str,
+    pub max_memory_scope: MemoryScope,
+    pub originating_connector_type: Option<&'a str>,
+    pub originating_connector_target: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, Copy)]
 pub struct NewTask<'a> {
     pub owner_user_id: &'a str,
     pub initiating_identity_id: &'a str,
     pub primary_agent_id: &'a str,
     pub assigned_agent_id: &'a str,
     pub parent_task_id: Option<&'a str>,
+    pub session_id: Option<&'a str>,
     pub kind: &'a str,
     pub objective: &'a str,
     pub context_summary: Option<&'a str>,
@@ -2056,6 +2285,7 @@ pub struct TaskRow {
     pub primary_agent_id: String,
     pub assigned_agent_id: String,
     pub parent_task_id: Option<String>,
+    pub session_id: Option<String>,
     pub kind: String,
     pub state: String,
     pub objective: String,
@@ -2066,6 +2296,23 @@ pub struct TaskRow {
     pub created_at: String,
     pub updated_at: String,
     pub completed_at: Option<String>,
+}
+
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct ConversationSessionRow {
+    pub session_id: String,
+    pub session_kind: String,
+    pub session_key: String,
+    pub audience_policy: String,
+    pub max_memory_scope: String,
+    pub originating_connector_type: Option<String>,
+    pub originating_connector_target: Option<String>,
+    pub last_activity_at: String,
+    pub last_reset_at: Option<String>,
+    pub archived_at: Option<String>,
+    pub lifecycle_reason: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
 }
 
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]

@@ -10,9 +10,10 @@ use beaverki_config::{LoadedConfig, SecretStore};
 use beaverki_core::{MemoryKind, MemoryScope, TaskState, now_rfc3339};
 use beaverki_db::{
     ApprovalActionRow, ApprovalActionSet, ApprovalRow, BootstrapState, ConnectorIdentityRow,
-    Database, IssueApprovalActions, MemoryRow, NewSchedule, NewScript, NewScriptReview, NewTask,
-    RoleRow, RuntimeHeartbeatRow, RuntimeSessionRow, ScheduleRow, ScriptReviewRow, ScriptRow,
-    TaskEventRow, TaskRow, ToolInvocationRow, UserRoleRow, UserRow,
+    ConversationSessionRow, Database, IssueApprovalActions, MemoryRow, NewConversationSession,
+    NewSchedule, NewScript, NewScriptReview, NewTask, RoleRow, RuntimeHeartbeatRow,
+    RuntimeSessionRow, ScheduleRow, ScriptReviewRow, ScriptRow, TaskEventRow, TaskRow,
+    ToolInvocationRow, UserRoleRow, UserRow,
 };
 use beaverki_memory::MemoryStore;
 use beaverki_models::{ModelProvider, OpenAiProvider};
@@ -35,6 +36,15 @@ const TASK_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(150);
 const CONNECTOR_MESSAGE_CONTEXT_EVENT: &str = "connector_message_context";
 const CLI_CONVERSATION_HISTORY_LIMIT: i64 = 4;
 const CLI_ACTIVE_CONVERSATION_WINDOW_SECS: i64 = 45 * 60;
+const SESSION_RESET_COMMAND: &str = "/new";
+const SESSION_KIND_CLI: &str = "cli";
+const SESSION_KIND_DIRECT_MESSAGE: &str = "direct_message";
+const SESSION_KIND_GROUP_ROOM: &str = "group_room";
+const SESSION_KIND_CRON_RUN: &str = "cron_run";
+const SESSION_AUDIENCE_DIRECT_USER: &str = "direct_user";
+const SESSION_AUDIENCE_SHARED_ROOM: &str = "shared_room";
+const SESSION_AUDIENCE_SCHEDULED_RUN: &str = "scheduled_run";
+const SESSION_LIFECYCLE_REASON_MANUAL_RESET: &str = "manual_reset";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskInspection {
@@ -169,8 +179,8 @@ impl Runtime {
     ) -> Result<AgentResult> {
         let user = self.resolve_user(user_id).await?;
         let initiating_identity_id = format!("cli:{}", user.user_id);
-        let request = self
-            .build_primary_request(&user, &initiating_identity_id, objective, scope)
+        let (request, _) = self
+            .prepare_cli_task_request(&user, &initiating_identity_id, objective, scope)
             .await?;
         self.runner.run_task(request).await
     }
@@ -183,40 +193,43 @@ impl Runtime {
     ) -> Result<TaskRow> {
         let user = self.resolve_user(user_id).await?;
         let initiating_identity_id = format!("cli:{}", user.user_id);
-        self.enqueue_objective_for_identity(&user, &initiating_identity_id, objective, None, scope)
+        let (request, session) = self
+            .prepare_cli_task_request(&user, &initiating_identity_id, objective, scope)
+            .await?;
+        self.create_task_from_request(&request, &session, None)
             .await
     }
 
     pub async fn enqueue_objective_from_connector(
         &self,
-        mapped_user_id: &str,
-        initiating_identity_id: &str,
-        objective: &str,
-        task_context: Option<&str>,
-        scope: MemoryScope,
-    ) -> Result<TaskRow> {
-        let user = self.resolve_user(Some(mapped_user_id)).await?;
-        self.enqueue_objective_for_identity(
-            &user,
-            initiating_identity_id,
-            objective,
-            task_context,
-            scope,
-        )
-        .await
-    }
-
-    async fn enqueue_objective_for_identity(
-        &self,
         user: &UserRow,
         initiating_identity_id: &str,
         objective: &str,
+        session: &ConversationSessionRow,
         task_context: Option<&str>,
         scope: MemoryScope,
     ) -> Result<TaskRow> {
         let request = self
-            .build_primary_request(user, initiating_identity_id, objective, scope)
+            .build_primary_request_for_session(
+                user,
+                initiating_identity_id,
+                objective,
+                scope,
+                session,
+                None,
+                task_context.map(ToOwned::to_owned),
+            )
             .await?;
+        self.create_task_from_request(&request, session, task_context)
+            .await
+    }
+
+    async fn create_task_from_request(
+        &self,
+        request: &AgentRequest,
+        session: &ConversationSessionRow,
+        task_context_override: Option<&str>,
+    ) -> Result<TaskRow> {
         self.db
             .create_task_with_params(NewTask {
                 owner_user_id: &request.owner_user_id,
@@ -224,13 +237,83 @@ impl Runtime {
                 primary_agent_id: &request.primary_agent_id,
                 assigned_agent_id: &request.assigned_agent_id,
                 parent_task_id: request.parent_task_id.as_deref(),
+                session_id: Some(&session.session_id),
                 kind: &request.kind,
                 objective: &request.objective,
-                context_summary: task_context.or(request.task_context.as_deref()),
+                context_summary: task_context_override.or(request.task_context.as_deref()),
                 scope: request.scope,
                 wake_at: None,
             })
             .await
+    }
+
+    async fn create_reset_task(
+        &self,
+        user: &UserRow,
+        initiating_identity_id: &str,
+        objective: &str,
+        session: &ConversationSessionRow,
+        scope: MemoryScope,
+    ) -> Result<TaskRow> {
+        let primary_agent_id = user
+            .primary_agent_id
+            .clone()
+            .ok_or_else(|| anyhow!("user '{}' has no primary agent", user.user_id))?;
+        let task = self
+            .db
+            .create_task_with_params(NewTask {
+                owner_user_id: &user.user_id,
+                initiating_identity_id,
+                primary_agent_id: &primary_agent_id,
+                assigned_agent_id: &primary_agent_id,
+                parent_task_id: None,
+                session_id: Some(&session.session_id),
+                kind: "interactive",
+                objective,
+                context_summary: Some("Conversation session reset handled by runtime."),
+                scope,
+                wake_at: None,
+            })
+            .await?;
+        self.db
+            .append_task_event(
+                &task.task_id,
+                "conversation_session_reset",
+                "runtime",
+                &self.config.runtime.instance_id,
+                json!({
+                    "session_id": session.session_id,
+                    "session_kind": session.session_kind,
+                    "session_key": session.session_key,
+                }),
+            )
+            .await?;
+        self.db
+            .complete_task(
+                &task.task_id,
+                "Started a new conversation. Durable memory and audit history were left intact.",
+            )
+            .await?;
+        self.db
+            .reset_conversation_session(&session.session_id, SESSION_LIFECYCLE_REASON_MANUAL_RESET)
+            .await?;
+        self.db
+            .record_audit_event(
+                "runtime",
+                &self.config.runtime.instance_id,
+                "conversation_session_reset",
+                json!({
+                    "session_id": session.session_id,
+                    "session_kind": session.session_kind,
+                    "session_key": session.session_key,
+                    "task_id": task.task_id,
+                }),
+            )
+            .await?;
+        self.db
+            .fetch_task_for_owner(&user.user_id, &task.task_id)
+            .await?
+            .ok_or_else(|| anyhow!("reset task '{}' disappeared after completion", task.task_id))
     }
 
     pub async fn execute_task(&self, task: TaskRow) -> Result<AgentResult> {
@@ -384,11 +467,14 @@ impl Runtime {
             .await?
             .ok_or_else(|| anyhow!("memory '{memory_id}' not found"))?;
         ensure_memory_visible_to_user(&memory, &user.user_id, &visible_scopes)?;
-        let memory_scope = memory
-            .scope
-            .parse::<MemoryScope>()
-            .map_err(|_| anyhow!("memory '{memory_id}' has unsupported scope '{}'", memory.scope))?;
-        if matches!(memory_scope, MemoryScope::Household) && !can_write_household_memory(&role_ids) {
+        let memory_scope = memory.scope.parse::<MemoryScope>().map_err(|_| {
+            anyhow!(
+                "memory '{memory_id}' has unsupported scope '{}'",
+                memory.scope
+            )
+        })?;
+        if matches!(memory_scope, MemoryScope::Household) && !can_write_household_memory(&role_ids)
+        {
             bail!(
                 "user '{}' is not allowed to forget household memory",
                 user.user_id
@@ -493,7 +579,8 @@ impl Runtime {
             intended_behavior_summary,
         )
         .await?;
-        let application = automation::apply_script_review(&review, &script.status, Some(&script.status));
+        let application =
+            automation::apply_script_review(&review, &script.status, Some(&script.status));
         self.db
             .update_script_safety(
                 &script.script_id,
@@ -801,6 +888,7 @@ impl Runtime {
                 "schedule_id": schedule.schedule_id,
             })
             .to_string();
+            let session = self.create_cron_run_session(&schedule.schedule_id).await?;
             self.db
                 .update_schedule_state(
                     &schedule.schedule_id,
@@ -817,6 +905,7 @@ impl Runtime {
                     primary_agent_id: &primary_agent_id,
                     assigned_agent_id: &primary_agent_id,
                     parent_task_id: None,
+                    session_id: Some(&session.session_id),
                     kind: "scheduled_lua",
                     objective: &objective,
                     context_summary: Some(&task_context),
@@ -897,7 +986,8 @@ impl Runtime {
         let execution = match execution {
             Ok(execution) => execution,
             Err(error) => {
-                if let Some(policy_error) = error.downcast_ref::<automation::LuaToolPolicyDenied>() {
+                if let Some(policy_error) = error.downcast_ref::<automation::LuaToolPolicyDenied>()
+                {
                     self.db
                         .append_task_event(
                             &task.task_id,
@@ -961,6 +1051,7 @@ impl Runtime {
                     primary_agent_id: &task.primary_agent_id,
                     assigned_agent_id: &task.assigned_agent_id,
                     parent_task_id: Some(&task.task_id),
+                    session_id: task.session_id.as_deref(),
                     kind: "lua_script",
                     objective: &task.objective,
                     context_summary: task.context_summary.as_deref(),
@@ -1341,33 +1432,128 @@ impl Runtime {
         }
     }
 
-    async fn build_primary_request(
+    async fn resolve_cli_conversation_session(
+        &self,
+        user: &UserRow,
+    ) -> Result<ConversationSessionRow> {
+        let session_key = format!("{SESSION_KIND_CLI}:{}", user.user_id);
+        self.db
+            .ensure_conversation_session(NewConversationSession {
+                session_kind: SESSION_KIND_CLI,
+                session_key: &session_key,
+                audience_policy: SESSION_AUDIENCE_DIRECT_USER,
+                max_memory_scope: MemoryScope::Household,
+                originating_connector_type: None,
+                originating_connector_target: None,
+            })
+            .await
+    }
+
+    pub(crate) async fn resolve_connector_conversation_session(
+        &self,
+        mapped_user_id: &str,
+        connector_type: &str,
+        channel_id: &str,
+        is_direct_message: bool,
+    ) -> Result<ConversationSessionRow> {
+        let (session_kind, session_key, audience_policy, max_memory_scope) = if is_direct_message {
+            (
+                SESSION_KIND_DIRECT_MESSAGE,
+                format!("{SESSION_KIND_DIRECT_MESSAGE}:{connector_type}:{mapped_user_id}"),
+                SESSION_AUDIENCE_DIRECT_USER,
+                MemoryScope::Private,
+            )
+        } else {
+            (
+                SESSION_KIND_GROUP_ROOM,
+                format!("{SESSION_KIND_GROUP_ROOM}:{connector_type}:{channel_id}"),
+                SESSION_AUDIENCE_SHARED_ROOM,
+                MemoryScope::Household,
+            )
+        };
+        self.db
+            .ensure_conversation_session(NewConversationSession {
+                session_kind,
+                session_key: &session_key,
+                audience_policy,
+                max_memory_scope,
+                originating_connector_type: Some(connector_type),
+                originating_connector_target: Some(channel_id),
+            })
+            .await
+    }
+
+    async fn create_cron_run_session(&self, schedule_id: &str) -> Result<ConversationSessionRow> {
+        let now = now_rfc3339();
+        let session_key = format!("{SESSION_KIND_CRON_RUN}:{schedule_id}:{now}");
+        self.db
+            .ensure_conversation_session(NewConversationSession {
+                session_kind: SESSION_KIND_CRON_RUN,
+                session_key: &session_key,
+                audience_policy: SESSION_AUDIENCE_SCHEDULED_RUN,
+                max_memory_scope: MemoryScope::Private,
+                originating_connector_type: None,
+                originating_connector_target: Some(schedule_id),
+            })
+            .await
+    }
+
+    async fn reset_cli_conversation_session(
+        &self,
+        user: &UserRow,
+        objective: &str,
+        requested_scope: MemoryScope,
+    ) -> Result<TaskRow> {
+        let session = self.resolve_cli_conversation_session(user).await?;
+        let effective_scope =
+            cap_task_scope_to_session(requested_scope, parse_session_max_scope(&session)?);
+        self.create_reset_task(
+            user,
+            &format!("cli:{}", user.user_id),
+            objective,
+            &session,
+            effective_scope,
+        )
+        .await
+    }
+
+    pub(crate) async fn reset_connector_conversation_session(
+        &self,
+        user: &UserRow,
+        initiating_identity_id: &str,
+        objective: &str,
+        session: &ConversationSessionRow,
+        requested_scope: MemoryScope,
+    ) -> Result<TaskRow> {
+        let effective_scope =
+            cap_task_scope_to_session(requested_scope, parse_session_max_scope(session)?);
+        self.create_reset_task(
+            user,
+            initiating_identity_id,
+            objective,
+            session,
+            effective_scope,
+        )
+        .await
+    }
+
+    async fn prepare_cli_task_request(
         &self,
         user: &UserRow,
         initiating_identity_id: &str,
         objective: &str,
         scope: MemoryScope,
-    ) -> Result<AgentRequest> {
-        let primary_agent_id = user
-            .primary_agent_id
-            .clone()
-            .ok_or_else(|| anyhow!("user '{}' has no primary agent", user.user_id))?;
-        let role_ids = self.user_role_ids(&user.user_id).await?;
-        let visible_scopes = visible_memory_scopes(&role_ids);
-        if matches!(scope, MemoryScope::Household)
-            && !visible_scopes.contains(&MemoryScope::Household)
-        {
-            bail!(
-                "user '{}' is not allowed to create household-scoped tasks",
-                user.user_id
-            );
-        }
+    ) -> Result<(AgentRequest, ConversationSessionRow)> {
+        let session = self.resolve_cli_conversation_session(user).await?;
         let recent_cli_exchanges = self
             .db
-            .list_recent_interactive_tasks_for_owner(&user.user_id, CLI_CONVERSATION_HISTORY_LIMIT)
+            .list_recent_interactive_tasks_for_session(
+                &session.session_id,
+                session.last_reset_at.as_deref(),
+                CLI_CONVERSATION_HISTORY_LIMIT,
+            )
             .await?
             .into_iter()
-            .filter(|task| task.initiating_identity_id == initiating_identity_id)
             .map(|task| CliConversationExchange {
                 created_at: task.created_at.clone(),
                 state: task.state.clone(),
@@ -1381,12 +1567,54 @@ impl Runtime {
             .map(|exchange| cli_conversation_status(&exchange.state, &exchange.created_at));
         let parent_task_id = if matches!(conversation_status, Some(CliConversationStatus::FollowUp))
         {
-            recent_cli_exchanges.first().map(|exchange| exchange.task_id.clone())
+            recent_cli_exchanges
+                .first()
+                .map(|exchange| exchange.task_id.clone())
         } else {
             None
         };
-        let task_context = (!recent_cli_exchanges.is_empty())
-            .then(|| build_cli_task_context(&recent_cli_exchanges));
+        let task_context = Some(build_cli_task_context(&recent_cli_exchanges));
+        let request = self
+            .build_primary_request_for_session(
+                user,
+                initiating_identity_id,
+                objective,
+                scope,
+                &session,
+                parent_task_id,
+                task_context,
+            )
+            .await?;
+        Ok((request, session))
+    }
+
+    async fn build_primary_request_for_session(
+        &self,
+        user: &UserRow,
+        initiating_identity_id: &str,
+        objective: &str,
+        requested_scope: MemoryScope,
+        session: &ConversationSessionRow,
+        parent_task_id: Option<String>,
+        task_context: Option<String>,
+    ) -> Result<AgentRequest> {
+        let primary_agent_id = user
+            .primary_agent_id
+            .clone()
+            .ok_or_else(|| anyhow!("user '{}' has no primary agent", user.user_id))?;
+        let role_ids = self.user_role_ids(&user.user_id).await?;
+        let session_max_scope = parse_session_max_scope(session)?;
+        let visible_scopes =
+            cap_scopes_to_session(visible_memory_scopes(&role_ids), session_max_scope);
+        let scope = cap_task_scope_to_session(requested_scope, session_max_scope);
+        if matches!(scope, MemoryScope::Household)
+            && !visible_scopes.contains(&MemoryScope::Household)
+        {
+            bail!(
+                "user '{}' is not allowed to create household-scoped tasks",
+                user.user_id
+            );
+        }
 
         Ok(AgentRequest {
             owner_user_id: user.user_id.clone(),
@@ -1422,6 +1650,17 @@ impl Runtime {
             .scope
             .parse::<MemoryScope>()
             .map_err(|_| anyhow!("unsupported task scope '{}'", task.scope))?;
+        let visible_scopes = if let Some(session_id) = task.session_id.as_deref() {
+            let session = self
+                .db
+                .fetch_conversation_session(session_id)
+                .await?
+                .ok_or_else(|| anyhow!("conversation session '{}' not found", session_id))?;
+            let session_max_scope = parse_session_max_scope(&session)?;
+            cap_scopes_to_session(visible_memory_scopes(&role_ids), session_max_scope)
+        } else {
+            visible_memory_scopes(&role_ids)
+        };
 
         let approved_automation_actions = self
             .db
@@ -1450,7 +1689,7 @@ impl Runtime {
             kind: task.kind.clone(),
             parent_task_id: task.parent_task_id.clone(),
             task_context: task.context_summary.clone(),
-            visible_scopes: visible_memory_scopes(&role_ids),
+            visible_scopes,
             memory_mode,
             approved_shell_commands,
             approved_automation_actions,
@@ -1759,7 +1998,9 @@ impl DaemonClient {
             .await?
         {
             DaemonResponse::Memories { memories } => Ok(memories),
-            other => Err(anyhow!("unexpected daemon memory history response: {other:?}")),
+            other => Err(anyhow!(
+                "unexpected daemon memory history response: {other:?}"
+            )),
         }
     }
 
@@ -1778,7 +2019,9 @@ impl DaemonClient {
             .await?
         {
             DaemonResponse::Memory { memory } => Ok(memory),
-            other => Err(anyhow!("unexpected daemon forget memory response: {other:?}")),
+            other => Err(anyhow!(
+                "unexpected daemon forget memory response: {other:?}"
+            )),
         }
     }
 
@@ -2175,24 +2418,47 @@ impl RuntimeDaemon {
                 wait,
             } => {
                 let scope = parse_scope(&scope)?;
-                let task = self
-                    .runtime
-                    .enqueue_objective(user_id.as_deref(), &objective, scope)
-                    .await?;
-                self.runtime
-                    .db
-                    .record_audit_event(
-                        "runtime",
-                        &self.current_session_id().await,
-                        "task_enqueued",
-                        json!({
-                            "task_id": task.task_id,
-                            "owner_user_id": task.owner_user_id,
-                            "scope": task.scope,
-                        }),
-                    )
-                    .await?;
-                self.wake_worker.notify_one();
+                let user = self.runtime.resolve_user(user_id.as_deref()).await?;
+                let is_reset = is_session_reset_command(&objective);
+                let task = if is_reset {
+                    self.runtime
+                        .reset_cli_conversation_session(&user, &objective, scope)
+                        .await?
+                } else {
+                    self.runtime
+                        .enqueue_objective(Some(&user.user_id), &objective, scope)
+                        .await?
+                };
+                if is_reset {
+                    self.runtime
+                        .db
+                        .record_audit_event(
+                            "runtime",
+                            &self.current_session_id().await,
+                            "conversation_session_reset_requested",
+                            json!({
+                                "task_id": task.task_id,
+                                "owner_user_id": task.owner_user_id,
+                                "scope": task.scope,
+                            }),
+                        )
+                        .await?;
+                } else {
+                    self.runtime
+                        .db
+                        .record_audit_event(
+                            "runtime",
+                            &self.current_session_id().await,
+                            "task_enqueued",
+                            json!({
+                                "task_id": task.task_id,
+                                "owner_user_id": task.owner_user_id,
+                                "scope": task.scope,
+                            }),
+                        )
+                        .await?;
+                    self.wake_worker.notify_one();
+                }
 
                 let task = if wait {
                     self.wait_for_task_state(&task.owner_user_id, &task.task_id)
@@ -2547,14 +2813,46 @@ fn parse_scope(value: &str) -> Result<MemoryScope> {
         .map_err(|_| anyhow!("unsupported scope '{value}', expected private or household"))
 }
 
+fn parse_session_max_scope(session: &ConversationSessionRow) -> Result<MemoryScope> {
+    parse_scope(&session.max_memory_scope).with_context(|| {
+        format!(
+            "conversation session '{}' has unsupported max memory scope '{}'",
+            session.session_id, session.max_memory_scope
+        )
+    })
+}
+
+fn cap_task_scope_to_session(scope: MemoryScope, session_max_scope: MemoryScope) -> MemoryScope {
+    match (scope, session_max_scope) {
+        (_, MemoryScope::Private) => MemoryScope::Private,
+        _ => scope,
+    }
+}
+
+fn cap_scopes_to_session(
+    scopes: Vec<MemoryScope>,
+    session_max_scope: MemoryScope,
+) -> Vec<MemoryScope> {
+    scopes
+        .into_iter()
+        .filter(|scope| {
+            matches!(session_max_scope, MemoryScope::Household)
+                || matches!(scope, MemoryScope::Private)
+        })
+        .collect()
+}
+
+fn is_session_reset_command(objective: &str) -> bool {
+    objective.trim() == SESSION_RESET_COMMAND
+}
+
 fn parse_memory_kind_filter(value: Option<&str>) -> Result<Option<MemoryKind>> {
     match value {
         None => Ok(None),
         Some("all") => Ok(None),
-        Some(value) => value
-            .parse::<MemoryKind>()
-            .map(Some)
-            .map_err(|_| anyhow!("unsupported memory kind '{value}', expected semantic or episodic")),
+        Some(value) => value.parse::<MemoryKind>().map(Some).map_err(|_| {
+            anyhow!("unsupported memory kind '{value}', expected semantic or episodic")
+        }),
     }
 }
 
@@ -2580,18 +2878,27 @@ fn ensure_memory_visible_to_user(
     user_id: &str,
     visible_scopes: &[MemoryScope],
 ) -> Result<()> {
-    let memory_scope = memory
-        .scope
-        .parse::<MemoryScope>()
-        .map_err(|_| anyhow!("memory '{}' has unsupported scope '{}'", memory.memory_id, memory.scope))?;
+    let memory_scope = memory.scope.parse::<MemoryScope>().map_err(|_| {
+        anyhow!(
+            "memory '{}' has unsupported scope '{}'",
+            memory.memory_id,
+            memory.scope
+        )
+    })?;
     if !visible_scopes.contains(&memory_scope) {
-        bail!("memory '{}' is not visible to the selected user", memory.memory_id);
+        bail!(
+            "memory '{}' is not visible to the selected user",
+            memory.memory_id
+        );
     }
 
     match memory.owner_user_id.as_deref() {
         Some(owner_user_id) if owner_user_id == user_id => Ok(()),
         None => Ok(()),
-        _ => bail!("memory '{}' is not visible to the selected user", memory.memory_id),
+        _ => bail!(
+            "memory '{}' is not visible to the selected user",
+            memory.memory_id
+        ),
     }
 }
 
@@ -2891,10 +3198,11 @@ mod tests {
         let (_tempdir, runtime) = test_runtime(vec![]).await;
         let user = runtime.default_user().clone();
         let initiating_identity_id = format!("cli:{}", user.user_id);
-        let primary_agent_id = user
-            .primary_agent_id
-            .clone()
-            .expect("primary agent id");
+        let primary_agent_id = user.primary_agent_id.clone().expect("primary agent id");
+        let session = runtime
+            .resolve_cli_conversation_session(&user)
+            .await
+            .expect("cli session");
         let prior_task = runtime
             .db
             .create_task_with_params(NewTask {
@@ -2903,6 +3211,7 @@ mod tests {
                 primary_agent_id: &primary_agent_id,
                 assigned_agent_id: &primary_agent_id,
                 parent_task_id: None,
+                session_id: Some(&session.session_id),
                 kind: "interactive",
                 objective: "How late is it?",
                 context_summary: None,
@@ -2917,8 +3226,8 @@ mod tests {
             .await
             .expect("complete prior task");
 
-        let request = runtime
-            .build_primary_request(
+        let (request, _) = runtime
+            .prepare_cli_task_request(
                 &user,
                 &initiating_identity_id,
                 "That is fine, but how do you know that?",
@@ -2927,11 +3236,364 @@ mod tests {
             .await
             .expect("build request");
 
-        assert_eq!(request.parent_task_id.as_deref(), Some(prior_task.task_id.as_str()));
+        assert_eq!(
+            request.parent_task_id.as_deref(),
+            Some(prior_task.task_id.as_str())
+        );
         let context = request.task_context.as_deref().expect("task context");
         assert!(context.contains("Conversation status: active follow-up"));
         assert!(context.contains("[CLI] User: How late is it?"));
         assert!(context.contains("[CLI] Assistant: It is 08:39 CEST on 2026-04-18."));
+    }
+
+    #[tokio::test]
+    async fn cli_session_reset_clears_prior_transcript_window() {
+        let (_tempdir, runtime) = test_runtime(vec![]).await;
+        let user = runtime.default_user().clone();
+        let initiating_identity_id = format!("cli:{}", user.user_id);
+
+        runtime
+            .enqueue_objective(
+                Some(&user.user_id),
+                "Remember this topic",
+                MemoryScope::Private,
+            )
+            .await
+            .expect("enqueue");
+        runtime
+            .reset_cli_conversation_session(&user, SESSION_RESET_COMMAND, MemoryScope::Private)
+            .await
+            .expect("reset");
+
+        let (request, session) = runtime
+            .prepare_cli_task_request(
+                &user,
+                &initiating_identity_id,
+                "Fresh topic after reset",
+                MemoryScope::Private,
+            )
+            .await
+            .expect("build request");
+
+        assert_eq!(request.parent_task_id, None);
+        let context = request.task_context.as_deref().expect("task context");
+        assert!(context.contains("new conversation"));
+        assert!(!context.contains("Remember this topic"));
+        assert!(session.last_reset_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn discord_dm_session_persists_across_dm_channel_ids_without_socket() {
+        let (_tempdir, mut runtime) = test_runtime(vec![]).await;
+        runtime.config.integrations.discord.task_wait_timeout_secs = 0;
+        let identity = runtime
+            .db
+            .upsert_connector_identity(
+                "discord",
+                "discord-user-dm",
+                None,
+                "user_alex",
+                "authenticated_message",
+            )
+            .await
+            .expect("mapping");
+        let db = runtime.db.clone();
+        let daemon = RuntimeDaemon::new(runtime);
+
+        daemon
+            .handle_connector_message(ConnectorMessageRequest {
+                connector_type: "discord".to_owned(),
+                external_user_id: identity.external_user_id.clone(),
+                external_display_name: Some("Torlenor".to_owned()),
+                channel_id: "dm-a".to_owned(),
+                message_id: "dm-msg-1".to_owned(),
+                content: "First DM message".to_owned(),
+                is_direct_message: true,
+            })
+            .await
+            .expect("first dm");
+        daemon
+            .handle_connector_message(ConnectorMessageRequest {
+                connector_type: "discord".to_owned(),
+                external_user_id: identity.external_user_id.clone(),
+                external_display_name: Some("Torlenor".to_owned()),
+                channel_id: "dm-b".to_owned(),
+                message_id: "dm-msg-2".to_owned(),
+                content: "Second DM message".to_owned(),
+                is_direct_message: true,
+            })
+            .await
+            .expect("second dm");
+
+        let recent_tasks = db
+            .list_recent_interactive_tasks_for_owner("user_alex", 2)
+            .await
+            .expect("recent tasks");
+        assert_eq!(recent_tasks.len(), 2);
+        assert_eq!(recent_tasks[0].session_id, recent_tasks[1].session_id);
+        let context = recent_tasks[0]
+            .context_summary
+            .as_deref()
+            .expect("dm context");
+        assert!(context.contains("direct-message entrypoints"));
+        assert!(context.contains("First DM message"));
+    }
+
+    #[tokio::test]
+    async fn discord_channel_and_dm_sessions_are_isolated_without_socket() {
+        let (_tempdir, mut runtime) = test_runtime(vec![]).await;
+        runtime.config.integrations.discord.allowed_channel_ids = vec!["channel-1".to_owned()];
+        runtime.config.integrations.discord.task_wait_timeout_secs = 0;
+        let identity = runtime
+            .db
+            .upsert_connector_identity(
+                "discord",
+                "discord-user-isolated",
+                Some("channel-1"),
+                "user_alex",
+                "authenticated_message",
+            )
+            .await
+            .expect("mapping");
+        let db = runtime.db.clone();
+        let daemon = RuntimeDaemon::new(runtime);
+
+        daemon
+            .handle_connector_message(ConnectorMessageRequest {
+                connector_type: "discord".to_owned(),
+                external_user_id: identity.external_user_id.clone(),
+                external_display_name: Some("Torlenor".to_owned()),
+                channel_id: "channel-1".to_owned(),
+                message_id: "channel-msg-1".to_owned(),
+                content: "!bk First channel message".to_owned(),
+                is_direct_message: false,
+            })
+            .await
+            .expect("channel message");
+        daemon
+            .handle_connector_message(ConnectorMessageRequest {
+                connector_type: "discord".to_owned(),
+                external_user_id: identity.external_user_id.clone(),
+                external_display_name: Some("Torlenor".to_owned()),
+                channel_id: "dm-1".to_owned(),
+                message_id: "dm-msg-1".to_owned(),
+                content: "Fresh DM message".to_owned(),
+                is_direct_message: true,
+            })
+            .await
+            .expect("dm message");
+
+        let recent_tasks = db
+            .list_recent_interactive_tasks_for_owner("user_alex", 2)
+            .await
+            .expect("recent tasks");
+        assert_ne!(recent_tasks[0].session_id, recent_tasks[1].session_id);
+        let context = recent_tasks[0]
+            .context_summary
+            .as_deref()
+            .expect("dm context");
+        assert!(!context.contains("First channel message"));
+    }
+
+    #[tokio::test]
+    async fn shared_room_session_is_shared_across_mapped_users() {
+        let (_tempdir, mut runtime) = test_runtime(vec![]).await;
+        runtime.config.integrations.discord.allowed_channel_ids = vec!["room-1".to_owned()];
+        runtime.config.integrations.discord.task_wait_timeout_secs = 0;
+        runtime
+            .create_user("Casey", &[String::from("adult")])
+            .await
+            .expect("create user");
+        runtime
+            .db
+            .upsert_connector_identity(
+                "discord",
+                "discord-user-room-a",
+                Some("room-1"),
+                "user_alex",
+                "authenticated_message",
+            )
+            .await
+            .expect("mapping alex");
+        runtime
+            .db
+            .upsert_connector_identity(
+                "discord",
+                "discord-user-room-b",
+                Some("room-1"),
+                "user_casey",
+                "authenticated_message",
+            )
+            .await
+            .expect("mapping casey");
+        let db = runtime.db.clone();
+        let daemon = RuntimeDaemon::new(runtime);
+
+        daemon
+            .handle_connector_message(ConnectorMessageRequest {
+                connector_type: "discord".to_owned(),
+                external_user_id: "discord-user-room-a".to_owned(),
+                external_display_name: Some("Alex".to_owned()),
+                channel_id: "room-1".to_owned(),
+                message_id: "room-msg-1".to_owned(),
+                content: "!bk First room message".to_owned(),
+                is_direct_message: false,
+            })
+            .await
+            .expect("first room message");
+        daemon
+            .handle_connector_message(ConnectorMessageRequest {
+                connector_type: "discord".to_owned(),
+                external_user_id: "discord-user-room-b".to_owned(),
+                external_display_name: Some("Casey".to_owned()),
+                channel_id: "room-1".to_owned(),
+                message_id: "room-msg-2".to_owned(),
+                content: "!bk Follow-up from Casey".to_owned(),
+                is_direct_message: false,
+            })
+            .await
+            .expect("second room message");
+
+        let recent_tasks = db
+            .list_recent_interactive_tasks_for_owner("user_casey", 1)
+            .await
+            .expect("casey tasks");
+        let task = recent_tasks.first().expect("casey task");
+        let context = task.context_summary.as_deref().expect("room context");
+        assert!(context.contains("shared connector room"));
+        assert!(context.contains("First room message"));
+    }
+
+    #[tokio::test]
+    async fn group_room_private_cap_downgrades_household_scope() {
+        let (_tempdir, mut runtime) = test_runtime(vec![]).await;
+        runtime.config.integrations.discord.allowed_channel_ids = vec!["room-2".to_owned()];
+        runtime.config.integrations.discord.task_wait_timeout_secs = 0;
+        runtime
+            .db
+            .upsert_connector_identity(
+                "discord",
+                "discord-user-room-cap",
+                Some("room-2"),
+                "user_alex",
+                "authenticated_message",
+            )
+            .await
+            .expect("mapping");
+        let session = runtime
+            .resolve_connector_conversation_session("user_alex", "discord", "room-2", false)
+            .await
+            .expect("session");
+        runtime
+            .db
+            .update_conversation_session_policy(
+                &session.session_id,
+                "guest_room",
+                MemoryScope::Private,
+                Some("test_cap"),
+            )
+            .await
+            .expect("cap session");
+        let db = runtime.db.clone();
+        let daemon = RuntimeDaemon::new(runtime);
+
+        daemon
+            .handle_connector_message(ConnectorMessageRequest {
+                connector_type: "discord".to_owned(),
+                external_user_id: "discord-user-room-cap".to_owned(),
+                external_display_name: Some("Alex".to_owned()),
+                channel_id: "room-2".to_owned(),
+                message_id: "room-cap-msg-1".to_owned(),
+                content: "!bk Message in capped room".to_owned(),
+                is_direct_message: false,
+            })
+            .await
+            .expect("room message");
+
+        let task = db
+            .list_recent_interactive_tasks_for_owner("user_alex", 1)
+            .await
+            .expect("recent task")
+            .into_iter()
+            .next()
+            .expect("task");
+        assert_eq!(task.scope, "private");
+        let request = daemon
+            .runtime
+            .build_request_from_task("user_alex", &task, Vec::new())
+            .await
+            .expect("request");
+        assert_eq!(request.visible_scopes, vec![MemoryScope::Private]);
+    }
+
+    #[tokio::test]
+    async fn discord_new_resets_session_without_agent_roundtrip() {
+        let (_tempdir, mut runtime) = test_runtime(vec![]).await;
+        runtime.config.integrations.discord.task_wait_timeout_secs = 0;
+        runtime
+            .db
+            .upsert_connector_identity(
+                "discord",
+                "discord-user-reset",
+                None,
+                "user_alex",
+                "authenticated_message",
+            )
+            .await
+            .expect("mapping");
+        let db = runtime.db.clone();
+        let daemon = RuntimeDaemon::new(runtime);
+
+        daemon
+            .handle_connector_message(ConnectorMessageRequest {
+                connector_type: "discord".to_owned(),
+                external_user_id: "discord-user-reset".to_owned(),
+                external_display_name: Some("Alex".to_owned()),
+                channel_id: "dm-reset-1".to_owned(),
+                message_id: "dm-reset-msg-1".to_owned(),
+                content: "Old DM message".to_owned(),
+                is_direct_message: true,
+            })
+            .await
+            .expect("first dm");
+        let reset_reply = daemon
+            .handle_connector_message(ConnectorMessageRequest {
+                connector_type: "discord".to_owned(),
+                external_user_id: "discord-user-reset".to_owned(),
+                external_display_name: Some("Alex".to_owned()),
+                channel_id: "dm-reset-2".to_owned(),
+                message_id: "dm-reset-msg-2".to_owned(),
+                content: SESSION_RESET_COMMAND.to_owned(),
+                is_direct_message: true,
+            })
+            .await
+            .expect("reset");
+        assert_eq!(
+            reset_reply.reply.as_deref(),
+            Some("Started a new conversation. Durable memory and audit history were left intact.")
+        );
+        daemon
+            .handle_connector_message(ConnectorMessageRequest {
+                connector_type: "discord".to_owned(),
+                external_user_id: "discord-user-reset".to_owned(),
+                external_display_name: Some("Alex".to_owned()),
+                channel_id: "dm-reset-3".to_owned(),
+                message_id: "dm-reset-msg-3".to_owned(),
+                content: "New DM message".to_owned(),
+                is_direct_message: true,
+            })
+            .await
+            .expect("new dm");
+
+        let latest_task = db
+            .list_recent_interactive_tasks_for_owner("user_alex", 1)
+            .await
+            .expect("recent task")
+            .into_iter()
+            .next()
+            .expect("task");
+        let context = latest_task.context_summary.as_deref().expect("context");
+        assert!(!context.contains("Old DM message"));
     }
 
     #[test]
@@ -3338,14 +4000,9 @@ end"#,
             .await
             .expect("create schedule");
 
-        db.update_schedule_state(
-            "sched_audit_chain",
-            true,
-            &now_rfc3339(),
-            None,
-        )
-        .await
-        .expect("force due schedule");
+        db.update_schedule_state("sched_audit_chain", true, &now_rfc3339(), None)
+            .await
+            .expect("force due schedule");
 
         let result = runtime
             .execute_next_runnable_task()
@@ -3429,6 +4086,7 @@ end"#,
                 primary_agent_id: &primary_agent_id,
                 assigned_agent_id: &primary_agent_id,
                 parent_task_id: None,
+                session_id: None,
                 kind: "lua_script",
                 objective: "Run a denied Lua script",
                 context_summary: Some(&task_context),
@@ -3438,7 +4096,10 @@ end"#,
             .await
             .expect("task");
 
-        let error = runtime.execute_task(task.clone()).await.expect_err("policy denial");
+        let error = runtime
+            .execute_task(task.clone())
+            .await
+            .expect_err("policy denial");
         let policy_error = error
             .downcast_ref::<automation::LuaToolPolicyDenied>()
             .expect("typed policy error");
@@ -3583,16 +4244,18 @@ end"#,
             .list_recent_interactive_tasks_for_owner("user_alex", 2)
             .await
             .expect("recent tasks");
-        let latest_task = recent_tasks.first().expect("latest task");
+        let latest_task = recent_tasks
+            .iter()
+            .find(|task| task.objective == "Follow up in DM")
+            .expect("latest dm task");
         let context = latest_task
             .context_summary
             .as_deref()
             .expect("context summary");
-        assert!(context.contains("Conversation history is shared across this BeaverKI user"));
-        assert!(context.contains(
+        assert!(context.contains("direct-message entrypoints"));
+        assert!(!context.contains(
             "[Discord channel | channel channel-1] User (Torlenor): First channel message"
         ));
-        assert!(context.contains("[Discord channel | channel channel-1] Assistant: channel reply"));
 
         client.shutdown().await.expect("shutdown request");
         handle.await.expect("join").expect("daemon result");
@@ -4409,11 +5072,21 @@ end"#,
         assert!(!active.iter().any(|memory| memory.memory_id == memory_id));
 
         let history = runtime
-            .memory_history(Some("user_alex"), "profile.wifi_password", Some("private"), Some("fact"), 10)
+            .memory_history(
+                Some("user_alex"),
+                "profile.wifi_password",
+                Some("private"),
+                Some("fact"),
+                10,
+            )
             .await
             .expect("memory history");
         assert!(history.iter().any(|memory| memory.memory_id == memory_id));
         let audit_events = runtime.db.list_audit_events(8).await.expect("audit events");
-        assert!(audit_events.iter().any(|event| event.event_type == "memory_forgotten"));
+        assert!(
+            audit_events
+                .iter()
+                .any(|event| event.event_type == "memory_forgotten")
+        );
     }
 }

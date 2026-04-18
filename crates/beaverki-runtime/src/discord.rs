@@ -4,8 +4,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use beaverki_db::{
-    ApprovalActionRow, ApprovalActionSet, ApprovalRow, ConnectorIdentityRow, Database,
-    TaskEventRow, TaskRow,
+    ApprovalActionRow, ApprovalActionSet, ApprovalRow, ConnectorIdentityRow,
+    ConversationSessionRow, Database, TaskEventRow, TaskRow,
 };
 use beaverki_policy::can_grant_approvals;
 use chrono::{DateTime, Utc};
@@ -713,6 +713,33 @@ impl RuntimeDaemon {
             .runtime
             .resolve_user(Some(&identity.mapped_user_id))
             .await?;
+        let session = self
+            .runtime
+            .resolve_connector_conversation_session(
+                &identity.mapped_user_id,
+                &message.connector_type,
+                &message.channel_id,
+                message.is_direct_message,
+            )
+            .await?;
+        if crate::is_session_reset_command(&command_text) {
+            self.runtime
+                .reset_connector_conversation_session(
+                    &mapped_user,
+                    &identity.identity_id,
+                    &command_text,
+                    &session,
+                    scope,
+                )
+                .await?;
+            return Ok(ConnectorMessageReply {
+                accepted: true,
+                reply: Some(
+                    "Started a new conversation. Durable memory and audit history were left intact."
+                        .to_owned(),
+                ),
+            });
+        }
         let user_label = message
             .external_display_name
             .as_deref()
@@ -720,12 +747,13 @@ impl RuntimeDaemon {
             .unwrap_or(mapped_user.display_name.as_str());
         let recent_exchanges = load_recent_conversation_exchanges(
             &self.runtime.db,
-            &identity.mapped_user_id,
+            &session,
             mapped_user.display_name.as_str(),
         )
         .await?;
         let current_source_label = discord_source_label(message.is_direct_message);
         let task_context = build_discord_task_context(
+            &session,
             &recent_exchanges,
             current_source_label,
             user_label,
@@ -734,9 +762,10 @@ impl RuntimeDaemon {
         let task = self
             .runtime
             .enqueue_objective_from_connector(
-                &identity.mapped_user_id,
+                &mapped_user,
                 &identity.identity_id,
                 &command_text,
+                &session,
                 Some(&task_context),
                 scope,
             )
@@ -1344,6 +1373,7 @@ struct ConversationExchange {
 }
 
 fn build_discord_task_context(
+    session: &ConversationSessionRow,
     recent_exchanges: &[ConversationExchange],
     current_source_label: &str,
     user_label: &str,
@@ -1354,9 +1384,18 @@ fn build_discord_task_context(
     context.push_str(&format!("- Source: {}.\n", current_source_label));
     context.push_str(&format!("- Channel ID: {}.\n", channel_id));
     context.push_str(&format!("- Current user label: {}.\n", user_label));
-    context.push_str(
-        "- Conversation history is shared across this BeaverKI user, even when they switch channels or connectors.\n",
-    );
+    context.push_str(&format!("- Session kind: {}.\n", session.session_kind));
+    match session.session_kind.as_str() {
+        "direct_message" => context.push_str(
+            "- Conversation history is shared across direct-message entrypoints for this mapped BeaverKI user.\n",
+        ),
+        "group_room" => context.push_str(
+            "- Conversation history is scoped to this shared connector room rather than the user's wider personal history.\n",
+        ),
+        _ => context.push_str(
+            "- Conversation history is scoped to this connector session.\n",
+        ),
+    }
 
     let Some(latest_exchange) = recent_exchanges.first() else {
         context.push_str(
@@ -1498,17 +1537,19 @@ fn discord_source_label(is_direct_message: bool) -> &'static str {
 
 async fn load_recent_conversation_exchanges(
     db: &Database,
-    owner_user_id: &str,
+    session: &ConversationSessionRow,
     fallback_user_label: &str,
 ) -> Result<Vec<ConversationExchange>> {
     let tasks = db
-        .list_recent_interactive_tasks_for_owner(owner_user_id, DISCORD_CONVERSATION_HISTORY_LIMIT)
+        .list_recent_interactive_tasks_for_session(
+            &session.session_id,
+            session.last_reset_at.as_deref(),
+            DISCORD_CONVERSATION_HISTORY_LIMIT,
+        )
         .await?;
     let mut exchanges = Vec::with_capacity(tasks.len());
     for task in tasks {
-        let events = db
-            .fetch_task_events_for_owner(owner_user_id, &task.task_id)
-            .await?;
+        let events = db.fetch_task_events(&task.task_id).await?;
         exchanges.push(build_conversation_exchange(
             &task,
             &events,
@@ -1722,7 +1763,7 @@ fn retry_delay_for_error(error: &anyhow::Error) -> Option<Duration> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use beaverki_db::{TaskEventRow, TaskRow};
+    use beaverki_db::{ConversationSessionRow, TaskEventRow, TaskRow};
     use chrono::{Duration as ChronoDuration, Utc};
 
     fn test_task(task_id: &str, state: &str, result_text: Option<&str>) -> TaskRow {
@@ -1733,6 +1774,7 @@ mod tests {
             primary_agent_id: "agent_alex".to_owned(),
             assigned_agent_id: "agent_alex".to_owned(),
             parent_task_id: None,
+            session_id: None,
             kind: "interactive".to_owned(),
             state: state.to_owned(),
             objective: "test objective".to_owned(),
@@ -1743,6 +1785,24 @@ mod tests {
             created_at: "2026-04-17T00:00:00Z".to_owned(),
             updated_at: "2026-04-17T00:00:00Z".to_owned(),
             completed_at: None,
+        }
+    }
+
+    fn test_session(session_kind: &str) -> ConversationSessionRow {
+        ConversationSessionRow {
+            session_id: "conversation_session_123".to_owned(),
+            session_kind: session_kind.to_owned(),
+            session_key: format!("{session_kind}:test"),
+            audience_policy: "test".to_owned(),
+            max_memory_scope: "private".to_owned(),
+            originating_connector_type: Some("discord".to_owned()),
+            originating_connector_target: Some("dm-1".to_owned()),
+            last_activity_at: "2026-04-17T00:00:00Z".to_owned(),
+            last_reset_at: None,
+            archived_at: None,
+            lifecycle_reason: None,
+            created_at: "2026-04-17T00:00:00Z".to_owned(),
+            updated_at: "2026-04-17T00:00:00Z".to_owned(),
         }
     }
 
@@ -1822,6 +1882,7 @@ mod tests {
         };
 
         let context = build_discord_task_context(
+            &test_session("direct_message"),
             &[recent_exchange],
             "Discord direct message",
             "Torlenor",
@@ -1850,6 +1911,7 @@ mod tests {
         };
 
         let context = build_discord_task_context(
+            &test_session("direct_message"),
             &[stale_exchange],
             "Discord direct message",
             "Torlenor",

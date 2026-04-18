@@ -18,6 +18,7 @@ Once the workspace, CI, and initial runtime scaffolding exist, these stories sho
 - Keep milestones small enough to ship incrementally.
 - Prefer end-to-end slices over subsystem stubs with no usable path.
 - Do not start a later milestone if the earlier one is still architecturally unstable.
+- When a milestone changes user-visible behavior or operator workflows, update or add user-facing documentation as part of that milestone when appropriate.
 - Treat this document as the pre-issue backlog, not as the long-term source of truth once GitHub issue management is active.
 
 ## 3. Milestones
@@ -261,7 +262,7 @@ Introduce first-class conversation sessions so BeaverKI separates transcript con
 
 Status:
 
-- proposed as the next milestone after M4
+- implemented in the repository
 
 Implementation notes:
 
@@ -321,6 +322,7 @@ Implementation notes:
 - scheduled cleanup should call the same reset or archive primitive introduced in `M4.5` rather than adding a second cleanup mechanism
 - scheduled cleanup should reset transcript continuity without deleting audit rows or durable memory
 - the first implementation should favor simple deterministic policies such as inactivity TTLs or fixed cleanup windows over semantic heuristics
+- commands to view and manage sessions via CLI should be added so operators can inspect active sessions, their last activity time, and manually trigger resets or archival when needed
 - manual reset through `/new` remains part of M4.5; this milestone adds automatic policies and operator controls around them
 
 Out of scope:
@@ -334,11 +336,14 @@ Stories:
 - `M4.6-002` Implement scheduled runtime cleanup that automatically resets or archives eligible sessions without deleting tasks, audits, or durable memory.
 - `M4.6-003` Add operator-facing inspection and policy controls for session state, including visibility into last activity, reset markers, and lifecycle reason.
 - `M4.6-004` Add audit coverage and end-to-end tests for timed session clearing, policy exemptions, repeated cleanup idempotency, and separation between transcript reset versus memory forgetting.
+- `M4.6-005` Add CLI commands to list active sessions per user, inspect their state and activity, and manually trigger resets or archival when needed.
 
 Exit criteria:
 
 - sessions can be automatically reset or archived at configured time points or inactivity thresholds
 - automatic cleanup is deterministic, auditable, and does not delete durable memory or task history
+- operators can view active sessions, their last activity time, and lifecycle state through CLI commands
+- operators can manually trigger session resets or archival through CLI commands when needed
 - operators can inspect why a session was reset or archived and which lifecycle policy applied
 
 ## 3.10 M4.7 Lua-Defined Tools

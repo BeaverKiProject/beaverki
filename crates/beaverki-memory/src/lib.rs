@@ -31,8 +31,12 @@ pub struct SemanticMemoryRecord<'a> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SemanticMemoryWriteResult {
-    Created { memory_id: String },
-    Deduplicated { memory_id: String },
+    Created {
+        memory_id: String,
+    },
+    Deduplicated {
+        memory_id: String,
+    },
     Corrected {
         previous_memory_id: String,
         memory_id: String,
