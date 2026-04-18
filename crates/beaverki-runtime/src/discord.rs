@@ -132,8 +132,10 @@ pub(crate) async fn run_discord_loop(daemon: Arc<RuntimeDaemon>) -> Result<()> {
         .map(ToOwned::to_owned)
         .ok_or_else(|| anyhow!("Discord connector is enabled but no bot token is loaded"))?;
     let http_client = build_discord_http_client()?;
+    let bot_user_id = fetch_discord_current_user_id(&http_client, &token).await?;
 
-    if let Err(error) = sync_discord_global_commands(&daemon, &http_client, &token).await
+    if let Err(error) =
+        sync_discord_global_commands(&daemon, &http_client, &token, &bot_user_id).await
     {
         warn!("failed to sync Discord global commands: {error:#}");
         daemon
@@ -159,7 +161,7 @@ pub(crate) async fn run_discord_loop(daemon: Arc<RuntimeDaemon>) -> Result<()> {
             "discord",
             "discord_connector_started",
             json!({
-                "allowed_channel_ids": daemon.runtime.config.integrations.discord.allowed_channel_ids,
+                "allowed_channels": daemon.runtime.config.integrations.discord.allowed_channels,
                 "command_prefix": daemon.runtime.config.integrations.discord.command_prefix,
             }),
         )
@@ -171,7 +173,7 @@ pub(crate) async fn run_discord_loop(daemon: Arc<RuntimeDaemon>) -> Result<()> {
             return Ok(());
         }
 
-        match run_gateway_session(Arc::clone(&daemon), &http_client, &token).await {
+        match run_gateway_session(Arc::clone(&daemon), &http_client, &token, &bot_user_id).await {
             Ok(()) => return Ok(()),
             Err(error) => {
                 warn!("discord connector session failed: {error:#}");
@@ -200,6 +202,7 @@ async fn run_gateway_session(
     daemon: Arc<RuntimeDaemon>,
     http_client: &reqwest::Client,
     token: &str,
+    bot_user_id: &str,
 ) -> Result<()> {
     let gateway_response = http_client
         .get(DISCORD_GATEWAY_URL)
@@ -284,13 +287,19 @@ async fn run_gateway_session(
                                                 .handle_discord_gateway_message(
                                                     http_client,
                                                     token,
+                                                    bot_user_id,
                                                     ConnectorMessageRequest {
                                                         connector_type: "discord".to_owned(),
                                                         external_user_id: message.author.id,
                                                         external_display_name,
                                                         channel_id: message.channel_id.clone(),
                                                         message_id: message.id,
-                                                        content: message.content,
+                                                        content: rewrite_channel_message_for_bot_mention(
+                                                            &message.content,
+                                                            message.guild_id.is_none(),
+                                                            &daemon.runtime.config.integrations.discord.command_prefix,
+                                                            bot_user_id,
+                                                        ),
                                                         is_direct_message: message.guild_id.is_none(),
                                                     },
                                                 )
@@ -399,8 +408,8 @@ async fn sync_discord_global_commands(
     daemon: &RuntimeDaemon,
     http_client: &reqwest::Client,
     token: &str,
+    application_id: &str,
 ) -> Result<()> {
-    let application_id = fetch_discord_application_id(http_client, token).await?;
     let commands = list_discord_global_commands(http_client, token, &application_id).await?;
     let desired_commands = discord_global_command_payloads();
     if discord_command_sets_match(&commands, &desired_commands) {
@@ -421,7 +430,8 @@ async fn sync_discord_global_commands(
         return Ok(());
     }
 
-    overwrite_discord_global_commands(http_client, token, &application_id, &desired_commands).await?;
+    overwrite_discord_global_commands(http_client, token, &application_id, &desired_commands)
+        .await?;
     daemon
         .runtime
         .db
@@ -443,7 +453,7 @@ async fn sync_discord_global_commands(
     Ok(())
 }
 
-async fn fetch_discord_application_id(
+async fn fetch_discord_current_user_id(
     http_client: &reqwest::Client,
     token: &str,
 ) -> Result<String> {
@@ -467,7 +477,9 @@ async fn list_discord_global_commands(
     application_id: &str,
 ) -> Result<Vec<DiscordRegisteredCommand>> {
     http_client
-        .get(format!("{DISCORD_API_BASE}/applications/{application_id}/commands"))
+        .get(format!(
+            "{DISCORD_API_BASE}/applications/{application_id}/commands"
+        ))
         .header("Authorization", format!("Bot {token}"))
         .send()
         .await
@@ -492,7 +504,9 @@ async fn overwrite_discord_global_commands(
     payload: &[Value],
 ) -> Result<()> {
     http_client
-        .put(format!("{DISCORD_API_BASE}/applications/{application_id}/commands"))
+        .put(format!(
+            "{DISCORD_API_BASE}/applications/{application_id}/commands"
+        ))
         .header("Authorization", format!("Bot {token}"))
         .json(&payload)
         .send()
@@ -583,7 +597,10 @@ fn discord_global_command_payloads() -> Vec<Value> {
     ]
 }
 
-fn discord_command_sets_match(commands: &[DiscordRegisteredCommand], desired_commands: &[Value]) -> bool {
+fn discord_command_sets_match(
+    commands: &[DiscordRegisteredCommand],
+    desired_commands: &[Value],
+) -> bool {
     if commands.len() != desired_commands.len() {
         return false;
     }
@@ -599,9 +616,16 @@ fn discord_registered_command_matches_payload(
     command: &DiscordRegisteredCommand,
     desired_command: &Value,
 ) -> bool {
-    command.name == desired_command.get("name").and_then(Value::as_str).unwrap_or_default()
+    command.name
+        == desired_command
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
         && command.command_type
-            == desired_command.get("type").and_then(Value::as_i64).unwrap_or_default()
+            == desired_command
+                .get("type")
+                .and_then(Value::as_i64)
+                .unwrap_or_default()
         && command.description
             == desired_command
                 .get("description")
@@ -655,15 +679,11 @@ async fn send_discord_interaction_callback(
         .send()
         .await
         .with_context(|| {
-            format!(
-                "failed to send Discord interaction callback for interaction {interaction_id}"
-            )
+            format!("failed to send Discord interaction callback for interaction {interaction_id}")
         })?
         .error_for_status()
         .with_context(|| {
-            format!(
-                "Discord rejected interaction callback for interaction {interaction_id}"
-            )
+            format!("Discord rejected interaction callback for interaction {interaction_id}")
         })?;
     Ok(())
 }
@@ -683,15 +703,11 @@ async fn edit_discord_interaction_response(
         .send()
         .await
         .with_context(|| {
-            format!(
-                "failed to edit Discord interaction response for application {application_id}"
-            )
+            format!("failed to edit Discord interaction response for application {application_id}")
         })?
         .error_for_status()
         .with_context(|| {
-            format!(
-                "Discord rejected interaction response edit for application {application_id}"
-            )
+            format!("Discord rejected interaction response edit for application {application_id}")
         })?;
     Ok(())
 }
@@ -957,14 +973,9 @@ impl RuntimeDaemon {
                 )
                 .await?;
 
-                let reply_text = match self
-                    .handle_discord_application_command(interaction)
-                    .await
-                {
+                let reply_text = match self.handle_discord_application_command(interaction).await {
                     Ok(Some(reply_text)) => reply_text,
-                    Ok(None) => {
-                        "This Discord command is not enabled in this context.".to_owned()
-                    }
+                    Ok(None) => "This Discord command is not enabled in this context.".to_owned(),
                     Err(error) => {
                         warn!("discord interaction handling failed: {error:#}");
                         format!("Discord command failed: {error}")
@@ -1003,7 +1014,12 @@ impl RuntimeDaemon {
         let author = interaction
             .user
             .as_ref()
-            .or_else(|| interaction.member.as_ref().and_then(|member| member.user.as_ref()))
+            .or_else(|| {
+                interaction
+                    .member
+                    .as_ref()
+                    .and_then(|member| member.user.as_ref())
+            })
             .ok_or_else(|| anyhow!("Discord interaction missing user payload"))?;
         let data = interaction
             .data
@@ -1014,7 +1030,13 @@ impl RuntimeDaemon {
         let content = if is_direct_message {
             command_text
         } else {
-            let prefix = self.runtime.config.integrations.discord.command_prefix.trim();
+            let prefix = self
+                .runtime
+                .config
+                .integrations
+                .discord
+                .command_prefix
+                .trim();
             if prefix.is_empty() {
                 command_text
             } else {
@@ -1037,6 +1059,7 @@ impl RuntimeDaemon {
         &self,
         http_client: &reqwest::Client,
         token: &str,
+        _bot_user_id: &str,
         message: ConnectorMessageRequest,
     ) -> Result<ConnectorMessageReply> {
         self.handle_connector_message_internal(message, Some((http_client, token)))
@@ -1074,12 +1097,19 @@ impl RuntimeDaemon {
             .await?;
 
         let discord_config = &self.runtime.config.integrations.discord;
-        if !message.is_direct_message
-            && !discord_config
-                .allowed_channel_ids
-                .iter()
-                .any(|channel_id| channel_id == &message.channel_id)
-        {
+        if !message.is_direct_message && !discord_config.is_allowed_channel(&message.channel_id) {
+            let attempted_trigger = is_channel_trigger_attempt(
+                message.content.as_str(),
+                discord_config.command_prefix.as_str(),
+            );
+            if attempted_trigger {
+                warn!(
+                    channel_id = %message.channel_id,
+                    external_user_id = %message.external_user_id,
+                    message_id = %message.message_id,
+                    "Discord connector ignored a command-like message from a non-allowlisted channel"
+                );
+            }
             self.runtime
                 .db
                 .record_audit_event(
@@ -1089,6 +1119,7 @@ impl RuntimeDaemon {
                     json!({
                         "reason": "channel_not_allowlisted",
                         "channel_id": message.channel_id,
+                        "attempted_trigger": attempted_trigger,
                     }),
                 )
                 .await?;
@@ -1841,6 +1872,71 @@ fn normalize_message_text(
     }
 }
 
+fn is_channel_trigger_attempt(content: &str, command_prefix: &str) -> bool {
+    let trimmed = content.trim();
+    let command_prefix = command_prefix.trim();
+    !trimmed.is_empty() && !command_prefix.is_empty() && trimmed.starts_with(command_prefix)
+}
+
+fn rewrite_channel_message_for_bot_mention(
+    content: &str,
+    is_direct_message: bool,
+    command_prefix: &str,
+    bot_user_id: &str,
+) -> String {
+    if is_direct_message {
+        return content.to_owned();
+    }
+
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return content.to_owned();
+    }
+
+    let command_prefix = command_prefix.trim();
+    if command_prefix.is_empty() || trimmed.starts_with(command_prefix) {
+        return content.to_owned();
+    }
+
+    let Some(stripped) = strip_bot_mention(trimmed, bot_user_id) else {
+        return content.to_owned();
+    };
+    let stripped = strip_channel_trigger_delimiters(&stripped);
+    if stripped.is_empty() {
+        return content.to_owned();
+    }
+
+    if stripped.starts_with(command_prefix) {
+        stripped.to_owned()
+    } else {
+        format!("{command_prefix} {stripped}")
+    }
+}
+
+fn strip_bot_mention(content: &str, bot_user_id: &str) -> Option<String> {
+    remove_bot_mention(content, &format!("<@{bot_user_id}>"))
+        .or_else(|| remove_bot_mention(content, &format!("<@!{bot_user_id}>")))
+}
+
+fn remove_bot_mention(content: &str, mention: &str) -> Option<String> {
+    let (before, after_with_mention) = content.split_once(mention)?;
+    let before = before.trim_end();
+    let after = strip_channel_trigger_delimiters(after_with_mention);
+
+    let combined = match (before.is_empty(), after.is_empty()) {
+        (true, true) => String::new(),
+        (true, false) => after.to_owned(),
+        (false, true) => before.to_owned(),
+        (false, false) => format!("{before} {after}"),
+    };
+
+    Some(combined.split_whitespace().collect::<Vec<_>>().join(" "))
+}
+
+fn strip_channel_trigger_delimiters(content: &str) -> &str {
+    content.trim_start_matches(|ch: char| ch.is_ascii_whitespace() || matches!(ch, ':' | ','))
+}
+
 fn discord_author_display_name(author: &DiscordAuthor) -> Option<String> {
     author
         .global_name
@@ -1860,12 +1956,7 @@ fn interaction_command_text(data: &DiscordInteractionData) -> Result<String> {
     let mut values = Vec::new();
     let mut preferred_prompt = None;
 
-    flatten_interaction_options(
-        &data.options,
-        &mut path,
-        &mut values,
-        &mut preferred_prompt,
-    );
+    flatten_interaction_options(&data.options, &mut path, &mut values, &mut preferred_prompt);
 
     if let Some(approval_command) = normalize_interaction_approval_command(&path, &values) {
         return Ok(approval_command);
@@ -2463,6 +2554,97 @@ mod tests {
     }
 
     #[test]
+    fn channel_trigger_attempt_matches_prefix_command() {
+        assert!(is_channel_trigger_attempt(
+            "!bk summarize the latest task",
+            "!bk"
+        ));
+    }
+
+    #[test]
+    fn channel_trigger_attempt_matches_rewritten_mention_command() {
+        let rewritten = rewrite_channel_message_for_bot_mention(
+            "please <@1234567890> summarize the latest task",
+            false,
+            "!bk",
+            "1234567890",
+        );
+
+        assert!(is_channel_trigger_attempt(&rewritten, "!bk"));
+    }
+
+    #[test]
+    fn channel_trigger_attempt_rejects_plain_channel_chat() {
+        assert!(!is_channel_trigger_attempt(
+            "hello everyone, general update here",
+            "!bk"
+        ));
+    }
+
+    #[test]
+    fn mention_trigger_rewrites_to_existing_prefix_flow() {
+        let rewritten = rewrite_channel_message_for_bot_mention(
+            "<@1234567890> summarize the latest task activity",
+            false,
+            "!bk",
+            "1234567890",
+        );
+
+        assert_eq!(rewritten, "!bk summarize the latest task activity");
+    }
+
+    #[test]
+    fn mention_trigger_handles_nickname_mentions_and_punctuation() {
+        let rewritten = rewrite_channel_message_for_bot_mention(
+            "<@!1234567890>, summarize the latest task activity",
+            false,
+            "!bk",
+            "1234567890",
+        );
+
+        assert_eq!(rewritten, "!bk summarize the latest task activity");
+    }
+
+    #[test]
+    fn mention_trigger_matches_mentions_mid_message() {
+        let rewritten = rewrite_channel_message_for_bot_mention(
+            "please <@1234567890> summarize the latest task activity",
+            false,
+            "!bk",
+            "1234567890",
+        );
+
+        assert_eq!(rewritten, "!bk please summarize the latest task activity");
+    }
+
+    #[test]
+    fn mention_trigger_does_not_double_apply_prefix() {
+        let rewritten = rewrite_channel_message_for_bot_mention(
+            "<@1234567890> !bk summarize the latest task activity",
+            false,
+            "!bk",
+            "1234567890",
+        );
+
+        assert_eq!(rewritten, "!bk summarize the latest task activity");
+    }
+
+    #[test]
+    fn mention_trigger_ignores_other_mentions() {
+        let rewritten = rewrite_channel_message_for_bot_mention(
+            "<@9999999999> summarize the latest task activity",
+            false,
+            "!bk",
+            "1234567890",
+        );
+
+        assert_eq!(
+            rewritten,
+            "<@9999999999> summarize the latest task activity"
+        );
+    }
+
+    #[test]
     fn completed_reply_omits_task_id() {
         let reply = format_task_reply(&test_task("task_123", "completed", Some("done")));
 
@@ -2818,7 +3000,7 @@ mod tests {
                 command_type: 1,
                 contexts: Some(vec![0, 1]),
                 options: normalized_discord_command_options_from_value(
-                    discord_global_command_payloads()[1].get("options")
+                    discord_global_command_payloads()[1].get("options"),
                 ),
             },
         ];

@@ -118,7 +118,7 @@ The shortest path is to use the Makefile targets for setup and daily operations,
 
 8. Optionally connect Discord for remote household use.
 
-	Store a bot token, enable the connector, then map each Discord user ID to a BeaverKi user. Direct messages are accepted by default; guild messages are accepted only from allowlisted channel IDs. For the full setup flow, see [Discord Setup Guide](docs/discord-setup.md).
+	Store a bot token, enable the connector, then map each Discord user ID to a BeaverKi user. Direct messages are accepted by default; guild messages are accepted only from allowlisted channel IDs and should either start with the configured prefix or include a direct bot mention. For the full setup flow, see [Discord Setup Guide](docs/discord-setup.md).
 
 9. Stop the daemon when you are done.
 

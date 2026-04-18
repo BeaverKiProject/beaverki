@@ -8,6 +8,7 @@ The current Discord integration lets BeaverKi:
 
 - accept direct messages from mapped Discord users
 - accept server messages only from explicitly allowlisted channel IDs
+- accept allowlisted server messages when they start with the configured command prefix or a direct mention of the bot
 - route each Discord identity to a BeaverKi household user
 - send task replies back into the same Discord conversation
 - keep short-lived working indicators active while a task is still running
@@ -72,21 +73,33 @@ Export the bot token or let the CLI prompt for it.
 export DISCORD_BOT_TOKEN="your-discord-bot-token"
 ```
 
-Enable the connector with the default prefix and one allowlisted channel:
+Enable the connector and store the bot token:
 
 ```bash
-cargo run -p beaverki-cli -- connector discord configure \
-  --enable \
-  --allow-channel 123456789012345678
+cargo run -p beaverki-cli -- connector discord configure --enable
 ```
 
-If you want a custom prefix in shared channels, set it explicitly:
+Then add an allowlisted shared channel in the default household mode:
+
+```bash
+cargo run -p beaverki-cli -- connector discord add-channel \
+  --channel-id 123456789012345678 \
+  --mode household
+```
+
+If you want the shared channel to behave as a guest room instead, set it explicitly when adding or updating the channel:
+
+```bash
+cargo run -p beaverki-cli -- connector discord add-channel \
+  --channel-id 123456789012345678 \
+  --mode guest
+```
+
+If you want a custom prefix in shared channels, set it explicitly without re-entering the token:
 
 ```bash
 cargo run -p beaverki-cli -- connector discord configure \
-  --enable \
-  --command-prefix "!beaver" \
-  --allow-channel 123456789012345678
+  --command-prefix "!beaver"
 ```
 
 When the connector is enabled, BeaverKi encrypts and stores the Discord bot token locally using the same secret storage flow as the model credentials.
@@ -97,12 +110,23 @@ Inspect the resulting configuration:
 cargo run -p beaverki-cli -- connector discord show
 ```
 
+If you only want the allowlisted shared-channel view, use:
+
+```bash
+cargo run -p beaverki-cli -- connector discord list-channels
+```
+
 You should see:
 
 - `Discord enabled: true`
 - the configured command prefix
 - the encrypted token secret reference
-- the allowlisted channel IDs
+- the allowlisted channels with their configured mode
+
+In shared channels, BeaverKi accepts either of these channel triggers:
+
+- the configured command prefix such as `!bk`
+- a message that includes a direct mention of the bot such as `@BeaverKi`
 
 ## 5. Map Discord Users To Household Users
 
@@ -159,12 +183,23 @@ Summarize the latest task activity for my account.
 
 ### Shared server channels
 
-Shared server channels must be explicitly allowlisted, and channel messages must start with the configured prefix.
+Shared server channels must be explicitly allowlisted.
+
+Within an allowlisted shared channel, BeaverKi accepts either:
+
+- a message that starts with the configured prefix
+- a message that includes a direct bot mention
 
 Example channel message with the default prefix:
 
 ```text
 !bk Summarize the latest task activity for my account.
+```
+
+Equivalent example using a bot mention:
+
+```text
+Hey @BeaverKi, summarize the latest task activity for my account.
 ```
 
 If the message is accepted, BeaverKi will either reply directly or acknowledge that the daemon is still working on it.
@@ -194,6 +229,7 @@ make daemon-status
 ```
 
 To change the channel allowlist or command prefix, rerun `connector discord configure` with the new values.
+To add or update a specific shared channel later, use `connector discord add-channel`. To remove one, use `connector discord remove-channel`.
 
 ## 10. Troubleshooting
 
@@ -220,7 +256,7 @@ cargo run -p beaverki-cli -- connector discord list-mappings
 The usual causes are:
 
 - the channel ID is not in the allowlist
-- the message does not start with the configured prefix
+- the message does not start with the configured prefix and does not include a direct bot mention
 - the user is not mapped to a BeaverKi household user
 - the bot lacks permission to read or reply in that channel
 

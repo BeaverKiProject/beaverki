@@ -317,7 +317,11 @@ integrations:
     enabled: true
     bot_token_secret_ref: "secret://connectors/discord/token"
     command_prefix: "!bk"
-    allowed_channel_ids: ["111", "222"]
+    allowed_channels:
+      - channel_id: "111"
+        mode: household
+      - channel_id: "222"
+        mode: guest
     task_wait_timeout_secs: 5
     approval_action_ttl_secs: 900
     approval_dm_only: true
@@ -1131,7 +1135,7 @@ This split is required so future connectors can reuse the same durable follow-up
 Must support:
 
 - receiving DMs
-- receiving messages from allowlisted channels
+- receiving messages from allowlisted channels through either the configured prefix or a direct bot mention anywhere in the message
 - identity mapping from Discord user ID to BeaverKi user ID
 - sending replies
 - routing approval prompts

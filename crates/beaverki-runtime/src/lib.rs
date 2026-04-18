@@ -7,7 +7,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use beaverki_agent::{AgentMemoryMode, AgentRequest, AgentResult, PrimaryAgentRunner};
 use beaverki_automation as automation;
 use beaverki_config::{
-    LoadedConfig, SecretStore, SessionLifecycleAction, SessionLifecyclePolicy,
+    DiscordChannelMode, LoadedConfig, SecretStore, SessionLifecycleAction, SessionLifecyclePolicy,
     SessionPolicyMatchInput, select_session_lifecycle_policy,
 };
 use beaverki_core::{MemoryKind, MemoryScope, TaskState, now_rfc3339};
@@ -45,6 +45,7 @@ const SESSION_KIND_DIRECT_MESSAGE: &str = "direct_message";
 const SESSION_KIND_GROUP_ROOM: &str = "group_room";
 const SESSION_KIND_CRON_RUN: &str = "cron_run";
 const SESSION_AUDIENCE_DIRECT_USER: &str = "direct_user";
+const SESSION_AUDIENCE_GUEST_ROOM: &str = "guest_room";
 const SESSION_AUDIENCE_SHARED_ROOM: &str = "shared_room";
 const SESSION_AUDIENCE_SCHEDULED_RUN: &str = "scheduled_run";
 const SESSION_LIFECYCLE_REASON_MANUAL_RESET: &str = "manual_reset";
@@ -1544,14 +1545,17 @@ impl Runtime {
                 MemoryScope::Private,
             )
         } else {
+            let (audience_policy, max_memory_scope) =
+                connector_group_room_policy(&self.config, connector_type, channel_id);
             (
                 SESSION_KIND_GROUP_ROOM,
                 format!("{SESSION_KIND_GROUP_ROOM}:{connector_type}:{channel_id}"),
-                SESSION_AUDIENCE_SHARED_ROOM,
-                MemoryScope::Household,
+                audience_policy,
+                max_memory_scope,
             )
         };
-        self.db
+        let session = self
+            .db
             .ensure_conversation_session(NewConversationSession {
                 session_kind,
                 session_key: &session_key,
@@ -1560,7 +1564,32 @@ impl Runtime {
                 originating_connector_type: Some(connector_type),
                 originating_connector_target: Some(channel_id),
             })
-            .await
+            .await?;
+
+        if session.audience_policy != audience_policy
+            || session.max_memory_scope != max_memory_scope.as_str()
+        {
+            self.db
+                .update_conversation_session_policy(
+                    &session.session_id,
+                    audience_policy,
+                    max_memory_scope,
+                    Some("connector_channel_policy_sync"),
+                )
+                .await?;
+            return self
+                .db
+                .fetch_conversation_session(&session.session_id)
+                .await?
+                .ok_or_else(|| {
+                    anyhow!(
+                        "conversation session '{}' disappeared after policy sync",
+                        session.session_id
+                    )
+                });
+        }
+
+        Ok(session)
     }
 
     async fn create_cron_run_session(&self, schedule_id: &str) -> Result<ConversationSessionRow> {
@@ -1803,6 +1832,23 @@ impl Runtime {
         }
         allowed_roots
     }
+}
+
+fn connector_group_room_policy(
+    config: &LoadedConfig,
+    connector_type: &str,
+    channel_id: &str,
+) -> (&'static str, MemoryScope) {
+    if connector_type == "discord" {
+        match config.integrations.discord.channel_mode(channel_id) {
+            Some(DiscordChannelMode::Guest) => {
+                return (SESSION_AUDIENCE_GUEST_ROOM, MemoryScope::Private);
+            }
+            Some(DiscordChannelMode::Household) | None => {}
+        }
+    }
+
+    (SESSION_AUDIENCE_SHARED_ROOM, MemoryScope::Household)
 }
 
 fn approval_action_is_expired(action: &ApprovalActionRow) -> bool {
@@ -3221,7 +3267,8 @@ mod tests {
     use anyhow::Result;
     use async_trait::async_trait;
     use beaverki_config::{
-        ProviderModels, RuntimeConfig, RuntimeDefaults, RuntimeFeatures, SessionManagementConfig,
+        DiscordAllowedChannel, DiscordChannelMode, ProviderModels, RuntimeConfig, RuntimeDefaults,
+        RuntimeFeatures, SessionManagementConfig,
     };
     use beaverki_models::{ConversationItem, ModelTurnResponse};
     use tempfile::TempDir;
@@ -3694,7 +3741,10 @@ mod tests {
     #[tokio::test]
     async fn discord_channel_and_dm_sessions_are_isolated_without_socket() {
         let (_tempdir, mut runtime) = test_runtime(vec![]).await;
-        runtime.config.integrations.discord.allowed_channel_ids = vec!["channel-1".to_owned()];
+        runtime.config.integrations.discord.allowed_channels = vec![DiscordAllowedChannel {
+            channel_id: "channel-1".to_owned(),
+            mode: DiscordChannelMode::Household,
+        }];
         runtime.config.integrations.discord.task_wait_timeout_secs = 0;
         let identity = runtime
             .db
@@ -3750,7 +3800,10 @@ mod tests {
     #[tokio::test]
     async fn shared_room_session_is_shared_across_mapped_users() {
         let (_tempdir, mut runtime) = test_runtime(vec![]).await;
-        runtime.config.integrations.discord.allowed_channel_ids = vec!["room-1".to_owned()];
+        runtime.config.integrations.discord.allowed_channels = vec![DiscordAllowedChannel {
+            channel_id: "room-1".to_owned(),
+            mode: DiscordChannelMode::Household,
+        }];
         runtime.config.integrations.discord.task_wait_timeout_secs = 0;
         runtime
             .create_user("Casey", &[String::from("adult")])
@@ -3819,7 +3872,10 @@ mod tests {
     #[tokio::test]
     async fn group_room_private_cap_downgrades_household_scope() {
         let (_tempdir, mut runtime) = test_runtime(vec![]).await;
-        runtime.config.integrations.discord.allowed_channel_ids = vec!["room-2".to_owned()];
+        runtime.config.integrations.discord.allowed_channels = vec![DiscordAllowedChannel {
+            channel_id: "room-2".to_owned(),
+            mode: DiscordChannelMode::Guest,
+        }];
         runtime.config.integrations.discord.task_wait_timeout_secs = 0;
         runtime
             .db
@@ -3832,20 +3888,6 @@ mod tests {
             )
             .await
             .expect("mapping");
-        let session = runtime
-            .resolve_connector_conversation_session("user_alex", "discord", "room-2", false)
-            .await
-            .expect("session");
-        runtime
-            .db
-            .update_conversation_session_policy(
-                &session.session_id,
-                "guest_room",
-                MemoryScope::Private,
-                Some("test_cap"),
-            )
-            .await
-            .expect("cap session");
         let db = runtime.db.clone();
         let daemon = RuntimeDaemon::new(runtime);
 
@@ -4491,7 +4533,10 @@ end"#,
             usage: None,
         }])
         .await;
-        runtime.config.integrations.discord.allowed_channel_ids = vec!["channel-1".to_owned()];
+        runtime.config.integrations.discord.allowed_channels = vec![DiscordAllowedChannel {
+            channel_id: "channel-1".to_owned(),
+            mode: DiscordChannelMode::Household,
+        }];
         let mapping = runtime
             .db
             .upsert_connector_identity(
@@ -4533,6 +4578,41 @@ end"#,
     }
 
     #[tokio::test]
+    async fn discord_command_in_non_allowlisted_channel_is_audited_as_trigger_attempt() {
+        let (_tempdir, runtime) = test_runtime(vec![]).await;
+        let db = runtime.db.clone();
+        let daemon = RuntimeDaemon::new(runtime);
+
+        let reply = daemon
+            .handle_connector_message(ConnectorMessageRequest {
+                connector_type: "discord".to_owned(),
+                external_user_id: "discord-user-unlisted".to_owned(),
+                external_display_name: Some("Torlenor".to_owned()),
+                channel_id: "channel-unlisted".to_owned(),
+                message_id: "msg-unlisted-1".to_owned(),
+                content: "!bk Summarize the latest task activity".to_owned(),
+                is_direct_message: false,
+            })
+            .await
+            .expect("connector message");
+
+        assert!(!reply.accepted);
+        assert_eq!(reply.reply, None);
+
+        let ignored_event = db
+            .list_audit_events(8)
+            .await
+            .expect("audit events")
+            .into_iter()
+            .find(|event| event.event_type == "connector_message_ignored")
+            .expect("ignored audit event");
+        let payload: Value = serde_json::from_str(&ignored_event.payload_json).expect("payload");
+        assert_eq!(payload["reason"], json!("channel_not_allowlisted"));
+        assert_eq!(payload["channel_id"], json!("channel-unlisted"));
+        assert_eq!(payload["attempted_trigger"], json!(true));
+    }
+
+    #[tokio::test]
     async fn discord_context_carries_recent_history_across_channels_for_same_user() {
         let (_tempdir, mut runtime) = test_runtime(vec![
             ModelTurnResponse {
@@ -4555,7 +4635,10 @@ end"#,
             },
         ])
         .await;
-        runtime.config.integrations.discord.allowed_channel_ids = vec!["channel-1".to_owned()];
+        runtime.config.integrations.discord.allowed_channels = vec![DiscordAllowedChannel {
+            channel_id: "channel-1".to_owned(),
+            mode: DiscordChannelMode::Household,
+        }];
         runtime
             .db
             .upsert_connector_identity(
@@ -4812,7 +4895,10 @@ end"#,
             },
         ])
         .await;
-        runtime.config.integrations.discord.allowed_channel_ids = vec!["channel-1".to_owned()];
+        runtime.config.integrations.discord.allowed_channels = vec![DiscordAllowedChannel {
+            channel_id: "channel-1".to_owned(),
+            mode: DiscordChannelMode::Household,
+        }];
         runtime
             .db
             .upsert_connector_identity(

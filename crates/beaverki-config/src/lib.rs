@@ -276,11 +276,26 @@ pub struct DiscordConfig {
     pub enabled: bool,
     pub bot_token_secret_ref: Option<String>,
     pub command_prefix: String,
-    pub allowed_channel_ids: Vec<String>,
+    pub allowed_channels: Vec<DiscordAllowedChannel>,
     pub task_wait_timeout_secs: u64,
     pub approval_action_ttl_secs: u64,
     pub approval_dm_only: bool,
     pub critical_confirmation_ttl_secs: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DiscordAllowedChannel {
+    pub channel_id: String,
+    #[serde(default)]
+    pub mode: DiscordChannelMode,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DiscordChannelMode {
+    #[default]
+    Household,
+    Guest,
 }
 
 impl Default for DiscordConfig {
@@ -289,12 +304,27 @@ impl Default for DiscordConfig {
             enabled: false,
             bot_token_secret_ref: None,
             command_prefix: "!bk".to_owned(),
-            allowed_channel_ids: Vec::new(),
+            allowed_channels: Vec::new(),
             task_wait_timeout_secs: 5,
             approval_action_ttl_secs: 15 * 60,
             approval_dm_only: true,
             critical_confirmation_ttl_secs: 5 * 60,
         }
+    }
+}
+
+impl DiscordConfig {
+    pub fn is_allowed_channel(&self, channel_id: &str) -> bool {
+        self.allowed_channels
+            .iter()
+            .any(|channel| channel.channel_id == channel_id)
+    }
+
+    pub fn channel_mode(&self, channel_id: &str) -> Option<DiscordChannelMode> {
+        self.allowed_channels
+            .iter()
+            .find(|channel| channel.channel_id == channel_id)
+            .map(|channel| channel.mode)
     }
 }
 
@@ -569,7 +599,44 @@ fn migrate_providers_config_value(value: serde_yaml::Value) -> Result<(serde_yam
 fn migrate_integrations_config_value(
     value: serde_yaml::Value,
 ) -> Result<(serde_yaml::Value, bool)> {
-    migrate_root_mapping(value, |_, _| Ok(false))
+    migrate_root_mapping(value, |mapping, _| {
+        let mut changed = false;
+        let discord_key = serde_yaml::Value::String("discord".to_owned());
+        let allowed_channels_key = serde_yaml::Value::String("allowed_channels".to_owned());
+        let allowed_channel_ids_key = serde_yaml::Value::String("allowed_channel_ids".to_owned());
+
+        if let Some(discord) = mapping
+            .get_mut(&discord_key)
+            .and_then(serde_yaml::Value::as_mapping_mut)
+        {
+            if !discord.contains_key(&allowed_channels_key) {
+                let migrated_channels = discord
+                    .remove(&allowed_channel_ids_key)
+                    .and_then(|value| value.as_sequence().cloned())
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|value| value.as_str().map(ToOwned::to_owned))
+                    .map(|channel_id| {
+                        serde_yaml::to_value(DiscordAllowedChannel {
+                            channel_id,
+                            mode: DiscordChannelMode::Household,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                if !migrated_channels.is_empty() {
+                    discord.insert(
+                        allowed_channels_key.clone(),
+                        serde_yaml::Value::Sequence(migrated_channels),
+                    );
+                    changed = true;
+                }
+            } else if discord.remove(&allowed_channel_ids_key).is_some() {
+                changed = true;
+            }
+        }
+
+        Ok(changed)
+    })
 }
 
 fn migrate_root_mapping(
@@ -886,10 +953,7 @@ entries:
         .expect("write providers");
         fs::write(
             &integrations_path,
-            r#"discord:
-  enabled: true
-  command_prefix: "!bk-test"
-"#,
+            "discord:\n  enabled: true\n  command_prefix: \"!bk-test\"\n  allowed_channel_ids: [\"111\", \"222\"]\n",
         )
         .expect("write integrations");
 
@@ -914,6 +978,15 @@ entries:
             loaded.integrations.discord.approval_action_ttl_secs,
             15 * 60
         );
+        assert_eq!(loaded.integrations.discord.allowed_channels.len(), 2);
+        assert_eq!(
+            loaded.integrations.discord.allowed_channels[0].channel_id,
+            "111"
+        );
+        assert_eq!(
+            loaded.integrations.discord.allowed_channels[0].mode,
+            DiscordChannelMode::Household
+        );
         assert!(loaded.integrations.discord.approval_dm_only);
         assert_eq!(
             loaded.integrations.discord.critical_confirmation_ttl_secs,
@@ -930,6 +1003,11 @@ entries:
         assert!(providers_rewritten.contains("version: 1"));
         assert!(providers_rewritten.contains("safety_review: gpt-5.4-mini"));
         assert!(integrations_rewritten.contains("version: 1"));
+        assert!(integrations_rewritten.contains("allowed_channels:"));
+        assert!(integrations_rewritten.contains("channel_id:"));
+        assert!(integrations_rewritten.contains("111"));
+        assert!(integrations_rewritten.contains("mode: household"));
+        assert!(!integrations_rewritten.contains("allowed_channel_ids:"));
 
         let runtime_backup =
             fs::read_to_string(backup_path_for(&runtime_path)).expect("runtime backup");

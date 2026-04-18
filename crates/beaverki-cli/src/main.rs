@@ -4,9 +4,10 @@ use std::process::Stdio;
 
 use anyhow::{Context, Result, anyhow, bail};
 use beaverki_config::{
-    LoadedConfig, SessionLifecycleAction, SessionLifecyclePolicy, SessionPolicyMatchInput,
-    SetupAnswers, default_app_paths, prompt_passphrase_from_env, select_session_lifecycle_policy,
-    write_integrations_config, write_providers_config, write_runtime_config, write_setup_files,
+    DiscordAllowedChannel, DiscordChannelMode, LoadedConfig, SessionLifecycleAction,
+    SessionLifecyclePolicy, SessionPolicyMatchInput, SetupAnswers, default_app_paths,
+    prompt_passphrase_from_env, select_session_lifecycle_policy, write_integrations_config,
+    write_providers_config, write_runtime_config, write_setup_files,
 };
 use beaverki_core::{MemoryKind, MemoryScope};
 use beaverki_db::{ConversationSessionRow, Database, MemoryRow, UserRow};
@@ -111,7 +112,10 @@ enum ConnectorCommand {
 #[derive(Subcommand)]
 enum DiscordCommand {
     Show(ConfigDirArgs),
+    ListChannels(ConfigDirArgs),
     Configure(DiscordConfigureArgs),
+    AddChannel(DiscordChannelAddArgs),
+    RemoveChannel(DiscordChannelRemoveArgs),
     MapUser(DiscordMapUserArgs),
     ListMappings(ConfigDirArgs),
 }
@@ -445,6 +449,24 @@ struct DiscordConfigureArgs {
 }
 
 #[derive(Args, Clone)]
+struct DiscordChannelAddArgs {
+    #[arg(long)]
+    config_dir: Option<PathBuf>,
+    #[arg(long = "channel-id")]
+    channel_id: String,
+    #[arg(long, default_value = "household")]
+    mode: String,
+}
+
+#[derive(Args, Clone)]
+struct DiscordChannelRemoveArgs {
+    #[arg(long)]
+    config_dir: Option<PathBuf>,
+    #[arg(long = "channel-id")]
+    channel_id: String,
+}
+
+#[derive(Args, Clone)]
 struct DiscordMapUserArgs {
     #[arg(long)]
     config_dir: Option<PathBuf>,
@@ -603,7 +625,10 @@ async fn main() -> Result<()> {
         Commands::Connector { command } => match *command {
             ConnectorCommand::Discord { command } => match *command {
                 DiscordCommand::Show(args) => discord_show(args).await,
+                DiscordCommand::ListChannels(args) => discord_list_channels(args).await,
                 DiscordCommand::Configure(args) => discord_configure(args).await,
+                DiscordCommand::AddChannel(args) => discord_add_channel(args).await,
+                DiscordCommand::RemoveChannel(args) => discord_remove_channel(args).await,
                 DiscordCommand::MapUser(args) => discord_map_user(args).await,
                 DiscordCommand::ListMappings(args) => discord_list_mappings(args).await,
             },
@@ -1814,15 +1839,31 @@ async fn discord_show(args: ConfigDirArgs) -> Result<()> {
             .as_deref()
             .unwrap_or("<not configured>")
     );
-    if discord.allowed_channel_ids.is_empty() {
+    let allowed_channel_lines = render_discord_allowed_channel_lines(&discord.allowed_channels);
+    if allowed_channel_lines.is_empty() {
         println!("Allowed channels: <none>");
     } else {
-        println!(
-            "Allowed channels: {}",
-            discord.allowed_channel_ids.join(", ")
-        );
+        println!("Allowed channels:");
+        for line in allowed_channel_lines {
+            println!("{line}");
+        }
     }
     println!("Task wait timeout: {}s", discord.task_wait_timeout_secs);
+    Ok(())
+}
+
+async fn discord_list_channels(args: ConfigDirArgs) -> Result<()> {
+    let config_dir = resolve_config_dir(args.config_dir)?;
+    let config = LoadedConfig::load_from_dir(&config_dir)?;
+    let lines = render_discord_allowed_channel_lines(&config.integrations.discord.allowed_channels);
+    if lines.is_empty() {
+        println!("No Discord channels are currently allowlisted.");
+        return Ok(());
+    }
+
+    for line in lines {
+        println!("{line}");
+    }
     Ok(())
 }
 
@@ -1849,33 +1890,47 @@ async fn discord_configure(args: DiscordConfigureArgs) -> Result<()> {
         discord.command_prefix = command_prefix.to_owned();
     }
     if !args.allowed_channel_ids.is_empty() {
-        discord.allowed_channel_ids = args.allowed_channel_ids;
+        discord.allowed_channels = normalize_discord_allowed_channels(
+            args.allowed_channel_ids
+                .into_iter()
+                .map(|channel_id| DiscordAllowedChannel {
+                    channel_id,
+                    mode: DiscordChannelMode::Household,
+                })
+                .collect(),
+        );
     }
 
     if discord.enabled {
-        let secret_ref = discord
-            .bot_token_secret_ref
-            .clone()
-            .unwrap_or_else(|| "secret://local/discord_bot_token".to_owned());
-        let token = std::env::var(&args.discord_token_env).unwrap_or_else(|_| {
-            Password::new()
-                .with_prompt("Discord bot token")
-                .interact()
-                .expect("failed to read Discord bot token")
-        });
-        if token.trim().is_empty() {
-            bail!("Discord bot token cannot be empty when enabling the connector");
-        }
+        let token_from_env = std::env::var(&args.discord_token_env).ok();
+        let requires_token_write =
+            token_from_env.is_some() || discord.bot_token_secret_ref.is_none();
+        if requires_token_write {
+            let secret_ref = discord
+                .bot_token_secret_ref
+                .clone()
+                .unwrap_or_else(|| "secret://local/discord_bot_token".to_owned());
+            let token = token_from_env.unwrap_or_else(|| {
+                Password::new()
+                    .with_prompt("Discord bot token")
+                    .interact()
+                    .expect("failed to read Discord bot token")
+            });
+            if token.trim().is_empty() {
+                bail!("Discord bot token cannot be empty when enabling the connector");
+            }
 
-        let passphrase = prompt_passphrase_from_env(&args.passphrase_env).unwrap_or_else(|| {
-            Password::new()
-                .with_prompt("Master passphrase")
-                .interact()
-                .expect("failed to read master passphrase")
-        });
-        let secret_store = beaverki_config::SecretStore::new(&config.runtime.secret_dir);
-        secret_store.write_secret(&secret_ref, token.trim(), &passphrase)?;
-        discord.bot_token_secret_ref = Some(secret_ref);
+            let passphrase =
+                prompt_passphrase_from_env(&args.passphrase_env).unwrap_or_else(|| {
+                    Password::new()
+                        .with_prompt("Master passphrase")
+                        .interact()
+                        .expect("failed to read master passphrase")
+                });
+            let secret_store = beaverki_config::SecretStore::new(&config.runtime.secret_dir);
+            secret_store.write_secret(&secret_ref, token.trim(), &passphrase)?;
+            discord.bot_token_secret_ref = Some(secret_ref);
+        }
     }
 
     config.integrations.discord = discord.clone();
@@ -1883,16 +1938,150 @@ async fn discord_configure(args: DiscordConfigureArgs) -> Result<()> {
     println!("Updated Discord integration config in {}", path.display());
     println!("Discord enabled: {}", discord.enabled);
     println!("Command prefix: {}", discord.command_prefix);
-    println!(
-        "Allowed channels: {}",
-        if discord.allowed_channel_ids.is_empty() {
-            "<none>".to_owned()
-        } else {
-            discord.allowed_channel_ids.join(", ")
+    if discord.allowed_channels.is_empty() {
+        println!("Allowed channels: <none>");
+    } else {
+        println!("Allowed channels:");
+        for channel in &discord.allowed_channels {
+            println!(
+                "- {} mode={}",
+                channel.channel_id,
+                discord_channel_mode_label(channel.mode)
+            );
         }
-    );
+    }
 
     Ok(())
+}
+
+async fn discord_add_channel(args: DiscordChannelAddArgs) -> Result<()> {
+    let config_dir = resolve_config_dir(args.config_dir)?;
+    let (mut config, db) = load_db(&config_dir).await?;
+    let mode = parse_discord_channel_mode(&args.mode)?;
+    let channel_id = normalize_discord_channel_id(&args.channel_id)?;
+    let token_already_configured = {
+        let discord = &mut config.integrations.discord;
+        if let Some(existing) = discord
+            .allowed_channels
+            .iter_mut()
+            .find(|channel| channel.channel_id == channel_id)
+        {
+            existing.mode = mode;
+        } else {
+            discord.allowed_channels.push(DiscordAllowedChannel {
+                channel_id: channel_id.clone(),
+                mode,
+            });
+        }
+        discord.allowed_channels =
+            normalize_discord_allowed_channels(discord.allowed_channels.clone());
+        discord.enabled && discord.bot_token_secret_ref.is_some()
+    };
+
+    let path = write_integrations_config(&config_dir, &config.integrations)?;
+    sync_discord_channel_session_policy(&db, &channel_id, mode).await?;
+
+    println!("Updated Discord integration config in {}", path.display());
+    println!(
+        "Allowed Discord channel {} with mode={}",
+        channel_id,
+        discord_channel_mode_label(mode)
+    );
+    if token_already_configured {
+        println!("Bot token was left unchanged.");
+    }
+    Ok(())
+}
+
+async fn discord_remove_channel(args: DiscordChannelRemoveArgs) -> Result<()> {
+    let config_dir = resolve_config_dir(args.config_dir)?;
+    let mut config = LoadedConfig::load_from_dir(&config_dir)?;
+    let channel_id = normalize_discord_channel_id(&args.channel_id)?;
+    let discord = &mut config.integrations.discord;
+    let original_len = discord.allowed_channels.len();
+    discord
+        .allowed_channels
+        .retain(|channel| channel.channel_id != channel_id);
+    if discord.allowed_channels.len() == original_len {
+        bail!(
+            "Discord channel '{}' is not currently allowlisted",
+            channel_id
+        );
+    }
+
+    let path = write_integrations_config(&config_dir, &config.integrations)?;
+    println!("Updated Discord integration config in {}", path.display());
+    println!("Removed Discord channel {} from the allowlist.", channel_id);
+    Ok(())
+}
+
+fn normalize_discord_allowed_channels(
+    mut channels: Vec<DiscordAllowedChannel>,
+) -> Vec<DiscordAllowedChannel> {
+    channels.sort_by(|left, right| left.channel_id.cmp(&right.channel_id));
+    channels.dedup_by(|left, right| left.channel_id == right.channel_id);
+    channels
+}
+
+fn normalize_discord_channel_id(channel_id: &str) -> Result<String> {
+    let channel_id = channel_id.trim();
+    if channel_id.is_empty() {
+        bail!("channel id cannot be empty");
+    }
+    Ok(channel_id.to_owned())
+}
+
+fn parse_discord_channel_mode(value: &str) -> Result<DiscordChannelMode> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "household" | "shared" => Ok(DiscordChannelMode::Household),
+        "guest" | "private" => Ok(DiscordChannelMode::Guest),
+        other => bail!(
+            "unsupported Discord channel mode '{}'; use 'household' or 'guest'",
+            other
+        ),
+    }
+}
+
+fn discord_channel_mode_label(mode: DiscordChannelMode) -> &'static str {
+    match mode {
+        DiscordChannelMode::Household => "household",
+        DiscordChannelMode::Guest => "guest",
+    }
+}
+
+fn render_discord_allowed_channel_lines(channels: &[DiscordAllowedChannel]) -> Vec<String> {
+    channels
+        .iter()
+        .map(|channel| {
+            format!(
+                "- {} mode={}",
+                channel.channel_id,
+                discord_channel_mode_label(channel.mode)
+            )
+        })
+        .collect()
+}
+
+async fn sync_discord_channel_session_policy(
+    db: &Database,
+    channel_id: &str,
+    mode: DiscordChannelMode,
+) -> Result<()> {
+    let session_key = format!("group_room:discord:{channel_id}");
+    let Some(session) = db.fetch_conversation_session_by_key(&session_key).await? else {
+        return Ok(());
+    };
+    let (audience_policy, max_memory_scope) = match mode {
+        DiscordChannelMode::Household => ("shared_room", MemoryScope::Household),
+        DiscordChannelMode::Guest => ("guest_room", MemoryScope::Private),
+    };
+    db.update_conversation_session_policy(
+        &session.session_id,
+        audience_policy,
+        max_memory_scope,
+        Some("discord_channel_management"),
+    )
+    .await
 }
 
 async fn discord_map_user(args: DiscordMapUserArgs) -> Result<()> {
@@ -2362,5 +2551,112 @@ fn print_daemon_status(status: &beaverki_runtime::DaemonStatus, reachable: bool)
     }
     if let Some(last_error) = &status.last_error {
         println!("Last error: {last_error}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn render_discord_allowed_channel_lines_includes_modes() {
+        let lines = render_discord_allowed_channel_lines(&[
+            DiscordAllowedChannel {
+                channel_id: "111".to_owned(),
+                mode: DiscordChannelMode::Household,
+            },
+            DiscordAllowedChannel {
+                channel_id: "222".to_owned(),
+                mode: DiscordChannelMode::Guest,
+            },
+        ]);
+
+        assert_eq!(
+            lines,
+            vec![
+                "- 111 mode=household".to_owned(),
+                "- 222 mode=guest".to_owned()
+            ]
+        );
+    }
+
+    #[test]
+    fn normalize_discord_allowed_channels_sorts_and_deduplicates() {
+        let channels = normalize_discord_allowed_channels(vec![
+            DiscordAllowedChannel {
+                channel_id: "222".to_owned(),
+                mode: DiscordChannelMode::Guest,
+            },
+            DiscordAllowedChannel {
+                channel_id: "111".to_owned(),
+                mode: DiscordChannelMode::Household,
+            },
+            DiscordAllowedChannel {
+                channel_id: "222".to_owned(),
+                mode: DiscordChannelMode::Household,
+            },
+        ]);
+
+        assert_eq!(channels.len(), 2);
+        assert_eq!(channels[0].channel_id, "111");
+        assert_eq!(channels[0].mode, DiscordChannelMode::Household);
+        assert_eq!(channels[1].channel_id, "222");
+        assert_eq!(channels[1].mode, DiscordChannelMode::Guest);
+    }
+
+    #[test]
+    fn parse_discord_channel_mode_supports_aliases() {
+        assert_eq!(
+            parse_discord_channel_mode("household").expect("household mode"),
+            DiscordChannelMode::Household
+        );
+        assert_eq!(
+            parse_discord_channel_mode("shared").expect("shared alias"),
+            DiscordChannelMode::Household
+        );
+        assert_eq!(
+            parse_discord_channel_mode("guest").expect("guest mode"),
+            DiscordChannelMode::Guest
+        );
+        assert_eq!(
+            parse_discord_channel_mode("private").expect("private alias"),
+            DiscordChannelMode::Guest
+        );
+        assert!(parse_discord_channel_mode("unknown").is_err());
+    }
+
+    #[tokio::test]
+    async fn sync_discord_channel_session_policy_updates_existing_room_session() {
+        let tempdir = tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("runtime.db");
+        let db = Database::connect(&db_path).await.expect("db connect");
+        let session = db
+            .ensure_conversation_session(beaverki_db::NewConversationSession {
+                session_kind: "group_room",
+                session_key: "group_room:discord:channel-123",
+                audience_policy: "shared_room",
+                max_memory_scope: MemoryScope::Household,
+                originating_connector_type: Some("discord"),
+                originating_connector_target: Some("channel-123"),
+            })
+            .await
+            .expect("session");
+
+        sync_discord_channel_session_policy(&db, "channel-123", DiscordChannelMode::Guest)
+            .await
+            .expect("sync policy");
+
+        let updated = db
+            .fetch_conversation_session(&session.session_id)
+            .await
+            .expect("fetch session")
+            .expect("session row");
+        assert_eq!(updated.audience_policy, "guest_room");
+        assert_eq!(updated.max_memory_scope, "private");
+        assert_eq!(
+            updated.lifecycle_reason.as_deref(),
+            Some("discord_channel_management")
+        );
     }
 }

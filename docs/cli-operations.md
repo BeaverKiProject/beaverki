@@ -186,10 +186,34 @@ Inspect the current connector configuration:
 cargo run -p beaverki-cli -- connector discord show
 ```
 
-Enable Discord and allow a guild channel:
+List Discord allowlisted channels with their configured mode:
 
 ```bash
-cargo run -p beaverki-cli -- connector discord configure --enable --allow-channel 1234567890
+cargo run -p beaverki-cli -- connector discord list-channels
+```
+
+Enable Discord and store the bot token:
+
+```bash
+cargo run -p beaverki-cli -- connector discord configure --enable
+```
+
+Add or update a Discord guild channel in household mode:
+
+```bash
+cargo run -p beaverki-cli -- connector discord add-channel --channel-id 1234567890 --mode household
+```
+
+Add or update a Discord guild channel in guest mode:
+
+```bash
+cargo run -p beaverki-cli -- connector discord add-channel --channel-id 1234567890 --mode guest
+```
+
+Remove a Discord guild channel from the allowlist:
+
+```bash
+cargo run -p beaverki-cli -- connector discord remove-channel --channel-id 1234567890
 ```
 
 Map a Discord user to a BeaverKi household user:
@@ -206,9 +230,9 @@ List the configured identity mappings:
 cargo run -p beaverki-cli -- connector discord list-mappings
 ```
 
-Direct messages are accepted by default. Guild messages are accepted only from explicitly allowlisted channels and only when they match the configured command prefix.
+Direct messages are accepted by default. Guild messages are accepted only from explicitly allowlisted channels and only when they either start with the configured command prefix or include a direct mention of the bot.
 
-In practice, that means household members can DM the bot directly without a prefix, while shared server channels should use the configured prefix such as `!bk`.
+In practice, that means household members can DM the bot directly without a prefix, while shared server channels should either use the configured prefix such as `!bk` or include a direct mention such as `@BeaverKi`.
 
 ## Discord Developer Portal Checklist
 
