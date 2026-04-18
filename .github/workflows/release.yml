@@ -53,10 +53,10 @@ jobs:
             artifact_name: beaverki-cli-linux-x86_64
             binary_name: beaverki-cli
             archive_name: beaverki-cli-${{ needs.validate-tag.outputs.release_tag }}-linux-x86_64.tar.gz
-          - os: windows-latest
-            artifact_name: beaverki-cli-windows-x86_64
-            binary_name: beaverki-cli.exe
-            archive_name: beaverki-cli-${{ needs.validate-tag.outputs.release_tag }}-windows-x86_64.zip
+          # - os: windows-latest
+          #   artifact_name: beaverki-cli-windows-x86_64
+          #   binary_name: beaverki-cli.exe
+          #   archive_name: beaverki-cli-${{ needs.validate-tag.outputs.release_tag }}-windows-x86_64.zip
           - os: macos-13
             artifact_name: beaverki-cli-macos-x86_64
             binary_name: beaverki-cli
