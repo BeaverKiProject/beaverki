@@ -13,6 +13,16 @@ The project is aimed at a practical V1 that can:
 
 The longer-term goal is a trusted digital companion that stays understandable to non-technical users while still giving advanced users full control over data, policy, and automation.
 
+## Releases
+
+BeaverKI release identifiers are driven by Git tags, not by the Cargo package version in the workspace manifests.
+
+- release tags must use `YYYY-MM-DD.N`, for example `2026-04-18.1`
+- beta tags may use `YYYY-MM-DD.N-betaX`, for example `2026-04-18.2-beta1`
+- pushing a matching tag creates a GitHub Release and uploads packaged CLI binaries for Linux, Windows, and macOS when those builds succeed
+
+This is compatible with Rust because Cargo still uses the workspace crate version for package metadata, while Git tags can use the date-based release scheme independently.
+
 ## Current State
 
 BeaverKI already has a usable local runtime foundation. Today the repository includes:
@@ -27,7 +37,7 @@ BeaverKI already has a usable local runtime foundation. Today the repository inc
 - shell, filesystem, and browser tools for the primary agent
 - Discord connector setup, identity mapping, DM intake, allowlisted channel intake, and approval routing
 - Lua scripting with review and activation flow
-- CI for formatting, linting, and tests
+- CI for formatting and tests, plus tag-driven GitHub Releases
 
 Still intentionally out of scope for the current milestone:
 

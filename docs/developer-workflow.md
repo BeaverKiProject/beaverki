@@ -115,7 +115,7 @@ Near-term:
 
 After the first code lands:
 
-- rustfmt and clippy jobs
+- rustfmt and test jobs
 - test matrix
 - schema migration validation
 - docs link checker
@@ -148,7 +148,18 @@ Even with strong automation, the following should remain explicit human control 
 - merge authority on protected branches
 - release tagging
 
-## 12. Recommended Next Repo Additions
+## 12. Release Tagging
+
+Release publication is tag-driven.
+
+- stable release tags use `YYYY-MM-DD.N`
+- beta release tags use `YYYY-MM-DD.N-betaX`
+- tag pushes build release binaries for Linux, Windows, and macOS and attach them to the GitHub Release
+- Cargo crate versions remain normal semver in `Cargo.toml`; the Git tag is the public release identifier
+
+The current CI workflow intentionally skips clippy until the existing lint failures are addressed.
+
+## 13. Recommended Next Repo Additions
 
 After crate scaffolding starts, the next useful repository additions are:
 
