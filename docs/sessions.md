@@ -137,18 +137,31 @@ This lets shared spaces stay narrower than a user's broader permissions.
 
 ## 8. Session Management Today
 
-Current manual session management is simple:
+BeaverKI now supports both manual and policy-driven session management.
+
+Current behavior:
 
 - BeaverKI creates or reuses the correct session automatically
 - users can reset the current session with `/new`
 - scheduled runs always start fresh
+- the runtime can automatically reset or archive inactive sessions based on configured lifecycle policies
+- lifecycle policies can match session kind and connector context
+- operators can inspect sessions and policies from the CLI
 
-Automatic cleanup policies are not part of the current session behavior yet.
+Automatic lifecycle actions stay session-scoped:
 
-That means:
+- resetting or archiving a session clears recent transcript continuity
+- task history and audit history stay intact
+- durable memory is not deleted
 
-- BeaverKI does not currently auto-reset old sessions on a timer
-- lifecycle automation and policy controls are planned separately
+Current operator controls include:
+
+- `beaverki session list`
+- `beaverki session show --session-id ...`
+- `beaverki session reset --session-id ...`
+- `beaverki session archive --session-id ...`
+- `beaverki session policy list`
+- `beaverki session policy set ...`
 
 ## 9. Practical Examples
 
@@ -197,5 +210,6 @@ The current BeaverKI session model is:
 - recent transcript continuity is session-scoped
 - CLI, DMs, shared rooms, and scheduled runs do not all share one global conversation
 - `/new` resets the current session without deleting memory or history
+- inactive sessions can be reset or archived automatically by runtime policy
 - durable memory survives across sessions
 - shared rooms can be capped to a narrower context than a user's broader entitlements

@@ -259,7 +259,7 @@ impl Database {
         let timestamp = now_rfc3339();
         sqlx::query(
             "UPDATE conversation_sessions
-             SET last_activity_at = ?, lifecycle_reason = COALESCE(?, lifecycle_reason), updated_at = ?
+             SET last_activity_at = ?, archived_at = NULL, lifecycle_reason = COALESCE(?, lifecycle_reason), updated_at = ?
              WHERE session_id = ?",
         )
         .bind(&timestamp)
@@ -280,7 +280,28 @@ impl Database {
         let timestamp = now_rfc3339();
         sqlx::query(
             "UPDATE conversation_sessions
-             SET last_activity_at = ?, last_reset_at = ?, lifecycle_reason = ?, updated_at = ?
+             SET last_reset_at = ?, lifecycle_reason = ?, updated_at = ?
+             WHERE session_id = ?",
+        )
+        .bind(&timestamp)
+        .bind(lifecycle_reason)
+        .bind(&timestamp)
+        .bind(session_id)
+        .execute(&self.pool)
+        .await
+        .context("failed to reset conversation session")?;
+        Ok(())
+    }
+
+    pub async fn archive_conversation_session(
+        &self,
+        session_id: &str,
+        lifecycle_reason: &str,
+    ) -> Result<()> {
+        let timestamp = now_rfc3339();
+        sqlx::query(
+            "UPDATE conversation_sessions
+             SET last_reset_at = ?, archived_at = ?, lifecycle_reason = ?, updated_at = ?
              WHERE session_id = ?",
         )
         .bind(&timestamp)
@@ -290,7 +311,7 @@ impl Database {
         .bind(session_id)
         .execute(&self.pool)
         .await
-        .context("failed to reset conversation session")?;
+        .context("failed to archive conversation session")?;
         Ok(())
     }
 
@@ -315,6 +336,128 @@ impl Database {
         .execute(&self.pool)
         .await
         .context("failed to update conversation session policy")?;
+        Ok(())
+    }
+
+    pub async fn list_conversation_sessions(
+        &self,
+        owner_user_id: Option<&str>,
+        include_archived: bool,
+        limit: i64,
+    ) -> Result<Vec<ConversationSessionRow>> {
+        let rows = match (owner_user_id, include_archived) {
+            (Some(owner_user_id), true) => {
+                sqlx::query_as::<_, ConversationSessionRow>(
+                    "SELECT session_id, session_kind, session_key, audience_policy, max_memory_scope, originating_connector_type, originating_connector_target, last_activity_at, last_reset_at, archived_at, lifecycle_reason, created_at, updated_at
+                     FROM conversation_sessions
+                     WHERE EXISTS (
+                       SELECT 1
+                       FROM tasks
+                       WHERE tasks.session_id = conversation_sessions.session_id
+                         AND tasks.owner_user_id = ?
+                     )
+                     ORDER BY last_activity_at DESC
+                     LIMIT ?",
+                )
+                .bind(owner_user_id)
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await
+            }
+            (Some(owner_user_id), false) => {
+                sqlx::query_as::<_, ConversationSessionRow>(
+                    "SELECT session_id, session_kind, session_key, audience_policy, max_memory_scope, originating_connector_type, originating_connector_target, last_activity_at, last_reset_at, archived_at, lifecycle_reason, created_at, updated_at
+                     FROM conversation_sessions
+                     WHERE archived_at IS NULL
+                       AND EXISTS (
+                         SELECT 1
+                         FROM tasks
+                         WHERE tasks.session_id = conversation_sessions.session_id
+                           AND tasks.owner_user_id = ?
+                       )
+                     ORDER BY last_activity_at DESC
+                     LIMIT ?",
+                )
+                .bind(owner_user_id)
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await
+            }
+            (None, true) => {
+                sqlx::query_as::<_, ConversationSessionRow>(
+                    "SELECT session_id, session_kind, session_key, audience_policy, max_memory_scope, originating_connector_type, originating_connector_target, last_activity_at, last_reset_at, archived_at, lifecycle_reason, created_at, updated_at
+                     FROM conversation_sessions
+                     ORDER BY last_activity_at DESC
+                     LIMIT ?",
+                )
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await
+            }
+            (None, false) => {
+                sqlx::query_as::<_, ConversationSessionRow>(
+                    "SELECT session_id, session_kind, session_key, audience_policy, max_memory_scope, originating_connector_type, originating_connector_target, last_activity_at, last_reset_at, archived_at, lifecycle_reason, created_at, updated_at
+                     FROM conversation_sessions
+                     WHERE archived_at IS NULL
+                     ORDER BY last_activity_at DESC
+                     LIMIT ?",
+                )
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await
+            }
+        }
+        .context("failed to list conversation sessions")?;
+        Ok(rows)
+    }
+
+    pub async fn count_tasks_for_session(&self, session_id: &str) -> Result<i64> {
+        let count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*)
+             FROM tasks
+             WHERE session_id = ?",
+        )
+        .bind(session_id)
+        .fetch_one(&self.pool)
+        .await
+        .context("failed to count tasks for conversation session")?;
+        Ok(count)
+    }
+
+    pub async fn list_session_owner_user_ids(&self, session_id: &str) -> Result<Vec<String>> {
+        let rows = sqlx::query_scalar::<_, String>(
+            "SELECT DISTINCT owner_user_id
+             FROM tasks
+             WHERE session_id = ?
+             ORDER BY owner_user_id ASC",
+        )
+        .bind(session_id)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list conversation session owners")?;
+        Ok(rows)
+    }
+
+    pub async fn overwrite_conversation_session_timestamps(
+        &self,
+        session_id: &str,
+        last_activity_at: &str,
+        last_reset_at: Option<&str>,
+        archived_at: Option<&str>,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE conversation_sessions
+             SET last_activity_at = ?, last_reset_at = ?, archived_at = ?, updated_at = ?
+             WHERE session_id = ?",
+        )
+        .bind(last_activity_at)
+        .bind(last_reset_at)
+        .bind(archived_at)
+        .bind(last_activity_at)
+        .bind(session_id)
+        .execute(&self.pool)
+        .await
+        .context("failed to overwrite conversation session timestamps")?;
         Ok(())
     }
 

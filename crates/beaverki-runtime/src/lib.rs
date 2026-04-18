@@ -6,7 +6,10 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use beaverki_agent::{AgentMemoryMode, AgentRequest, AgentResult, PrimaryAgentRunner};
 use beaverki_automation as automation;
-use beaverki_config::{LoadedConfig, SecretStore};
+use beaverki_config::{
+    LoadedConfig, SecretStore, SessionLifecycleAction, SessionLifecyclePolicy,
+    SessionPolicyMatchInput, select_session_lifecycle_policy,
+};
 use beaverki_core::{MemoryKind, MemoryScope, TaskState, now_rfc3339};
 use beaverki_db::{
     ApprovalActionRow, ApprovalActionSet, ApprovalRow, BootstrapState, ConnectorIdentityRow,
@@ -63,6 +66,14 @@ pub struct ScriptInspection {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryInspection {
     pub memory: MemoryRow,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionLifecycleExecution {
+    pub session_id: String,
+    pub policy_id: String,
+    pub action: String,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -340,6 +351,65 @@ impl Runtime {
 
     pub async fn pending_task_count(&self) -> Result<i64> {
         self.db.pending_task_count().await
+    }
+
+    pub async fn run_session_lifecycle_cleanup(&self) -> Result<Vec<SessionLifecycleExecution>> {
+        let now = Utc::now();
+        let sessions = self
+            .db
+            .list_conversation_sessions(None, false, 512)
+            .await?;
+        let mut actions = Vec::new();
+
+        for session in sessions {
+            let Some(policy) = self.match_session_lifecycle_policy(&session) else {
+                continue;
+            };
+            if !session_lifecycle_is_due(&session, policy, now)? {
+                continue;
+            }
+
+            let reason = format!(
+                "policy:{}:{}",
+                policy.policy_id,
+                policy.action.as_str()
+            );
+            match policy.action {
+                SessionLifecycleAction::Reset => {
+                    self.db
+                        .reset_conversation_session(&session.session_id, &reason)
+                        .await?;
+                }
+                SessionLifecycleAction::Archive => {
+                    self.db
+                        .archive_conversation_session(&session.session_id, &reason)
+                        .await?;
+                }
+            }
+            self.db
+                .record_audit_event(
+                    "runtime",
+                    &self.config.runtime.instance_id,
+                    "conversation_session_lifecycle_applied",
+                    json!({
+                        "session_id": session.session_id,
+                        "session_kind": session.session_kind,
+                        "policy_id": policy.policy_id,
+                        "action": policy.action.as_str(),
+                        "reason": reason,
+                        "last_activity_at": session.last_activity_at,
+                    }),
+                )
+                .await?;
+            actions.push(SessionLifecycleExecution {
+                session_id: session.session_id,
+                policy_id: policy.policy_id.clone(),
+                action: policy.action.as_str().to_owned(),
+                reason,
+            });
+        }
+
+        Ok(actions)
     }
 
     pub async fn latest_runtime_session(&self) -> Result<Option<RuntimeSessionRow>> {
@@ -1432,6 +1502,22 @@ impl Runtime {
         }
     }
 
+    fn match_session_lifecycle_policy<'a>(
+        &'a self,
+        session: &ConversationSessionRow,
+    ) -> Option<&'a SessionLifecyclePolicy> {
+        select_session_lifecycle_policy(
+            &self.config.runtime.session_management.policies,
+            &SessionPolicyMatchInput {
+                session_kind: &session.session_kind,
+                connector_type: session.originating_connector_type.as_deref(),
+                connector_target: session.originating_connector_target.as_deref(),
+                audience_policy: &session.audience_policy,
+                max_memory_scope: &session.max_memory_scope,
+            },
+        )
+    }
+
     async fn resolve_cli_conversation_session(
         &self,
         user: &UserRow,
@@ -2212,6 +2298,7 @@ impl RuntimeDaemon {
         let daemon = Arc::new(self);
         let worker = tokio::spawn(Self::worker_loop(Arc::clone(&daemon)));
         let heartbeat = tokio::spawn(Self::heartbeat_loop(Arc::clone(&daemon)));
+        let cleanup = daemon.start_session_cleanup_loop();
         let connector = daemon.start_connector_loop();
         let accept = tokio::spawn(Self::accept_loop(
             Arc::clone(&daemon),
@@ -2225,6 +2312,15 @@ impl RuntimeDaemon {
         let heartbeat_result = heartbeat
             .await
             .context("daemon heartbeat loop join failure")?;
+        let cleanup_result = if let Some(cleanup) = cleanup {
+            Some(
+                cleanup
+                    .await
+                    .context("daemon session cleanup loop join failure")?,
+            )
+        } else {
+            None
+        };
         let connector_result = if let Some(connector) = connector {
             Some(
                 connector
@@ -2239,6 +2335,7 @@ impl RuntimeDaemon {
             .err()
             .or(worker_result.err())
             .or(heartbeat_result.err())
+            .or_else(|| cleanup_result.and_then(Result::err))
             .or_else(|| connector_result.and_then(Result::err));
         daemon
             .finish(final_error.as_ref().map(ToString::to_string))
@@ -2352,6 +2449,21 @@ impl RuntimeDaemon {
             tokio::select! {
                 _ = daemon.shutdown.notified() => return Ok(()),
                 _ = interval.tick() => daemon.refresh_heartbeat(None).await?,
+            }
+        }
+    }
+
+    async fn session_cleanup_loop(daemon: Arc<Self>, interval_secs: u64) -> Result<()> {
+        let mut interval = time::interval(Duration::from_secs(interval_secs));
+        loop {
+            tokio::select! {
+                _ = daemon.shutdown.notified() => return Ok(()),
+                _ = interval.tick() => {
+                    let actions = daemon.runtime.run_session_lifecycle_cleanup().await?;
+                    if !actions.is_empty() {
+                        daemon.refresh_heartbeat(None).await?;
+                    }
+                }
             }
         }
     }
@@ -2762,6 +2874,25 @@ impl RuntimeDaemon {
             None
         }
     }
+
+    fn start_session_cleanup_loop(
+        self: &Arc<Self>,
+    ) -> Option<tokio::task::JoinHandle<Result<()>>> {
+        let interval_secs = self
+            .runtime
+            .config
+            .runtime
+            .session_management
+            .cleanup_interval_secs;
+        if interval_secs == 0 {
+            return None;
+        }
+
+        let daemon = Arc::clone(self);
+        Some(tokio::spawn(async move {
+            Self::session_cleanup_loop(daemon, interval_secs).await
+        }))
+    }
 }
 
 pub async fn load_daemon_client(config_dir: impl AsRef<Path>) -> Result<DaemonClient> {
@@ -2805,6 +2936,45 @@ fn load_discord_bot_token(config: &LoadedConfig, passphrase: &str) -> Result<Opt
 
     let secret_store = SecretStore::new(&config.runtime.secret_dir);
     Ok(Some(secret_store.read_secret(secret_ref, passphrase)?))
+}
+
+fn session_lifecycle_is_due(
+    session: &ConversationSessionRow,
+    policy: &SessionLifecyclePolicy,
+    now: DateTime<Utc>,
+) -> Result<bool> {
+    let last_activity_at = DateTime::parse_from_rfc3339(&session.last_activity_at)
+        .with_context(|| {
+            format!(
+                "conversation session '{}' has invalid last_activity_at '{}'",
+                session.session_id, session.last_activity_at
+            )
+        })?
+        .with_timezone(&Utc);
+    let inactive_for = now.signed_duration_since(last_activity_at);
+    let inactivity_threshold = chrono::Duration::seconds(
+        i64::try_from(policy.inactivity_after_secs).context("policy inactivity TTL is too large")?,
+    );
+    if inactive_for < inactivity_threshold {
+        return Ok(false);
+    }
+
+    let already_applied_at = match policy.action {
+        SessionLifecycleAction::Reset => session.last_reset_at.as_deref(),
+        SessionLifecycleAction::Archive => session.archived_at.as_deref(),
+    };
+    let Some(already_applied_at) = already_applied_at else {
+        return Ok(true);
+    };
+    let already_applied_at = DateTime::parse_from_rfc3339(already_applied_at)
+        .with_context(|| {
+            format!(
+                "conversation session '{}' has invalid lifecycle timestamp '{}'",
+                session.session_id, already_applied_at
+            )
+        })?
+        .with_timezone(&Utc);
+    Ok(already_applied_at < last_activity_at)
 }
 
 fn parse_scope(value: &str) -> Result<MemoryScope> {
@@ -3057,7 +3227,10 @@ mod tests {
 
     use anyhow::Result;
     use async_trait::async_trait;
-    use beaverki_config::{ProviderModels, RuntimeConfig, RuntimeDefaults, RuntimeFeatures};
+    use beaverki_config::{
+        ProviderModels, RuntimeConfig, RuntimeDefaults, RuntimeFeatures,
+        SessionManagementConfig,
+    };
     use beaverki_models::{ConversationItem, ModelTurnResponse};
     use tempfile::TempDir;
 
@@ -3133,6 +3306,7 @@ mod tests {
                     markdown_exports: true,
                 },
                 defaults: RuntimeDefaults { max_agent_steps: 4 },
+                session_management: SessionManagementConfig::default(),
             },
             providers: beaverki_config::ProvidersConfig {
                 version: 1,
@@ -3154,6 +3328,25 @@ mod tests {
         )
         .expect("runtime");
         (tempdir, runtime)
+    }
+
+    async fn set_session_timestamps(
+        runtime: &Runtime,
+        session_id: &str,
+        last_activity_at: &str,
+        last_reset_at: Option<&str>,
+        archived_at: Option<&str>,
+    ) {
+        runtime
+            .db
+            .overwrite_conversation_session_timestamps(
+                session_id,
+                last_activity_at,
+                last_reset_at,
+                archived_at,
+            )
+            .await
+            .expect("update session timestamps");
     }
 
     async fn wait_for_ready_or_report(
@@ -3280,6 +3473,158 @@ mod tests {
         assert!(context.contains("new conversation"));
         assert!(!context.contains("Remember this topic"));
         assert!(session.last_reset_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn session_cleanup_resets_inactive_cli_sessions_without_forgetting_memory() {
+        let (_tempdir, runtime) = test_runtime(vec![]).await;
+        let user = runtime.default_user().clone();
+        let initiating_identity_id = format!("cli:{}", user.user_id);
+        let primary_agent_id = user.primary_agent_id.clone().expect("primary agent id");
+        let session = runtime
+            .resolve_cli_conversation_session(&user)
+            .await
+            .expect("cli session");
+        let task = runtime
+            .db
+            .create_task_with_params(NewTask {
+                owner_user_id: &user.user_id,
+                initiating_identity_id: &initiating_identity_id,
+                primary_agent_id: &primary_agent_id,
+                assigned_agent_id: &primary_agent_id,
+                parent_task_id: None,
+                session_id: Some(&session.session_id),
+                kind: "interactive",
+                objective: "Keep this session alive for now",
+                context_summary: None,
+                scope: MemoryScope::Private,
+                wake_at: None,
+            })
+            .await
+            .expect("task");
+        runtime
+            .db
+            .complete_task(&task.task_id, "done")
+            .await
+            .expect("complete task");
+        let memory_id = runtime
+            .db
+            .insert_memory(beaverki_db::NewMemory {
+                owner_user_id: Some(&user.user_id),
+                scope: MemoryScope::Private,
+                memory_kind: MemoryKind::Semantic,
+                subject_type: "user_profile",
+                subject_key: Some("preferred_name"),
+                content_text: "Alex",
+                content_json: None,
+                sensitivity: "normal",
+                source_type: "test",
+                source_ref: Some("cleanup"),
+                task_id: None,
+            })
+            .await
+            .expect("memory");
+        let stale_activity_at = (Utc::now() - chrono::Duration::hours(13)).to_rfc3339();
+        set_session_timestamps(&runtime, &session.session_id, &stale_activity_at, None, None).await;
+
+        let actions = runtime
+            .run_session_lifecycle_cleanup()
+            .await
+            .expect("cleanup");
+
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].policy_id, "cli_inactive_reset");
+        assert_eq!(actions[0].action, "reset");
+        let updated = runtime
+            .db
+            .fetch_conversation_session(&session.session_id)
+            .await
+            .expect("fetch session")
+            .expect("session");
+        assert!(updated.last_reset_at.is_some());
+        assert!(updated.archived_at.is_none());
+        assert_eq!(
+            updated.lifecycle_reason.as_deref(),
+            Some("policy:cli_inactive_reset:reset")
+        );
+        let recent_tasks = runtime
+            .db
+            .list_recent_interactive_tasks_for_session(
+                &session.session_id,
+                updated.last_reset_at.as_deref(),
+                8,
+            )
+            .await
+            .expect("recent tasks after cleanup");
+        assert!(recent_tasks.is_empty());
+        let memory = runtime
+            .db
+            .fetch_memory(&memory_id)
+            .await
+            .expect("fetch memory")
+            .expect("memory");
+        assert!(memory.forgotten_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn session_cleanup_honors_disabled_policies_and_archive_is_idempotent() {
+        let (_tempdir, mut runtime) = test_runtime(vec![]).await;
+        let policy = runtime
+            .config
+            .runtime
+            .session_management
+            .policies
+            .iter_mut()
+            .find(|policy| policy.policy_id == "group_room_inactive_archive")
+            .expect("group room policy");
+        policy.enabled = false;
+        let session = runtime
+            .resolve_connector_conversation_session("user_alex", "discord", "room-archive", false)
+            .await
+            .expect("room session");
+        let stale_activity_at = (Utc::now() - chrono::Duration::days(8)).to_rfc3339();
+        set_session_timestamps(&runtime, &session.session_id, &stale_activity_at, None, None).await;
+
+        let disabled_actions = runtime
+            .run_session_lifecycle_cleanup()
+            .await
+            .expect("cleanup disabled");
+        assert!(disabled_actions.is_empty());
+
+        let policy = runtime
+            .config
+            .runtime
+            .session_management
+            .policies
+            .iter_mut()
+            .find(|policy| policy.policy_id == "group_room_inactive_archive")
+            .expect("group room policy");
+        policy.enabled = true;
+
+        let first_actions = runtime
+            .run_session_lifecycle_cleanup()
+            .await
+            .expect("cleanup enabled");
+        assert_eq!(first_actions.len(), 1);
+        assert_eq!(first_actions[0].action, "archive");
+        let archived = runtime
+            .db
+            .fetch_conversation_session(&session.session_id)
+            .await
+            .expect("fetch archived session")
+            .expect("session");
+        assert!(archived.last_reset_at.is_some());
+        assert!(archived.archived_at.is_some());
+        assert_eq!(
+            archived.lifecycle_reason.as_deref(),
+            Some("policy:group_room_inactive_archive:archive")
+        );
+
+        let second_actions = runtime
+            .run_session_lifecycle_cleanup()
+            .await
+            .expect("cleanup idempotent");
+        assert!(second_actions.is_empty());
     }
 
     #[tokio::test]

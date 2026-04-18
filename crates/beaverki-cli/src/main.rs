@@ -4,11 +4,12 @@ use std::process::Stdio;
 
 use anyhow::{Context, Result, anyhow, bail};
 use beaverki_config::{
-    LoadedConfig, SetupAnswers, default_app_paths, prompt_passphrase_from_env,
-    write_integrations_config, write_providers_config, write_setup_files,
+    LoadedConfig, SessionLifecycleAction, SessionLifecyclePolicy, SessionPolicyMatchInput,
+    SetupAnswers, default_app_paths, prompt_passphrase_from_env, select_session_lifecycle_policy,
+    write_integrations_config, write_providers_config, write_runtime_config, write_setup_files,
 };
 use beaverki_core::{MemoryKind, MemoryScope};
-use beaverki_db::{Database, MemoryRow, UserRow};
+use beaverki_db::{ConversationSessionRow, Database, MemoryRow, UserRow};
 use beaverki_models::OpenAiProvider;
 use beaverki_policy::{is_builtin_role, visible_memory_scopes};
 use beaverki_runtime::{DaemonClient, Runtime, RuntimeDaemon, latest_daemon_status};
@@ -58,6 +59,10 @@ enum Commands {
     Approval {
         #[command(subcommand)]
         command: Box<ApprovalCommand>,
+    },
+    Session {
+        #[command(subcommand)]
+        command: Box<SessionCommand>,
     },
     Role {
         #[command(subcommand)]
@@ -154,6 +159,24 @@ enum ApprovalCommand {
     List(ApprovalListArgs),
     Approve(ApprovalResolveArgs),
     Deny(ApprovalResolveArgs),
+}
+
+#[derive(Subcommand)]
+enum SessionCommand {
+    List(SessionListArgs),
+    Show(SessionShowArgs),
+    Reset(SessionActionArgs),
+    Archive(SessionActionArgs),
+    Policy {
+        #[command(subcommand)]
+        command: Box<SessionPolicyCommand>,
+    },
+}
+
+#[derive(Subcommand)]
+enum SessionPolicyCommand {
+    List(ConfigDirArgs),
+    Set(SessionPolicySetArgs),
 }
 
 #[derive(Subcommand)]
@@ -305,6 +328,64 @@ struct ApprovalResolveArgs {
     approval_id: String,
     #[arg(long, default_value = "BEAVERKI_MASTER_PASSPHRASE")]
     passphrase_env: String,
+}
+
+#[derive(Args, Clone)]
+struct SessionListArgs {
+    #[arg(long)]
+    config_dir: Option<PathBuf>,
+    #[arg(long)]
+    user: Option<String>,
+    #[arg(long, default_value_t = false)]
+    all_users: bool,
+    #[arg(long, default_value_t = false)]
+    include_archived: bool,
+    #[arg(long, default_value_t = 20)]
+    limit: i64,
+}
+
+#[derive(Args, Clone)]
+struct SessionShowArgs {
+    #[arg(long)]
+    config_dir: Option<PathBuf>,
+    #[arg(long)]
+    session_id: String,
+}
+
+#[derive(Args, Clone)]
+struct SessionActionArgs {
+    #[arg(long)]
+    config_dir: Option<PathBuf>,
+    #[arg(long)]
+    session_id: String,
+    #[arg(long)]
+    user: Option<String>,
+}
+
+#[derive(Args, Clone)]
+struct SessionPolicySetArgs {
+    #[arg(long)]
+    config_dir: Option<PathBuf>,
+    #[arg(long)]
+    policy_id: String,
+    #[arg(long)]
+    action: Option<String>,
+    #[arg(long)]
+    inactivity_after_secs: Option<u64>,
+    #[arg(long)]
+    session_kind: Option<String>,
+    #[arg(long)]
+    connector_type: Option<String>,
+    #[arg(long)]
+    connector_target_prefix: Option<String>,
+    #[arg(long)]
+    audience_policy: Option<String>,
+    #[arg(long)]
+    max_memory_scope: Option<String>,
+    #[arg(long, default_value_t = false)]
+    enable: bool,
+    #[arg(long, default_value_t = false)]
+    disable: bool,
 }
 
 #[derive(Args, Clone)]
@@ -558,6 +639,18 @@ async fn main() -> Result<()> {
             ApprovalCommand::List(args) => approval_list(args).await,
             ApprovalCommand::Approve(args) => approval_resolve(args, true).await,
             ApprovalCommand::Deny(args) => approval_resolve(args, false).await,
+        },
+        Commands::Session { command } => match *command {
+            SessionCommand::List(args) => session_list(args).await,
+            SessionCommand::Show(args) => session_show(args).await,
+            SessionCommand::Reset(args) => session_apply_action(args, SessionLifecycleAction::Reset).await,
+            SessionCommand::Archive(args) => {
+                session_apply_action(args, SessionLifecycleAction::Archive).await
+            }
+            SessionCommand::Policy { command } => match *command {
+                SessionPolicyCommand::List(args) => session_policy_list(args).await,
+                SessionPolicyCommand::Set(args) => session_policy_set(args).await,
+            },
         },
         Commands::Role { command } => match *command {
             RoleCommand::List(args) => role_list(args).await,
@@ -1085,6 +1178,289 @@ async fn approval_resolve(args: ApprovalResolveArgs, approve: bool) -> Result<()
         println!("\n{result_text}");
     }
 
+    Ok(())
+}
+
+async fn session_list(args: SessionListArgs) -> Result<()> {
+    let config_dir = resolve_config_dir(args.config_dir)?;
+    let (config, db) = load_db(&config_dir).await?;
+    let owner_filter = if args.all_users {
+        None
+    } else {
+        Some(resolve_user_for_db(&db, args.user.as_deref()).await?.user_id)
+    };
+    let sessions = db
+        .list_conversation_sessions(owner_filter.as_deref(), args.include_archived, args.limit)
+        .await?;
+
+    if sessions.is_empty() {
+        println!("No sessions matched the requested filters.");
+        return Ok(());
+    }
+
+    for session in sessions {
+        let owners = db.list_session_owner_user_ids(&session.session_id).await?;
+        let policy_id = matching_session_policy_id(&config, &session);
+        println!(
+            "- {} kind={} owners=[{}] last_activity={} last_reset={} archived_at={} reason={} policy={}",
+            session.session_id,
+            session.session_kind,
+            if owners.is_empty() {
+                "<none>".to_owned()
+            } else {
+                owners.join(", ")
+            },
+            session.last_activity_at,
+            session.last_reset_at.as_deref().unwrap_or("<never>"),
+            session.archived_at.as_deref().unwrap_or("<active>"),
+            session.lifecycle_reason.as_deref().unwrap_or("<none>"),
+            policy_id.unwrap_or_else(|| "<none>".to_owned())
+        );
+    }
+
+    Ok(())
+}
+
+async fn session_show(args: SessionShowArgs) -> Result<()> {
+    let config_dir = resolve_config_dir(args.config_dir)?;
+    let (config, db) = load_db(&config_dir).await?;
+    let session = db
+        .fetch_conversation_session(&args.session_id)
+        .await?
+        .ok_or_else(|| anyhow!("session '{}' not found", args.session_id))?;
+    let owners = db.list_session_owner_user_ids(&session.session_id).await?;
+    let task_count = db.count_tasks_for_session(&session.session_id).await?;
+
+    println!("Session: {}", session.session_id);
+    println!("Kind: {}", session.session_kind);
+    println!("Key: {}", session.session_key);
+    println!("Owners: {}", join_or_none(&owners));
+    println!("Audience policy: {}", session.audience_policy);
+    println!("Max memory scope: {}", session.max_memory_scope);
+    println!(
+        "Connector type: {}",
+        session
+            .originating_connector_type
+            .as_deref()
+            .unwrap_or("<none>")
+    );
+    println!(
+        "Connector target: {}",
+        session
+            .originating_connector_target
+            .as_deref()
+            .unwrap_or("<none>")
+    );
+    println!("Last activity: {}", session.last_activity_at);
+    println!(
+        "Last reset: {}",
+        session.last_reset_at.as_deref().unwrap_or("<never>")
+    );
+    println!(
+        "Archived at: {}",
+        session.archived_at.as_deref().unwrap_or("<active>")
+    );
+    println!(
+        "Lifecycle reason: {}",
+        session.lifecycle_reason.as_deref().unwrap_or("<none>")
+    );
+    println!("Created at: {}", session.created_at);
+    println!("Updated at: {}", session.updated_at);
+    println!("Task count: {}", task_count);
+    println!(
+        "Matching policy: {}",
+        matching_session_policy_id(&config, &session).unwrap_or_else(|| "<none>".to_owned())
+    );
+    Ok(())
+}
+
+async fn session_apply_action(args: SessionActionArgs, action: SessionLifecycleAction) -> Result<()> {
+    let config_dir = resolve_config_dir(args.config_dir)?;
+    let (_config, db) = load_db(&config_dir).await?;
+    let operator = resolve_user_for_db(&db, args.user.as_deref()).await?;
+    let session = db
+        .fetch_conversation_session(&args.session_id)
+        .await?
+        .ok_or_else(|| anyhow!("session '{}' not found", args.session_id))?;
+    let reason = match action {
+        SessionLifecycleAction::Reset => "manual_reset",
+        SessionLifecycleAction::Archive => "manual_archive",
+    };
+
+    match action {
+        SessionLifecycleAction::Reset => {
+            db.reset_conversation_session(&session.session_id, reason).await?;
+        }
+        SessionLifecycleAction::Archive => {
+            db.archive_conversation_session(&session.session_id, reason).await?;
+        }
+    }
+    db.record_audit_event(
+        "user",
+        &operator.user_id,
+        "conversation_session_lifecycle_overridden",
+        serde_json::json!({
+            "session_id": session.session_id,
+            "action": action.as_str(),
+            "reason": reason,
+        }),
+    )
+    .await?;
+
+    let updated = db
+        .fetch_conversation_session(&args.session_id)
+        .await?
+        .ok_or_else(|| anyhow!("session '{}' disappeared after update", args.session_id))?;
+    println!(
+        "Session {} {}.",
+        updated.session_id,
+        match action {
+            SessionLifecycleAction::Reset => "reset",
+            SessionLifecycleAction::Archive => "archived",
+        }
+    );
+    println!("Last reset: {}", updated.last_reset_at.as_deref().unwrap_or("<never>"));
+    println!(
+        "Archived at: {}",
+        updated.archived_at.as_deref().unwrap_or("<active>")
+    );
+    println!(
+        "Lifecycle reason: {}",
+        updated.lifecycle_reason.as_deref().unwrap_or("<none>")
+    );
+    Ok(())
+}
+
+async fn session_policy_list(args: ConfigDirArgs) -> Result<()> {
+    let config_dir = resolve_config_dir(args.config_dir)?;
+    let config = LoadedConfig::load_from_dir(&config_dir)?;
+    println!(
+        "Cleanup interval: {}s",
+        config.runtime.session_management.cleanup_interval_secs
+    );
+    if config.runtime.session_management.policies.is_empty() {
+        println!("No session lifecycle policies configured.");
+        return Ok(());
+    }
+
+    for policy in &config.runtime.session_management.policies {
+        println!(
+            "- {} enabled={} action={} inactivity={}s kind={} connector_type={} connector_target_prefix={} audience_policy={} max_memory_scope={}",
+            policy.policy_id,
+            if policy.enabled { "yes" } else { "no" },
+            policy.action.as_str(),
+            policy.inactivity_after_secs,
+            policy.session_kind.as_deref().unwrap_or("<any>"),
+            policy.connector_type.as_deref().unwrap_or("<any>"),
+            policy
+                .connector_target_prefix
+                .as_deref()
+                .unwrap_or("<any>"),
+            policy.audience_policy.as_deref().unwrap_or("<any>"),
+            policy.max_memory_scope.as_deref().unwrap_or("<any>")
+        );
+    }
+    Ok(())
+}
+
+async fn session_policy_set(args: SessionPolicySetArgs) -> Result<()> {
+    let config_dir = resolve_config_dir(args.config_dir)?;
+    if args.enable && args.disable {
+        bail!("--enable and --disable cannot be used together");
+    }
+
+    let mut config = LoadedConfig::load_from_dir(&config_dir)?;
+    let existing_index = config
+        .runtime
+        .session_management
+        .policies
+        .iter()
+        .position(|policy| policy.policy_id == args.policy_id);
+    let mut policy = existing_index
+        .map(|index| config.runtime.session_management.policies[index].clone())
+        .unwrap_or(SessionLifecyclePolicy {
+            policy_id: args.policy_id.clone(),
+            enabled: true,
+            action: SessionLifecycleAction::Reset,
+            inactivity_after_secs: 0,
+            session_kind: None,
+            connector_type: None,
+            connector_target_prefix: None,
+            audience_policy: None,
+            max_memory_scope: None,
+        });
+
+    if let Some(action) = args.action.as_deref() {
+        policy.action = parse_session_lifecycle_action(action)?;
+    } else if existing_index.is_none() {
+        bail!("new policies require --action");
+    }
+    if let Some(inactivity_after_secs) = args.inactivity_after_secs {
+        if inactivity_after_secs == 0 {
+            bail!("--inactivity-after-secs must be greater than zero");
+        }
+        policy.inactivity_after_secs = inactivity_after_secs;
+    } else if existing_index.is_none() {
+        bail!("new policies require --inactivity-after-secs");
+    }
+    if let Some(session_kind) = args.session_kind {
+        policy.session_kind = normalize_optional_filter(session_kind);
+    }
+    if let Some(connector_type) = args.connector_type {
+        policy.connector_type = normalize_optional_filter(connector_type);
+    }
+    if let Some(connector_target_prefix) = args.connector_target_prefix {
+        policy.connector_target_prefix = normalize_optional_filter(connector_target_prefix);
+    }
+    if let Some(audience_policy) = args.audience_policy {
+        policy.audience_policy = normalize_optional_filter(audience_policy);
+    }
+    if let Some(max_memory_scope) = args.max_memory_scope {
+        policy.max_memory_scope = normalize_optional_filter(max_memory_scope);
+    }
+    if args.enable {
+        policy.enabled = true;
+    }
+    if args.disable {
+        policy.enabled = false;
+    }
+
+    if let Some(index) = existing_index {
+        config.runtime.session_management.policies[index] = policy.clone();
+    } else {
+        config.runtime.session_management.policies.push(policy.clone());
+    }
+    let path = write_runtime_config(&config_dir, &config.runtime)?;
+
+    println!("Updated session lifecycle policy in {}", path.display());
+    println!("Policy ID: {}", policy.policy_id);
+    println!("Enabled: {}", if policy.enabled { "yes" } else { "no" });
+    println!("Action: {}", policy.action.as_str());
+    println!("Inactivity: {}s", policy.inactivity_after_secs);
+    println!(
+        "Session kind: {}",
+        policy.session_kind.as_deref().unwrap_or("<any>")
+    );
+    println!(
+        "Connector type: {}",
+        policy.connector_type.as_deref().unwrap_or("<any>")
+    );
+    println!(
+        "Connector target prefix: {}",
+        policy
+            .connector_target_prefix
+            .as_deref()
+            .unwrap_or("<any>")
+    );
+    println!(
+        "Audience policy: {}",
+        policy.audience_policy.as_deref().unwrap_or("<any>")
+    );
+    println!(
+        "Max memory scope: {}",
+        policy.max_memory_scope.as_deref().unwrap_or("<any>")
+    );
+    println!("Restart the daemon to apply updated cleanup policies.");
     Ok(())
 }
 
@@ -1866,6 +2242,48 @@ fn print_memory_detail(memory: &MemoryRow) {
         "Content JSON: {}",
         memory.content_json.as_deref().unwrap_or("<none>")
     );
+}
+
+fn join_or_none(values: &[String]) -> String {
+    if values.is_empty() {
+        "<none>".to_owned()
+    } else {
+        values.join(", ")
+    }
+}
+
+fn matching_session_policy_id(
+    config: &LoadedConfig,
+    session: &ConversationSessionRow,
+) -> Option<String> {
+    select_session_lifecycle_policy(
+        &config.runtime.session_management.policies,
+        &SessionPolicyMatchInput {
+            session_kind: &session.session_kind,
+            connector_type: session.originating_connector_type.as_deref(),
+            connector_target: session.originating_connector_target.as_deref(),
+            audience_policy: &session.audience_policy,
+            max_memory_scope: &session.max_memory_scope,
+        },
+    )
+    .map(|policy| policy.policy_id.clone())
+}
+
+fn parse_session_lifecycle_action(value: &str) -> Result<SessionLifecycleAction> {
+    match value {
+        "reset" => Ok(SessionLifecycleAction::Reset),
+        "archive" => Ok(SessionLifecycleAction::Archive),
+        _ => bail!("unsupported session action '{value}', expected reset or archive"),
+    }
+}
+
+fn normalize_optional_filter(value: String) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_owned())
+    }
 }
 
 async fn try_daemon_client(config_dir: &PathBuf) -> Result<DaemonClient> {

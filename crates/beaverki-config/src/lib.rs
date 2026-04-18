@@ -28,6 +28,8 @@ pub struct RuntimeConfig {
     pub default_timezone: String,
     pub features: RuntimeFeatures,
     pub defaults: RuntimeDefaults,
+    #[serde(default)]
+    pub session_management: SessionManagementConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -38,6 +40,166 @@ pub struct RuntimeFeatures {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeDefaults {
     pub max_agent_steps: u8,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SessionManagementConfig {
+    pub cleanup_interval_secs: u64,
+    pub policies: Vec<SessionLifecyclePolicy>,
+}
+
+impl Default for SessionManagementConfig {
+    fn default() -> Self {
+        Self {
+            cleanup_interval_secs: 5 * 60,
+            policies: vec![
+                SessionLifecyclePolicy {
+                    policy_id: "cli_inactive_reset".to_owned(),
+                    enabled: true,
+                    action: SessionLifecycleAction::Reset,
+                    inactivity_after_secs: 12 * 60 * 60,
+                    session_kind: Some("cli".to_owned()),
+                    connector_type: None,
+                    connector_target_prefix: None,
+                    audience_policy: None,
+                    max_memory_scope: None,
+                },
+                SessionLifecyclePolicy {
+                    policy_id: "direct_message_inactive_reset".to_owned(),
+                    enabled: true,
+                    action: SessionLifecycleAction::Reset,
+                    inactivity_after_secs: 6 * 60 * 60,
+                    session_kind: Some("direct_message".to_owned()),
+                    connector_type: None,
+                    connector_target_prefix: None,
+                    audience_policy: None,
+                    max_memory_scope: None,
+                },
+                SessionLifecyclePolicy {
+                    policy_id: "group_room_inactive_archive".to_owned(),
+                    enabled: true,
+                    action: SessionLifecycleAction::Archive,
+                    inactivity_after_secs: 7 * 24 * 60 * 60,
+                    session_kind: Some("group_room".to_owned()),
+                    connector_type: None,
+                    connector_target_prefix: None,
+                    audience_policy: None,
+                    max_memory_scope: None,
+                },
+                SessionLifecyclePolicy {
+                    policy_id: "cron_run_inactive_archive".to_owned(),
+                    enabled: true,
+                    action: SessionLifecycleAction::Archive,
+                    inactivity_after_secs: 24 * 60 * 60,
+                    session_kind: Some("cron_run".to_owned()),
+                    connector_type: None,
+                    connector_target_prefix: None,
+                    audience_policy: None,
+                    max_memory_scope: None,
+                },
+            ],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionLifecycleAction {
+    Reset,
+    Archive,
+}
+
+impl SessionLifecycleAction {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Reset => "reset",
+            Self::Archive => "archive",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SessionLifecyclePolicy {
+    pub policy_id: String,
+    pub enabled: bool,
+    pub action: SessionLifecycleAction,
+    pub inactivity_after_secs: u64,
+    pub session_kind: Option<String>,
+    pub connector_type: Option<String>,
+    pub connector_target_prefix: Option<String>,
+    pub audience_policy: Option<String>,
+    pub max_memory_scope: Option<String>,
+}
+
+impl Default for SessionLifecyclePolicy {
+    fn default() -> Self {
+        Self {
+            policy_id: String::new(),
+            enabled: true,
+            action: SessionLifecycleAction::Reset,
+            inactivity_after_secs: 0,
+            session_kind: None,
+            connector_type: None,
+            connector_target_prefix: None,
+            audience_policy: None,
+            max_memory_scope: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SessionPolicyMatchInput<'a> {
+    pub session_kind: &'a str,
+    pub connector_type: Option<&'a str>,
+    pub connector_target: Option<&'a str>,
+    pub audience_policy: &'a str,
+    pub max_memory_scope: &'a str,
+}
+
+impl SessionLifecyclePolicy {
+    pub fn matches(&self, input: &SessionPolicyMatchInput<'_>) -> bool {
+        if !self.enabled {
+            return false;
+        }
+        if let Some(session_kind) = self.session_kind.as_deref()
+            && session_kind != input.session_kind
+        {
+            return false;
+        }
+        if let Some(connector_type) = self.connector_type.as_deref()
+            && Some(connector_type) != input.connector_type
+        {
+            return false;
+        }
+        if let Some(prefix) = self.connector_target_prefix.as_deref() {
+            let Some(target) = input.connector_target else {
+                return false;
+            };
+            if !target.starts_with(prefix) {
+                return false;
+            }
+        }
+        if let Some(audience_policy) = self.audience_policy.as_deref()
+            && audience_policy != input.audience_policy
+        {
+            return false;
+        }
+        if let Some(max_memory_scope) = self.max_memory_scope.as_deref()
+            && max_memory_scope != input.max_memory_scope
+        {
+            return false;
+        }
+        true
+    }
+}
+
+pub fn select_session_lifecycle_policy<'a>(
+    policies: &'a [SessionLifecyclePolicy],
+    input: &SessionPolicyMatchInput<'_>,
+) -> Option<&'a SessionLifecyclePolicy> {
+    policies.iter().find(|policy| policy.matches(input))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -236,6 +398,7 @@ pub fn write_setup_files(answers: &SetupAnswers) -> Result<SetupArtifacts> {
             markdown_exports: true,
         },
         defaults: RuntimeDefaults { max_agent_steps: 8 },
+        session_management: SessionManagementConfig::default(),
     };
     let providers = ProvidersConfig {
         version: CURRENT_CONFIG_VERSION,
@@ -298,6 +461,15 @@ pub fn write_providers_config(
     Ok(path)
 }
 
+pub fn write_runtime_config(
+    config_dir: impl AsRef<Path>,
+    runtime: &RuntimeConfig,
+) -> Result<PathBuf> {
+    let path = config_dir.as_ref().join("runtime.yaml");
+    write_runtime_config_path(&path, runtime)?;
+    Ok(path)
+}
+
 pub fn write_integrations_config(
     config_dir: impl AsRef<Path>,
     integrations: &IntegrationsConfig,
@@ -309,6 +481,11 @@ pub fn write_integrations_config(
 
 fn write_providers_config_path(path: &Path, providers: &ProvidersConfig) -> Result<()> {
     fs::write(path, serde_yaml::to_string(providers)?)
+        .with_context(|| format!("failed to write {}", path.display()))
+}
+
+fn write_runtime_config_path(path: &Path, runtime: &RuntimeConfig) -> Result<()> {
+    fs::write(path, serde_yaml::to_string(runtime)?)
         .with_context(|| format!("failed to write {}", path.display()))
 }
 
@@ -341,7 +518,21 @@ where
 }
 
 fn migrate_runtime_config_value(value: serde_yaml::Value) -> Result<(serde_yaml::Value, bool)> {
-    migrate_root_mapping(value, |_, _| Ok(false))
+    migrate_root_mapping(value, |mapping, version| {
+        let mut changed = false;
+        if version < CURRENT_CONFIG_VERSION {
+            let session_management_key =
+                serde_yaml::Value::String("session_management".to_owned());
+            if !mapping.contains_key(&session_management_key) {
+                mapping.insert(
+                    session_management_key,
+                    serde_yaml::to_value(SessionManagementConfig::default())?,
+                );
+                changed = true;
+            }
+        }
+        Ok(changed)
+    })
 }
 
 fn migrate_providers_config_value(value: serde_yaml::Value) -> Result<(serde_yaml::Value, bool)> {
@@ -606,6 +797,7 @@ mod tests {
                     markdown_exports: true,
                 },
                 defaults: RuntimeDefaults { max_agent_steps: 8 },
+                session_management: SessionManagementConfig::default(),
             },
             providers: ProvidersConfig {
                 version: CURRENT_CONFIG_VERSION,
@@ -704,6 +896,14 @@ entries:
 
         let loaded = LoadedConfig::load_from_dir(&config_dir).expect("load");
         assert_eq!(loaded.runtime.version, CURRENT_CONFIG_VERSION);
+        assert_eq!(
+            loaded.runtime.session_management.cleanup_interval_secs,
+            SessionManagementConfig::default().cleanup_interval_secs
+        );
+        assert_eq!(
+            loaded.runtime.session_management.policies.len(),
+            SessionManagementConfig::default().policies.len()
+        );
         assert_eq!(loaded.providers.version, CURRENT_CONFIG_VERSION);
         assert_eq!(loaded.integrations.version, CURRENT_CONFIG_VERSION);
         assert_eq!(
@@ -727,6 +927,7 @@ entries:
             fs::read_to_string(&integrations_path).expect("integrations content");
 
         assert!(runtime_rewritten.contains("version: 1"));
+        assert!(runtime_rewritten.contains("session_management:"));
         assert!(providers_rewritten.contains("version: 1"));
         assert!(providers_rewritten.contains("safety_review: gpt-5.4-mini"));
         assert!(integrations_rewritten.contains("version: 1"));
@@ -789,5 +990,43 @@ entries:
 
         let error = LoadedConfig::load_from_dir(&config_dir).expect_err("future version error");
         assert!(format!("{error:#}").contains("unsupported config version 999"));
+    }
+
+    #[test]
+    fn session_policy_matching_respects_optional_filters() {
+        let policy = SessionLifecyclePolicy {
+            policy_id: "discord-room".to_owned(),
+            enabled: true,
+            action: SessionLifecycleAction::Archive,
+            inactivity_after_secs: 600,
+            session_kind: Some("group_room".to_owned()),
+            connector_type: Some("discord".to_owned()),
+            connector_target_prefix: Some("room-".to_owned()),
+            audience_policy: Some("shared_room".to_owned()),
+            max_memory_scope: Some("household".to_owned()),
+        };
+        let matching = SessionPolicyMatchInput {
+            session_kind: "group_room",
+            connector_type: Some("discord"),
+            connector_target: Some("room-42"),
+            audience_policy: "shared_room",
+            max_memory_scope: "household",
+        };
+        let non_matching = SessionPolicyMatchInput {
+            session_kind: "group_room",
+            connector_type: Some("discord"),
+            connector_target: Some("dm-42"),
+            audience_policy: "shared_room",
+            max_memory_scope: "household",
+        };
+
+        assert!(policy.matches(&matching));
+        assert!(!policy.matches(&non_matching));
+        assert_eq!(
+            select_session_lifecycle_policy(&[policy], &matching)
+                .expect("policy")
+                .policy_id,
+            "discord-room"
+        );
     }
 }

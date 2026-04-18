@@ -313,7 +313,7 @@ Add policy-driven lifecycle management for conversation sessions after first-cla
 
 Status:
 
-- proposed after M4.5
+- implemented in the repository
 
 Implementation notes:
 
