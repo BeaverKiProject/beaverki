@@ -521,8 +521,7 @@ fn migrate_runtime_config_value(value: serde_yaml::Value) -> Result<(serde_yaml:
     migrate_root_mapping(value, |mapping, version| {
         let mut changed = false;
         if version < CURRENT_CONFIG_VERSION {
-            let session_management_key =
-                serde_yaml::Value::String("session_management".to_owned());
+            let session_management_key = serde_yaml::Value::String("session_management".to_owned());
             if !mapping.contains_key(&session_management_key) {
                 mapping.insert(
                     session_management_key,

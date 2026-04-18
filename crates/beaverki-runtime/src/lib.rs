@@ -355,10 +355,7 @@ impl Runtime {
 
     pub async fn run_session_lifecycle_cleanup(&self) -> Result<Vec<SessionLifecycleExecution>> {
         let now = Utc::now();
-        let sessions = self
-            .db
-            .list_conversation_sessions(None, false, 512)
-            .await?;
+        let sessions = self.db.list_conversation_sessions(None, false, 512).await?;
         let mut actions = Vec::new();
 
         for session in sessions {
@@ -369,11 +366,7 @@ impl Runtime {
                 continue;
             }
 
-            let reason = format!(
-                "policy:{}:{}",
-                policy.policy_id,
-                policy.action.as_str()
-            );
+            let reason = format!("policy:{}:{}", policy.policy_id, policy.action.as_str());
             match policy.action {
                 SessionLifecycleAction::Reset => {
                     self.db
@@ -2875,9 +2868,7 @@ impl RuntimeDaemon {
         }
     }
 
-    fn start_session_cleanup_loop(
-        self: &Arc<Self>,
-    ) -> Option<tokio::task::JoinHandle<Result<()>>> {
+    fn start_session_cleanup_loop(self: &Arc<Self>) -> Option<tokio::task::JoinHandle<Result<()>>> {
         let interval_secs = self
             .runtime
             .config
@@ -2953,7 +2944,8 @@ fn session_lifecycle_is_due(
         .with_timezone(&Utc);
     let inactive_for = now.signed_duration_since(last_activity_at);
     let inactivity_threshold = chrono::Duration::seconds(
-        i64::try_from(policy.inactivity_after_secs).context("policy inactivity TTL is too large")?,
+        i64::try_from(policy.inactivity_after_secs)
+            .context("policy inactivity TTL is too large")?,
     );
     if inactive_for < inactivity_threshold {
         return Ok(false);
@@ -3228,8 +3220,7 @@ mod tests {
     use anyhow::Result;
     use async_trait::async_trait;
     use beaverki_config::{
-        ProviderModels, RuntimeConfig, RuntimeDefaults, RuntimeFeatures,
-        SessionManagementConfig,
+        ProviderModels, RuntimeConfig, RuntimeDefaults, RuntimeFeatures, SessionManagementConfig,
     };
     use beaverki_models::{ConversationItem, ModelTurnResponse};
     use tempfile::TempDir;
@@ -3525,7 +3516,14 @@ mod tests {
             .await
             .expect("memory");
         let stale_activity_at = (Utc::now() - chrono::Duration::hours(13)).to_rfc3339();
-        set_session_timestamps(&runtime, &session.session_id, &stale_activity_at, None, None).await;
+        set_session_timestamps(
+            &runtime,
+            &session.session_id,
+            &stale_activity_at,
+            None,
+            None,
+        )
+        .await;
 
         let actions = runtime
             .run_session_lifecycle_cleanup()
@@ -3583,7 +3581,14 @@ mod tests {
             .await
             .expect("room session");
         let stale_activity_at = (Utc::now() - chrono::Duration::days(8)).to_rfc3339();
-        set_session_timestamps(&runtime, &session.session_id, &stale_activity_at, None, None).await;
+        set_session_timestamps(
+            &runtime,
+            &session.session_id,
+            &stale_activity_at,
+            None,
+            None,
+        )
+        .await;
 
         let disabled_actions = runtime
             .run_session_lifecycle_cleanup()

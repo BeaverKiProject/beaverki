@@ -643,7 +643,9 @@ async fn main() -> Result<()> {
         Commands::Session { command } => match *command {
             SessionCommand::List(args) => session_list(args).await,
             SessionCommand::Show(args) => session_show(args).await,
-            SessionCommand::Reset(args) => session_apply_action(args, SessionLifecycleAction::Reset).await,
+            SessionCommand::Reset(args) => {
+                session_apply_action(args, SessionLifecycleAction::Reset).await
+            }
             SessionCommand::Archive(args) => {
                 session_apply_action(args, SessionLifecycleAction::Archive).await
             }
@@ -1187,7 +1189,11 @@ async fn session_list(args: SessionListArgs) -> Result<()> {
     let owner_filter = if args.all_users {
         None
     } else {
-        Some(resolve_user_for_db(&db, args.user.as_deref()).await?.user_id)
+        Some(
+            resolve_user_for_db(&db, args.user.as_deref())
+                .await?
+                .user_id,
+        )
     };
     let sessions = db
         .list_conversation_sessions(owner_filter.as_deref(), args.include_archived, args.limit)
@@ -1274,7 +1280,10 @@ async fn session_show(args: SessionShowArgs) -> Result<()> {
     Ok(())
 }
 
-async fn session_apply_action(args: SessionActionArgs, action: SessionLifecycleAction) -> Result<()> {
+async fn session_apply_action(
+    args: SessionActionArgs,
+    action: SessionLifecycleAction,
+) -> Result<()> {
     let config_dir = resolve_config_dir(args.config_dir)?;
     let (_config, db) = load_db(&config_dir).await?;
     let operator = resolve_user_for_db(&db, args.user.as_deref()).await?;
@@ -1289,10 +1298,12 @@ async fn session_apply_action(args: SessionActionArgs, action: SessionLifecycleA
 
     match action {
         SessionLifecycleAction::Reset => {
-            db.reset_conversation_session(&session.session_id, reason).await?;
+            db.reset_conversation_session(&session.session_id, reason)
+                .await?;
         }
         SessionLifecycleAction::Archive => {
-            db.archive_conversation_session(&session.session_id, reason).await?;
+            db.archive_conversation_session(&session.session_id, reason)
+                .await?;
         }
     }
     db.record_audit_event(
@@ -1319,7 +1330,10 @@ async fn session_apply_action(args: SessionActionArgs, action: SessionLifecycleA
             SessionLifecycleAction::Archive => "archived",
         }
     );
-    println!("Last reset: {}", updated.last_reset_at.as_deref().unwrap_or("<never>"));
+    println!(
+        "Last reset: {}",
+        updated.last_reset_at.as_deref().unwrap_or("<never>")
+    );
     println!(
         "Archived at: {}",
         updated.archived_at.as_deref().unwrap_or("<active>")
@@ -1352,10 +1366,7 @@ async fn session_policy_list(args: ConfigDirArgs) -> Result<()> {
             policy.inactivity_after_secs,
             policy.session_kind.as_deref().unwrap_or("<any>"),
             policy.connector_type.as_deref().unwrap_or("<any>"),
-            policy
-                .connector_target_prefix
-                .as_deref()
-                .unwrap_or("<any>"),
+            policy.connector_target_prefix.as_deref().unwrap_or("<any>"),
             policy.audience_policy.as_deref().unwrap_or("<any>"),
             policy.max_memory_scope.as_deref().unwrap_or("<any>")
         );
@@ -1428,7 +1439,11 @@ async fn session_policy_set(args: SessionPolicySetArgs) -> Result<()> {
     if let Some(index) = existing_index {
         config.runtime.session_management.policies[index] = policy.clone();
     } else {
-        config.runtime.session_management.policies.push(policy.clone());
+        config
+            .runtime
+            .session_management
+            .policies
+            .push(policy.clone());
     }
     let path = write_runtime_config(&config_dir, &config.runtime)?;
 
@@ -1447,10 +1462,7 @@ async fn session_policy_set(args: SessionPolicySetArgs) -> Result<()> {
     );
     println!(
         "Connector target prefix: {}",
-        policy
-            .connector_target_prefix
-            .as_deref()
-            .unwrap_or("<any>")
+        policy.connector_target_prefix.as_deref().unwrap_or("<any>")
     );
     println!(
         "Audience policy: {}",
