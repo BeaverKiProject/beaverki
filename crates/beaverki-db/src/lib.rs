@@ -2298,10 +2298,7 @@ impl Database {
         Ok(rows)
     }
 
-    pub async fn list_workflow_stages(
-        &self,
-        workflow_id: &str,
-    ) -> Result<Vec<WorkflowStageRow>> {
+    pub async fn list_workflow_stages(&self, workflow_id: &str) -> Result<Vec<WorkflowStageRow>> {
         let rows = sqlx::query_as::<_, WorkflowStageRow>(
             "SELECT stage_id, workflow_id, version_number, stage_index, stage_kind, stage_label, artifact_ref, stage_config_json, created_at, updated_at
              FROM workflow_stages
@@ -2485,7 +2482,10 @@ impl Database {
             .ok_or_else(|| anyhow!("workflow run missing after insert"))
     }
 
-    pub async fn fetch_workflow_run(&self, workflow_run_id: &str) -> Result<Option<WorkflowRunRow>> {
+    pub async fn fetch_workflow_run(
+        &self,
+        workflow_run_id: &str,
+    ) -> Result<Option<WorkflowRunRow>> {
         let row = sqlx::query_as::<_, WorkflowRunRow>(
             "SELECT workflow_run_id, workflow_id, owner_user_id, initiating_identity_id, schedule_id, source_task_id, state, current_stage_index, artifacts_json, wake_at, block_reason, last_error, retry_count, started_at, completed_at, created_at, updated_at
              FROM workflow_runs

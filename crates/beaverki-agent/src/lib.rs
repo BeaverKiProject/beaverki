@@ -981,10 +981,12 @@ impl PrimaryAgentRunner {
             "workflow_get" => self.handle_workflow_get(request, arguments).await,
             "workflow_write" => self.handle_workflow_write(task, request, arguments).await,
             "workflow_activate" => {
-                self.handle_workflow_activate(task, request, arguments).await
+                self.handle_workflow_activate(task, request, arguments)
+                    .await
             }
             "workflow_schedule" => {
-                self.handle_workflow_schedule(task, request, arguments).await
+                self.handle_workflow_schedule(task, request, arguments)
+                    .await
             }
             "workflow_replay" => self.handle_workflow_replay(task, request, arguments).await,
             "workflow_run_list" => self.handle_workflow_run_list(request, arguments).await,
@@ -1561,7 +1563,7 @@ impl PrimaryAgentRunner {
                     &beaverki_core::now_rfc3339(),
                     self.base_tool_context.default_timezone.as_deref(),
                 )
-                    .map_err(ToolError::Failed)?
+                .map_err(ToolError::Failed)?
             } else {
                 beaverki_core::now_rfc3339()
             };
@@ -1665,7 +1667,7 @@ impl PrimaryAgentRunner {
                         &beaverki_core::now_rfc3339(),
                         self.base_tool_context.default_timezone.as_deref(),
                     )
-                        .map_err(ToolError::Failed)?
+                    .map_err(ToolError::Failed)?
                 } else {
                     let schedule = self
                         .db
@@ -3149,16 +3151,14 @@ impl PrimaryAgentRunner {
             .map(ToOwned::to_owned);
         let name = required_string_arg(&arguments, "name", "workflow_write")?;
         let description = optional_string_arg(&arguments, "description").map(str::to_owned);
-        let intended_behavior_summary = required_string_arg(
-            &arguments,
-            "intended_behavior_summary",
-            "workflow_write",
-        )?;
+        let intended_behavior_summary =
+            required_string_arg(&arguments, "intended_behavior_summary", "workflow_write")?;
         let stages_value = arguments
             .get("stages")
             .cloned()
             .ok_or_else(|| ToolError::Failed(anyhow!("workflow_write requires stages")))?;
-        let stage_inputs = workflow_stage_inputs_from_value(&stages_value).map_err(ToolError::Failed)?;
+        let stage_inputs =
+            workflow_stage_inputs_from_value(&stages_value).map_err(ToolError::Failed)?;
         if stage_inputs.is_empty() {
             return Err(ToolError::Failed(anyhow!(
                 "workflow_write requires at least one stage"
@@ -3330,19 +3330,6 @@ impl PrimaryAgentRunner {
                 payload: json!({
                     "workflow_id": workflow.workflow_id,
                     "status": workflow.status,
-                }),
-            });
-        }
-        if !self.has_approved_action(request, "workflow_activate", &workflow.workflow_id) {
-            return Err(ToolError::Denied {
-                message: "Workflow activation requires approval".to_owned(),
-                detail: json!({
-                    "action_type": "workflow_activate",
-                    "target_ref": workflow.workflow_id,
-                    "rationale": format!(
-                        "Task '{}' wants to activate workflow '{}'.",
-                        task.objective, workflow.workflow_id
-                    ),
                 }),
             });
         }
@@ -3576,13 +3563,16 @@ impl PrimaryAgentRunner {
         request: &AgentRequest,
         arguments: Value,
     ) -> std::result::Result<ToolOutput, ToolError> {
-        let workflow_run_id = required_string_arg(&arguments, "workflow_run_id", "workflow_run_get")?;
+        let workflow_run_id =
+            required_string_arg(&arguments, "workflow_run_id", "workflow_run_get")?;
         let run = self
             .db
             .fetch_workflow_run_for_owner(&request.owner_user_id, workflow_run_id)
             .await
             .map_err(ToolError::Failed)?
-            .ok_or_else(|| ToolError::Failed(anyhow!("workflow run '{workflow_run_id}' not found")))?;
+            .ok_or_else(|| {
+                ToolError::Failed(anyhow!("workflow run '{workflow_run_id}' not found"))
+            })?;
         Ok(ToolOutput {
             payload: workflow_run_to_json(run).map_err(ToolError::Failed)?,
         })
@@ -4298,14 +4288,15 @@ async fn validate_workflow_stage_references(
     for stage in stages {
         match stage.stage_kind.as_str() {
             "lua_script" => {
-                let script_id = stage
-                    .artifact_ref
-                    .as_deref()
-                    .ok_or_else(|| anyhow!("workflow stage '{}' is missing script_id", stage.stage_id))?;
+                let script_id = stage.artifact_ref.as_deref().ok_or_else(|| {
+                    anyhow!("workflow stage '{}' is missing script_id", stage.stage_id)
+                })?;
                 let script = db
                     .fetch_script_for_owner(&workflow.owner_user_id, script_id)
                     .await?
-                    .ok_or_else(|| anyhow!("workflow stage references missing script '{}'", script_id))?;
+                    .ok_or_else(|| {
+                        anyhow!("workflow stage references missing script '{}'", script_id)
+                    })?;
                 if script.status != "active" || script.safety_status != "approved" {
                     return Err(anyhow!(
                         "workflow script '{}' must be active and approved",
@@ -4314,14 +4305,15 @@ async fn validate_workflow_stage_references(
                 }
             }
             "lua_tool" => {
-                let tool_id = stage
-                    .artifact_ref
-                    .as_deref()
-                    .ok_or_else(|| anyhow!("workflow stage '{}' is missing tool_id", stage.stage_id))?;
+                let tool_id = stage.artifact_ref.as_deref().ok_or_else(|| {
+                    anyhow!("workflow stage '{}' is missing tool_id", stage.stage_id)
+                })?;
                 let tool = db
                     .fetch_lua_tool_for_owner(&workflow.owner_user_id, tool_id)
                     .await?
-                    .ok_or_else(|| anyhow!("workflow stage references missing Lua tool '{}'", tool_id))?;
+                    .ok_or_else(|| {
+                        anyhow!("workflow stage references missing Lua tool '{}'", tool_id)
+                    })?;
                 if tool.status != "active" || tool.safety_status != "approved" {
                     return Err(anyhow!(
                         "workflow Lua tool '{}' must be active and approved",
@@ -4967,7 +4959,7 @@ fn tool_definitions(tools: &ToolRegistry) -> Vec<ToolDefinition> {
     });
     definitions.push(ToolDefinition {
         name: "workflow_activate".to_owned(),
-        description: "Activate a reviewed workflow definition after user approval so it can run on schedule or via replay.".to_owned(),
+        description: "Activate a reviewed workflow definition after safety approval so it can run on schedule or via replay.".to_owned(),
         input_schema: json!({
             "type": "object",
             "properties": {
@@ -5103,7 +5095,7 @@ Use tools when needed, but keep the task focused and auditable.
 Only low-risk read-only shell commands are allowed by default. Medium/high/critical shell commands require user approval.
 For exploring allowed roots and locating files, prefer filesystem_list, filesystem_read_text, and filesystem_search over shell_exec.
 Use Lua tools when recurring or structured automation materially helps. Writing a Lua script triggers safety review. New scripts require explicit activation later, while rewrites of already active scripts stay active if the new version passes safety review. Scheduling requires user approval. When writing Lua, prefer `return function(ctx) ... end`, use BeaverKI host APIs such as `ctx.log_info`, `ctx.notify_user`, `ctx.task_defer`, `ctx.memory_read`, `ctx.memory_write`, and `ctx.tool_call`, and avoid legacy globals like `run()`, `log()`, or `notify()`.
-Use workflow tools for staged recurring automation. Reuse the same workflow_id when revising a workflow so BeaverKI creates a new workflow version instead of inventing unrelated workflows.
+Use workflow tools for staged recurring automation. Reuse the same workflow_id when revising a workflow so BeaverKI creates a new workflow version instead of inventing unrelated workflows. Safety-approved workflows can be activated directly; scheduling still requires user approval.
 When a user is building or debugging a workflow, inspect existing state before proposing changes: use workflow_get for the current definition, workflow_run_list to see recent runs, and workflow_run_get to inspect persisted artifacts, final results, retry state, and block reasons for a specific run.
 If a workflow run failed or blocked, prefer reading the run state and artifacts first, then revise the workflow with workflow_write using the same workflow_id, and only then suggest activation, replay, or rescheduling as needed.
 Never claim a workflow was created, revised, activated, scheduled, replayed, or successfully completed unless the corresponding workflow tool returned success in this task.
@@ -5934,8 +5926,14 @@ mod tests {
             .expect("schedule self delivery");
 
         assert_eq!(created.payload["status"], json!("scheduled"));
-        assert_eq!(created.payload["recipient_user_id"], json!(default_user.user_id));
-        assert_eq!(created.payload["recipient_display_name"], json!(default_user.display_name));
+        assert_eq!(
+            created.payload["recipient_user_id"],
+            json!(default_user.user_id)
+        );
+        assert_eq!(
+            created.payload["recipient_display_name"],
+            json!(default_user.display_name)
+        );
         assert_eq!(created.payload["message"], json!("Take vitamins."));
     }
 
@@ -7632,6 +7630,145 @@ mod tests {
         ]))
         .expect_err("missing artifact_ref should fail");
         assert!(error.to_string().contains("requires artifact_ref"));
+    }
+
+    #[tokio::test]
+    async fn workflow_activate_allows_safety_approved_workflow_without_extra_approval() {
+        let (db, runner) = test_runner(FakeProvider::new(vec![])).await;
+        let default_user = db.default_user().await.expect("default").expect("user");
+        let roles = db
+            .list_user_roles(&default_user.user_id)
+            .await
+            .expect("roles")
+            .into_iter()
+            .map(|row| row.role_id)
+            .collect::<Vec<_>>();
+        let task = db
+            .create_task_with_params(NewTask {
+                owner_user_id: &default_user.user_id,
+                initiating_identity_id: &format!("cli:{}", default_user.user_id),
+                primary_agent_id: default_user.primary_agent_id.as_deref().expect("agent"),
+                assigned_agent_id: default_user.primary_agent_id.as_deref().expect("agent"),
+                parent_task_id: None,
+                session_id: None,
+                kind: "interactive",
+                objective: "Activate a workflow",
+                context_summary: None,
+                scope: MemoryScope::Private,
+                wake_at: None,
+            })
+            .await
+            .expect("task");
+        db.create_workflow_definition(
+            NewWorkflowDefinition {
+                workflow_id: Some("workflow_agent_activate"),
+                owner_user_id: &default_user.user_id,
+                name: "Agent activation",
+                description: Some("Safety-approved workflow"),
+                status: "draft",
+                created_from_task_id: Some(&task.task_id),
+                safety_status: "approved",
+                safety_summary: Some("approved"),
+            },
+            &[NewWorkflowStage {
+                stage_id: Some("workflow_stage_notify"),
+                stage_kind: "user_notify",
+                stage_label: Some("Notify"),
+                artifact_ref: None,
+                stage_config_json: json!({}),
+            }],
+        )
+        .await
+        .expect("workflow");
+
+        let payload = runner
+            .handle_workflow_activate(
+                &task,
+                &test_request(&default_user, &roles, "Activate a workflow", Vec::new()),
+                json!({ "workflow_id": "workflow_agent_activate" }),
+            )
+            .await
+            .expect("activation should succeed")
+            .payload;
+
+        assert_eq!(payload["workflow_id"], json!("workflow_agent_activate"));
+        assert_eq!(payload["status"], json!("active"));
+
+        let workflow = db
+            .fetch_workflow_definition_for_owner(&default_user.user_id, "workflow_agent_activate")
+            .await
+            .expect("fetch workflow")
+            .expect("workflow");
+        assert_eq!(workflow.status, "active");
+    }
+
+    #[tokio::test]
+    async fn workflow_schedule_still_requires_explicit_approval() {
+        let (db, runner) = test_runner(FakeProvider::new(vec![])).await;
+        let default_user = db.default_user().await.expect("default").expect("user");
+        let roles = db
+            .list_user_roles(&default_user.user_id)
+            .await
+            .expect("roles")
+            .into_iter()
+            .map(|row| row.role_id)
+            .collect::<Vec<_>>();
+        let task = db
+            .create_task_with_params(NewTask {
+                owner_user_id: &default_user.user_id,
+                initiating_identity_id: &format!("cli:{}", default_user.user_id),
+                primary_agent_id: default_user.primary_agent_id.as_deref().expect("agent"),
+                assigned_agent_id: default_user.primary_agent_id.as_deref().expect("agent"),
+                parent_task_id: None,
+                session_id: None,
+                kind: "interactive",
+                objective: "Schedule a workflow",
+                context_summary: None,
+                scope: MemoryScope::Private,
+                wake_at: None,
+            })
+            .await
+            .expect("task");
+        db.create_workflow_definition(
+            NewWorkflowDefinition {
+                workflow_id: Some("workflow_schedule_gate"),
+                owner_user_id: &default_user.user_id,
+                name: "Scheduling gate",
+                description: Some("Scheduling still needs approval"),
+                status: "active",
+                created_from_task_id: Some(&task.task_id),
+                safety_status: "approved",
+                safety_summary: Some("approved"),
+            },
+            &[NewWorkflowStage {
+                stage_id: Some("workflow_stage_notify"),
+                stage_kind: "user_notify",
+                stage_label: Some("Notify"),
+                artifact_ref: None,
+                stage_config_json: json!({}),
+            }],
+        )
+        .await
+        .expect("workflow");
+
+        let error = runner
+            .handle_workflow_schedule(
+                &task,
+                &test_request(&default_user, &roles, "Schedule a workflow", Vec::new()),
+                json!({
+                    "workflow_id": "workflow_schedule_gate",
+                    "schedule_id": "sched_workflow_schedule_gate",
+                    "cron_expr": "TZ=Europe/Vienna 0 7 * * *",
+                    "enabled": true
+                }),
+            )
+            .await
+            .expect_err("schedule should still require approval");
+
+        let ToolError::Denied { detail, .. } = error else {
+            panic!("expected ToolError::Denied");
+        };
+        assert_eq!(detail["action_type"], json!("workflow_schedule"));
     }
 
     #[test]

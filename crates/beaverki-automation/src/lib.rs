@@ -270,16 +270,12 @@ fn split_cron_timezone_hint(cron_expr: &str) -> Result<(Option<&str>, &str)> {
     for prefix in ["CRON_TZ=", "TZ="] {
         if let Some(rest) = trimmed.strip_prefix(prefix) {
             let Some(timezone_end) = rest.find(char::is_whitespace) else {
-                bail!(
-                    "cron expression '{cron_expr}' is missing fields after timezone hint"
-                );
+                bail!("cron expression '{cron_expr}' is missing fields after timezone hint");
             };
             let timezone = rest[..timezone_end].trim();
             let expression = rest[timezone_end..].trim();
             if timezone.is_empty() || expression.is_empty() {
-                bail!(
-                    "cron expression '{cron_expr}' is missing a timezone or schedule fields"
-                );
+                bail!("cron expression '{cron_expr}' is missing a timezone or schedule fields");
             }
             return Ok((Some(timezone), expression));
         }
@@ -298,9 +294,7 @@ fn normalize_cron_expression(cron_expr: &str) -> Result<String> {
     match fields.len() {
         5 => Ok(format!("0 {}", fields.join(" "))),
         6 | 7 => Ok(fields.join(" ")),
-        _ => bail!(
-            "invalid cron expression '{cron_expr}': expected 5, 6, or 7 fields"
-        ),
+        _ => bail!("invalid cron expression '{cron_expr}': expected 5, 6, or 7 fields"),
     }
 }
 
@@ -310,14 +304,17 @@ fn parse_schedule_timezone(timezone: &str) -> Result<Tz> {
         .with_context(|| format!("invalid timezone '{timezone}'"))
 }
 
-pub fn next_run_after(cron_expr: &str, after: &str, default_timezone: Option<&str>) -> Result<String> {
+pub fn next_run_after(
+    cron_expr: &str,
+    after: &str,
+    default_timezone: Option<&str>,
+) -> Result<String> {
     let (timezone_hint, expression) = split_cron_timezone_hint(cron_expr)?;
     let normalized_expr = normalize_cron_expression(expression)?;
     let schedule = Schedule::from_str(&normalized_expr)
         .with_context(|| format!("invalid cron expression '{cron_expr}'"))?;
     let base = DateTime::parse_from_rfc3339(after)
-        .with_context(|| format!("invalid RFC3339 timestamp '{after}'"))?
-        ;
+        .with_context(|| format!("invalid RFC3339 timestamp '{after}'"))?;
     let timezone_name = timezone_hint.or_else(|| {
         default_timezone
             .map(str::trim)
@@ -723,23 +720,15 @@ mod tests {
 
     #[test]
     fn next_run_after_uses_default_timezone() {
-        let next = next_run_after(
-            "0 7 * * *",
-            "2026-01-01T05:30:00Z",
-            Some("Europe/Vienna"),
-        )
-        .expect("default timezone should be applied");
+        let next = next_run_after("0 7 * * *", "2026-01-01T05:30:00Z", Some("Europe/Vienna"))
+            .expect("default timezone should be applied");
         assert_eq!(next, "2026-01-01T06:00:00+00:00");
     }
 
     #[test]
     fn next_run_after_accepts_timezone_prefixed_cron() {
-        let next = next_run_after(
-            "TZ=Europe/Vienna 0 7 * * *",
-            "2026-07-01T04:30:00Z",
-            None,
-        )
-        .expect("timezone-prefixed cron should parse");
+        let next = next_run_after("TZ=Europe/Vienna 0 7 * * *", "2026-07-01T04:30:00Z", None)
+            .expect("timezone-prefixed cron should parse");
         assert_eq!(next, "2026-07-01T05:00:00+00:00");
     }
 }

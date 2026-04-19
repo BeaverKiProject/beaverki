@@ -1763,7 +1763,9 @@ async fn workflow_list(args: UserConfigArgs) -> Result<()> {
     let config_dir = resolve_config_dir(args.config_dir)?;
     let (_, db) = load_db(&config_dir).await?;
     let user = resolve_user_for_db(&db, args.user.as_deref()).await?;
-    let workflows = db.list_workflow_definitions_for_owner(&user.user_id).await?;
+    let workflows = db
+        .list_workflow_definitions_for_owner(&user.user_id)
+        .await?;
     for workflow in workflows {
         println!(
             "- {} name={} status={} safety_status={}",
@@ -1790,7 +1792,9 @@ async fn workflow_show(args: WorkflowShowArgs) -> Result<()> {
         .into_iter()
         .filter(|row| row.target_type == "workflow" && row.target_id == workflow.workflow_id)
         .collect::<Vec<_>>();
-    let runs = db.list_workflow_runs_for_workflow(&workflow.workflow_id).await?;
+    let runs = db
+        .list_workflow_runs_for_workflow(&workflow.workflow_id)
+        .await?;
     print_workflow_inspection(&beaverki_runtime::WorkflowInspection {
         workflow,
         versions,
@@ -2005,7 +2009,10 @@ fn print_workflow_inspection(inspection: &beaverki_runtime::WorkflowInspection) 
     println!("Name: {}", inspection.workflow.name);
     println!("Status: {}", inspection.workflow.status);
     println!("Safety status: {}", inspection.workflow.safety_status);
-    println!("Current version: v{}", inspection.workflow.current_version_number);
+    println!(
+        "Current version: v{}",
+        inspection.workflow.current_version_number
+    );
     if let Some(summary) = inspection.workflow.safety_summary.as_deref() {
         println!("Safety summary: {summary}");
     }

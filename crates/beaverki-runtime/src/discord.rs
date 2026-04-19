@@ -2841,7 +2841,10 @@ mod tests {
             session_state.connect_mode(),
             DiscordGatewayConnectMode::Identify
         );
-        assert_eq!(gateway_connect_payload("token-123", &session_state)["op"], 2);
+        assert_eq!(
+            gateway_connect_payload("token-123", &session_state)["op"],
+            2
+        );
     }
 
     #[test]
@@ -2856,7 +2859,10 @@ mod tests {
             session_state.connect_mode(),
             DiscordGatewayConnectMode::Resume
         );
-        assert_eq!(gateway_connect_payload("token-123", &session_state)["op"], 6);
+        assert_eq!(
+            gateway_connect_payload("token-123", &session_state)["op"],
+            6
+        );
         assert_eq!(
             gateway_connect_payload("token-123", &session_state)["d"]["session_id"],
             "session-123"
