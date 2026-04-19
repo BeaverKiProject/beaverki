@@ -99,8 +99,10 @@ Schedule a workflow:
 cargo run -p beaverki-cli -- automation schedule add \
   --workflow-id <workflow-id> \
   --schedule-id morning_digest \
-  --cron "0 0 8 * * * *"
+  --cron "0 8 * * *"
 ```
+
+Recurring schedules accept standard 5-field cron, optional 6- or 7-field forms with leading seconds, and optional timezone prefixes such as `TZ=Europe/Vienna 0 7 * * *`.
 
 Replay a workflow immediately:
 

@@ -12,6 +12,7 @@ beaverki-models = { path = "../beaverki-models" }
 beaverki-policy = { path = "../beaverki-policy" }
 beaverki-tools = { path = "../beaverki-tools" }
 chrono.workspace = true
+chrono-tz.workspace = true
 cron.workspace = true
 mlua.workspace = true
 serde.workspace = true

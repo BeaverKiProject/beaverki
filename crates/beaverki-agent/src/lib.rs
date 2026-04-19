@@ -1203,6 +1203,7 @@ impl PrimaryAgentRunner {
             normalized_window_start.as_deref(),
             normalized_window_end.as_deref(),
             cron_expr,
+            self.base_tool_context.default_timezone.as_deref(),
         )
         .map_err(ToolError::Failed)?;
 
@@ -1577,7 +1578,11 @@ impl PrimaryAgentRunner {
 
         if let ScheduledDeliveryMode::Recurring { cron_expr, enabled } = mode {
             let next_run_at = if *enabled {
-                automation::next_run_after(cron_expr, &beaverki_core::now_rfc3339())
+                automation::next_run_after(
+                    cron_expr,
+                    &beaverki_core::now_rfc3339(),
+                    self.base_tool_context.default_timezone.as_deref(),
+                )
                     .map_err(ToolError::Failed)?
             } else {
                 beaverki_core::now_rfc3339()
@@ -1677,7 +1682,11 @@ impl PrimaryAgentRunner {
                     )));
                 };
                 let next_run_at = if *enabled {
-                    automation::next_run_after(cron_expr, &beaverki_core::now_rfc3339())
+                    automation::next_run_after(
+                        cron_expr,
+                        &beaverki_core::now_rfc3339(),
+                        self.base_tool_context.default_timezone.as_deref(),
+                    )
                         .map_err(ToolError::Failed)?
                 } else {
                     let schedule = self
@@ -2692,8 +2701,12 @@ impl PrimaryAgentRunner {
             });
         }
 
-        let next_run_at = automation::next_run_after(cron_expr, &beaverki_core::now_rfc3339())
-            .map_err(ToolError::Failed)?;
+        let next_run_at = automation::next_run_after(
+            cron_expr,
+            &beaverki_core::now_rfc3339(),
+            self.base_tool_context.default_timezone.as_deref(),
+        )
+        .map_err(ToolError::Failed)?;
         let schedule = self
             .db
             .upsert_schedule(NewSchedule {
@@ -3420,8 +3433,12 @@ impl PrimaryAgentRunner {
                 }),
             });
         }
-        let next_run_at = automation::next_run_after(cron_expr, &beaverki_core::now_rfc3339())
-            .map_err(ToolError::Failed)?;
+        let next_run_at = automation::next_run_after(
+            cron_expr,
+            &beaverki_core::now_rfc3339(),
+            self.base_tool_context.default_timezone.as_deref(),
+        )
+        .map_err(ToolError::Failed)?;
         let schedule = self
             .db
             .upsert_schedule(NewSchedule {
@@ -4694,7 +4711,7 @@ fn tool_definitions(tools: &ToolRegistry) -> Vec<ToolDefinition> {
     });
     definitions.push(ToolDefinition {
         name: "household_schedule_message".to_owned(),
-        description: "Create or update a deferred or recurring household delivery. Use this for reminders or scheduled messages to another mapped household user later. Provide exactly one of `deliver_at` or `cron_expr` as RFC3339 or cron-structured scheduling input.".to_owned(),
+        description: "Create or update a deferred or recurring household delivery. Use this for reminders or scheduled messages to another mapped household user later. Provide exactly one of `deliver_at` or `cron_expr`. `deliver_at` must be RFC3339. `cron_expr` accepts standard 5-field cron by default, also accepts 6- or 7-field cron with leading seconds, and may include a leading `TZ=Area/City` or `CRON_TZ=Area/City` timezone hint such as `TZ=Europe/Vienna 0 7 * * *`.".to_owned(),
         input_schema: json!({
             "type": "object",
             "properties": {
@@ -4840,7 +4857,7 @@ fn tool_definitions(tools: &ToolRegistry) -> Vec<ToolDefinition> {
     });
     definitions.push(ToolDefinition {
         name: "lua_script_schedule".to_owned(),
-        description: "Create or update a recurring schedule for an active Lua automation script after user approval.".to_owned(),
+        description: "Create or update a recurring schedule for an active Lua automation script after user approval. `cron_expr` accepts standard 5-field cron by default, also accepts 6- or 7-field cron with leading seconds, and may include a leading `TZ=Area/City` or `CRON_TZ=Area/City` timezone hint such as `TZ=Europe/Vienna 0 7 * * *`.".to_owned(),
         input_schema: json!({
             "type": "object",
             "properties": {
@@ -4984,7 +5001,7 @@ fn tool_definitions(tools: &ToolRegistry) -> Vec<ToolDefinition> {
     });
     definitions.push(ToolDefinition {
         name: "workflow_schedule".to_owned(),
-        description: "Create or update a recurring schedule for an active reviewed workflow after user approval.".to_owned(),
+        description: "Create or update a recurring schedule for an active reviewed workflow after user approval. `cron_expr` accepts standard 5-field cron by default, also accepts 6- or 7-field cron with leading seconds, and may include a leading `TZ=Area/City` or `CRON_TZ=Area/City` timezone hint such as `TZ=Europe/Vienna 0 7 * * *`.".to_owned(),
         input_schema: json!({
             "type": "object",
             "properties": {
@@ -5118,7 +5135,7 @@ Automatic memory retrieval for the current conversation may be narrower than you
 Use memory_remember only for durable semantic facts that are likely to matter in future conversations, such as names, identities, stable preferences, or long-lived household facts. Do not store transient task progress or one-off summaries with memory_remember. Use `private` scope by default and only use `household` for explicitly shared facts. Reuse the same subject_key when correcting an existing fact.
 Use memory_forget when a previously stored memory row is wrong or should stop affecting future tasks. If the user says an earlier remembered fact was incorrect, forget the wrong row and then store the corrected fact if appropriate.
 Use household_send_message only when the user explicitly wants BeaverKI to pass an immediate message to another mapped household user now. Keep the delivery payload concise, use the intended recipient's name or user identifier, and do not use this tool for later reminders or recurring schedules. If the recipient is ambiguous or unmapped, ask for clarification instead of pretending delivery succeeded.
-Use household_schedule_message for deferred reminders or recurring cross-user delivery. Provide exactly one of `deliver_at` or `cron_expr`. Use household_schedule_list, household_schedule_get, and household_schedule_cancel to inspect or manage scheduled household delivery instead of claiming you changed a schedule without tool confirmation.
+Use household_schedule_message for deferred reminders or recurring cross-user delivery. Provide exactly one of `deliver_at` or `cron_expr`. For recurring schedules, prefer standard 5-field cron like `0 7 * * *`; 6- or 7-field cron with leading seconds also works. If the user's local timezone matters, include it as a leading `TZ=Area/City` or `CRON_TZ=Area/City` prefix, for example `TZ=Europe/Vienna 0 7 * * *`. Use household_schedule_list, household_schedule_get, and household_schedule_cancel to inspect or manage scheduled household delivery instead of claiming you changed a schedule without tool confirmation.
 Never claim memory was persisted unless a memory_write or memory_remember tool call returned success in this task.
 For file writes, prefer filesystem_write_text. Never claim a denied tool succeeded.
 Use agent_spawn_subagent only for a tightly bounded, materially useful child task. Any sub-agent receives only the explicit task slice you provide.
@@ -5279,6 +5296,7 @@ fn validate_scheduled_delivery_timing(
     window_start_at: Option<&str>,
     window_end_at: Option<&str>,
     cron_expr: Option<&str>,
+    default_timezone: Option<&str>,
 ) -> Result<()> {
     let now = DateTime::parse_from_rfc3339(&beaverki_core::now_rfc3339())
         .context("failed to read current time")?
@@ -5331,7 +5349,7 @@ fn validate_scheduled_delivery_timing(
     }
 
     if let Some(cron_expr) = cron_expr {
-        automation::next_run_after(cron_expr, &beaverki_core::now_rfc3339())?;
+        automation::next_run_after(cron_expr, &beaverki_core::now_rfc3339(), default_timezone)?;
     }
 
     Ok(())

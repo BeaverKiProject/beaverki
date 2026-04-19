@@ -447,6 +447,7 @@ impl Runtime {
         }
         let mut tool_context =
             ToolContext::new(config.runtime.workspace_root.clone(), allowed_roots);
+        tool_context.default_timezone = Some(config.runtime.default_timezone.clone());
         tool_context.browser_interactive_launcher =
             config.integrations.browser.interactive_launcher.clone();
         tool_context.browser_headless_program =
@@ -1451,7 +1452,11 @@ impl Runtime {
             }
             other => bail!("unsupported schedule target type '{other}'"),
         }
-        let next_run_at = automation::next_run_after(cron_expr, &now_rfc3339())?;
+        let next_run_at = automation::next_run_after(
+            cron_expr,
+            &now_rfc3339(),
+            Some(self.config.runtime.default_timezone.as_str()),
+        )?;
         let schedule = self
             .db
             .create_schedule(NewSchedule {
@@ -1499,7 +1504,11 @@ impl Runtime {
             .await?
             .ok_or_else(|| anyhow!("schedule '{schedule_id}' not found"))?;
         let next_run_at = if enabled {
-            automation::next_run_after(&schedule.cron_expr, &now_rfc3339())?
+            automation::next_run_after(
+                &schedule.cron_expr,
+                &now_rfc3339(),
+                Some(self.config.runtime.default_timezone.as_str()),
+            )?
         } else {
             schedule.next_run_at.clone()
         };
@@ -1542,7 +1551,11 @@ impl Runtime {
         let due = self.db.list_due_schedules(&now).await?;
         let mut tasks = Vec::new();
         for schedule in due {
-            let next_run_at = automation::next_run_after(&schedule.cron_expr, &now)?;
+            let next_run_at = automation::next_run_after(
+                &schedule.cron_expr,
+                &now,
+                Some(self.config.runtime.default_timezone.as_str()),
+            )?;
             self.db
                 .update_schedule_state(
                     &schedule.schedule_id,

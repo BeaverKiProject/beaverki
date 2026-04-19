@@ -201,13 +201,15 @@ Schedule a workflow instead of a single Lua script:
 cargo run -p beaverki-cli -- automation schedule add \
   --workflow-id <workflow-id> \
   --schedule-id morning_digest \
-  --cron "0 0 8 * * * *"
+  --cron "0 8 * * *"
 ```
 
 The schedule command now accepts exactly one of:
 
 - `--script-id`
 - `--workflow-id`
+
+Cron input accepts standard 5-field expressions such as `0 7 * * *`. It also accepts 6- or 7-field variants with a leading seconds field, and an optional leading timezone hint such as `TZ=Europe/Vienna 0 7 * * *` or `CRON_TZ=Europe/Vienna 0 7 * * *`.
 
 ## Memory Inspection
 
