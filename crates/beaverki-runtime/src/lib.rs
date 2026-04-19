@@ -2035,20 +2035,6 @@ impl Runtime {
                 return Ok(AgentResult { task: failed });
             }
         };
-        if requester.user_id == recipient.user_id {
-            let reason = "scheduled household delivery requires another user as the recipient";
-            self.db
-                .mark_household_delivery_failed(&delivery.delivery_id, reason)
-                .await?;
-            self.db.fail_task(&task.task_id, reason).await?;
-            let failed = self
-                .db
-                .fetch_task_for_owner(&task.owner_user_id, &task.task_id)
-                .await?
-                .ok_or_else(|| anyhow!("scheduled task '{}' disappeared", task.task_id))?;
-            return Ok(AgentResult { task: failed });
-        }
-
         let delegate = RuntimeHouseholdDeliveryDelegate {
             db: self.db.clone(),
             runtime_actor_id: self.config.runtime.instance_id.clone(),
@@ -5335,7 +5321,7 @@ fn connector_type_from_events(events: &[TaskEventRow]) -> Option<String> {
 mod tests {
     use std::collections::VecDeque;
     use std::future::pending;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, OnceLock};
 
     use anyhow::Result;
     use async_trait::async_trait;
@@ -5347,6 +5333,15 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+
+    static DIRECT_SEND_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    fn direct_send_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        DIRECT_SEND_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("direct send test lock")
+    }
 
     #[derive(Clone)]
     struct FakeProvider {
@@ -6875,6 +6870,7 @@ end"#,
 
     #[tokio::test]
     async fn household_direct_delivery_sends_once_and_persists_audit_state() {
+        let _direct_send_guard = direct_send_test_guard();
         let (_tempdir, runtime) = test_runtime_with_discord_token(
             vec![
                 ModelTurnResponse {
@@ -7011,6 +7007,7 @@ end"#,
 
     #[tokio::test]
     async fn scheduled_household_delivery_pauses_for_approval_and_executes_later() {
+        let _direct_send_guard = direct_send_test_guard();
         let (_tempdir, runtime) = test_runtime_with_discord_token(
             vec![
                 ModelTurnResponse {
@@ -7158,7 +7155,153 @@ end"#,
     }
 
     #[tokio::test]
+    async fn scheduled_household_delivery_can_send_to_requester_when_route_exists() {
+        let _direct_send_guard = direct_send_test_guard();
+        let (_tempdir, runtime) = test_runtime_with_discord_token(
+            vec![
+                ModelTurnResponse {
+                    output_items: vec![json!({
+                        "type": "function_call",
+                        "call_id": "call_1",
+                        "name": "household_schedule_message",
+                        "arguments": "{\"delivery_id\":null,\"recipient\":\"Alex\",\"message\":\"Take vitamins.\",\"deliver_at\":\"2099-01-01T09:00:00Z\",\"cron_expr\":null,\"window_start_at\":null,\"window_end_at\":null,\"enabled\":true}"
+                    })],
+                    tool_calls: vec![beaverki_models::ModelToolCall {
+                        call_id: "call_1".to_owned(),
+                        name: "household_schedule_message".to_owned(),
+                        arguments: json!({
+                            "delivery_id": Value::Null,
+                            "recipient": "Alex",
+                            "message": "Take vitamins.",
+                            "deliver_at": "2099-01-01T09:00:00Z",
+                            "cron_expr": Value::Null,
+                            "window_start_at": Value::Null,
+                            "window_end_at": Value::Null,
+                            "enabled": true
+                        }),
+                    }],
+                    output_text: String::new(),
+                    usage: None,
+                },
+                ModelTurnResponse {
+                    output_items: vec![json!({
+                        "type": "function_call",
+                        "call_id": "call_2",
+                        "name": "household_schedule_message",
+                        "arguments": "{\"delivery_id\":null,\"recipient\":\"Alex\",\"message\":\"Take vitamins.\",\"deliver_at\":\"2099-01-01T09:00:00Z\",\"cron_expr\":null,\"window_start_at\":null,\"window_end_at\":null,\"enabled\":true}"
+                    })],
+                    tool_calls: vec![beaverki_models::ModelToolCall {
+                        call_id: "call_2".to_owned(),
+                        name: "household_schedule_message".to_owned(),
+                        arguments: json!({
+                            "delivery_id": Value::Null,
+                            "recipient": "Alex",
+                            "message": "Take vitamins.",
+                            "deliver_at": "2099-01-01T09:00:00Z",
+                            "cron_expr": Value::Null,
+                            "window_start_at": Value::Null,
+                            "window_end_at": Value::Null,
+                            "enabled": true
+                        }),
+                    }],
+                    output_text: String::new(),
+                    usage: None,
+                },
+                ModelTurnResponse {
+                    output_items: vec![json!({
+                        "type": "message",
+                        "content": [{ "type": "output_text", "text": "I scheduled that reminder for you." }]
+                    })],
+                    tool_calls: vec![],
+                    output_text: "I scheduled that reminder for you.".to_owned(),
+                    usage: None,
+                },
+            ],
+            Some("discord-token".to_owned()),
+        )
+        .await;
+        runtime
+            .db
+            .upsert_connector_identity(
+                "discord",
+                "discord-alex",
+                None,
+                &runtime.default_user.user_id,
+                "authenticated_message",
+            )
+            .await
+            .expect("map Alex");
+
+        let first = runtime
+            .run_objective(
+                None,
+                "Remind me to take vitamins tomorrow morning.",
+                MemoryScope::Private,
+            )
+            .await
+            .expect("first run");
+        assert_eq!(first.task.state, TaskState::WaitingApproval.as_str());
+
+        let approval = runtime
+            .list_approvals(None, Some("pending"))
+            .await
+            .expect("approvals")
+            .into_iter()
+            .next()
+            .expect("approval");
+        let resumed = runtime
+            .resolve_approval(None, &approval.approval_id, true)
+            .await
+            .expect("approve");
+        assert_eq!(resumed.state, TaskState::Completed.as_str());
+
+        let deliveries = runtime
+            .db
+            .list_scheduled_household_deliveries_for_requester(&runtime.default_user.user_id)
+            .await
+            .expect("scheduled deliveries");
+        assert_eq!(deliveries.len(), 1);
+        let delivery = &deliveries[0];
+        let scheduled_task_id = delivery
+            .materialized_task_id
+            .as_deref()
+            .expect("scheduled task id");
+
+        runtime
+            .db
+            .update_task_wake_at(scheduled_task_id, Some(&now_rfc3339()))
+            .await
+            .expect("wake task");
+        let direct_send_calls = Arc::new(Mutex::new(Vec::new()));
+        discord::set_test_direct_send_capture(Some(Arc::clone(&direct_send_calls)));
+
+        let executed = runtime
+            .execute_next_runnable_task()
+            .await
+            .expect("execute next")
+            .expect("scheduled task");
+
+        discord::set_test_direct_send_capture(None);
+
+        assert_eq!(executed.task.state, TaskState::Completed.as_str());
+        let sent = runtime
+            .db
+            .fetch_household_delivery(&delivery.delivery_id)
+            .await
+            .expect("fetch delivery")
+            .expect("delivery");
+        assert_eq!(sent.status, "sent");
+        assert_eq!(sent.recipient_user_id, runtime.default_user.user_id);
+
+        let calls = direct_send_calls.lock().expect("captured sends");
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].contains("recipient=discord-alex"));
+        assert!(calls[0].contains("Take vitamins."));
+    }
+
+    #[tokio::test]
     async fn recurring_household_delivery_revalidates_requester_roles_at_send_time() {
+        let _direct_send_guard = direct_send_test_guard();
         let (_tempdir, runtime) =
             test_runtime_with_discord_token(vec![], Some("discord-token".to_owned())).await;
         let requester = runtime

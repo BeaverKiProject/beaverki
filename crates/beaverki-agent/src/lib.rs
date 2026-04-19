@@ -1234,28 +1234,6 @@ impl PrimaryAgentRunner {
             }
         };
 
-        if recipient.user_id == request.owner_user_id {
-            self.record_household_delivery_schedule_denial(
-                task,
-                request,
-                delivery_id,
-                recipient_query,
-                Some(message_text),
-                "self_delivery_not_allowed",
-                json!({
-                    "recipient_user_id": recipient.user_id,
-                }),
-            )
-            .await?;
-            return Err(ToolError::Denied {
-                message: "scheduled household delivery requires another user as the recipient"
-                    .to_owned(),
-                detail: json!({
-                    "recipient_user_id": recipient.user_id,
-                }),
-            });
-        }
-
         let route = self
             .resolve_household_delivery_route(&recipient.user_id)
             .await?;
@@ -4711,7 +4689,7 @@ fn tool_definitions(tools: &ToolRegistry) -> Vec<ToolDefinition> {
     });
     definitions.push(ToolDefinition {
         name: "household_schedule_message".to_owned(),
-        description: "Create or update a deferred or recurring household delivery. Use this for reminders or scheduled messages to another mapped household user later. Provide exactly one of `deliver_at` or `cron_expr`. `deliver_at` must be RFC3339. `cron_expr` accepts standard 5-field cron by default, also accepts 6- or 7-field cron with leading seconds, and may include a leading `TZ=Area/City` or `CRON_TZ=Area/City` timezone hint such as `TZ=Europe/Vienna 0 7 * * *`.".to_owned(),
+        description: "Create or update a deferred or recurring household delivery. Use this for reminders or scheduled messages to a mapped household user later, including yourself if you have a mapped delivery route. Provide exactly one of `deliver_at` or `cron_expr`. `deliver_at` must be RFC3339. `cron_expr` accepts standard 5-field cron by default, also accepts 6- or 7-field cron with leading seconds, and may include a leading `TZ=Area/City` or `CRON_TZ=Area/City` timezone hint such as `TZ=Europe/Vienna 0 7 * * *`.".to_owned(),
         input_schema: json!({
             "type": "object",
             "properties": {
@@ -5135,7 +5113,7 @@ Automatic memory retrieval for the current conversation may be narrower than you
 Use memory_remember only for durable semantic facts that are likely to matter in future conversations, such as names, identities, stable preferences, or long-lived household facts. Do not store transient task progress or one-off summaries with memory_remember. Use `private` scope by default and only use `household` for explicitly shared facts. Reuse the same subject_key when correcting an existing fact.
 Use memory_forget when a previously stored memory row is wrong or should stop affecting future tasks. If the user says an earlier remembered fact was incorrect, forget the wrong row and then store the corrected fact if appropriate.
 Use household_send_message only when the user explicitly wants BeaverKI to pass an immediate message to another mapped household user now. Keep the delivery payload concise, use the intended recipient's name or user identifier, and do not use this tool for later reminders or recurring schedules. If the recipient is ambiguous or unmapped, ask for clarification instead of pretending delivery succeeded.
-Use household_schedule_message for deferred reminders or recurring cross-user delivery. Provide exactly one of `deliver_at` or `cron_expr`. For recurring schedules, prefer standard 5-field cron like `0 7 * * *`; 6- or 7-field cron with leading seconds also works. If the user's local timezone matters, include it as a leading `TZ=Area/City` or `CRON_TZ=Area/City` prefix, for example `TZ=Europe/Vienna 0 7 * * *`. Use household_schedule_list, household_schedule_get, and household_schedule_cancel to inspect or manage scheduled household delivery instead of claiming you changed a schedule without tool confirmation.
+Use household_schedule_message for deferred reminders or recurring delivery to a mapped household user, including the current user if they want BeaverKI to remind them later and they have a mapped route. Provide exactly one of `deliver_at` or `cron_expr`. For recurring schedules, prefer standard 5-field cron like `0 7 * * *`; 6- or 7-field cron with leading seconds also works. If the user's local timezone matters, include it as a leading `TZ=Area/City` or `CRON_TZ=Area/City` prefix, for example `TZ=Europe/Vienna 0 7 * * *`. Use household_schedule_list, household_schedule_get, and household_schedule_cancel to inspect or manage scheduled household delivery instead of claiming you changed a schedule without tool confirmation.
 Never claim memory was persisted unless a memory_write or memory_remember tool call returned success in this task.
 For file writes, prefer filesystem_write_text. Never claim a denied tool succeeded.
 Use agent_spawn_subagent only for a tightly bounded, materially useful child task. Any sub-agent receives only the explicit task slice you provide.
@@ -5884,6 +5862,81 @@ mod tests {
             .expect("cancel");
         assert_eq!(canceled.payload["status"], json!("canceled"));
         assert_eq!(canceled.payload["scheduled_job_state"], json!("canceled"));
+    }
+
+    #[tokio::test]
+    async fn scheduled_household_delivery_can_target_requester_when_route_exists() {
+        let (db, runner) = test_runner(FakeProvider::new(vec![])).await;
+        let default_user = db.default_user().await.expect("default").expect("user");
+        let roles = db
+            .list_user_roles(&default_user.user_id)
+            .await
+            .expect("roles")
+            .into_iter()
+            .map(|row| row.role_id)
+            .collect::<Vec<_>>();
+        db.upsert_connector_identity(
+            "discord",
+            "discord-alex",
+            None,
+            &default_user.user_id,
+            "authenticated_message",
+        )
+        .await
+        .expect("map self");
+        let task = db
+            .create_task(
+                &default_user.user_id,
+                default_user.primary_agent_id.as_deref().expect("agent"),
+                "Schedule a reminder for myself",
+                MemoryScope::Private,
+            )
+            .await
+            .expect("task");
+        let deliver_at = normalize_rfc3339_timestamp("2099-01-01T09:00:00Z", "deliver_at")
+            .expect("normalize deliver_at");
+        let target_ref = scheduled_delivery_approval_target(
+            None,
+            &default_user.user_id,
+            "Take vitamins.",
+            &ScheduledDeliveryMode::OneShot {
+                deliver_at: deliver_at.clone(),
+            },
+            None,
+            None,
+        );
+        let request = test_request(
+            &default_user,
+            &roles,
+            "Schedule a reminder for myself",
+            vec![ApprovedAutomationAction {
+                action_type: "household_delivery_schedule".to_owned(),
+                target_ref,
+            }],
+        );
+
+        let created = runner
+            .handle_household_schedule_message(
+                &task,
+                &request,
+                json!({
+                    "delivery_id": null,
+                    "recipient": default_user.display_name,
+                    "message": "Take vitamins.",
+                    "deliver_at": deliver_at,
+                    "cron_expr": null,
+                    "window_start_at": null,
+                    "window_end_at": null,
+                    "enabled": true
+                }),
+            )
+            .await
+            .expect("schedule self delivery");
+
+        assert_eq!(created.payload["status"], json!("scheduled"));
+        assert_eq!(created.payload["recipient_user_id"], json!(default_user.user_id));
+        assert_eq!(created.payload["recipient_display_name"], json!(default_user.display_name));
+        assert_eq!(created.payload["message"], json!("Take vitamins."));
     }
 
     #[tokio::test]
