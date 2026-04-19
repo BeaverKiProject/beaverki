@@ -448,7 +448,10 @@ async fn send_discord_message(
 ) -> Result<String> {
     let message = truncate_reply(content);
     let response = http_client
-        .post(format!("{}/channels/{channel_id}/messages", discord_api_base()))
+        .post(format!(
+            "{}/channels/{channel_id}/messages",
+            discord_api_base()
+        ))
         .header("Authorization", format!("Bot {token}"))
         .json(&json!({ "content": message }))
         .send()
@@ -459,7 +462,9 @@ async fn send_discord_message(
     let created = response
         .json::<DiscordCreatedMessage>()
         .await
-        .with_context(|| format!("failed to decode Discord message response for channel {channel_id}"))?;
+        .with_context(|| {
+            format!("failed to decode Discord message response for channel {channel_id}")
+        })?;
     Ok(created.id)
 }
 

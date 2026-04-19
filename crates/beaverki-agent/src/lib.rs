@@ -877,7 +877,8 @@ impl PrimaryAgentRunner {
             "memory_remember" => self.handle_memory_remember(task, request, arguments).await,
             "memory_forget" => self.handle_memory_forget(task, request, arguments).await,
             "household_send_message" => {
-                self.handle_household_send_message(task, request, arguments).await
+                self.handle_household_send_message(task, request, arguments)
+                    .await
             }
             "lua_script_list"
             | "lua_script_get"
@@ -974,7 +975,8 @@ impl PrimaryAgentRunner {
         request: &AgentRequest,
         arguments: Value,
     ) -> std::result::Result<ToolOutput, ToolError> {
-        let recipient_query = required_string_arg(&arguments, "recipient", "household_send_message")?;
+        let recipient_query =
+            required_string_arg(&arguments, "recipient", "household_send_message")?;
         let message_text = required_string_arg(&arguments, "message", "household_send_message")?;
 
         if !can_send_household_direct_delivery(&request.role_ids) {
@@ -1055,7 +1057,9 @@ impl PrimaryAgentRunner {
 
         let dedupe_key = format!(
             "{}:{}:{}",
-            task.task_id, recipient.user_id, message_text.trim()
+            task.task_id,
+            recipient.user_id,
+            message_text.trim()
         );
         let outcome = delegate
             .deliver_immediate_household_message(HouseholdDeliveryRequest {
