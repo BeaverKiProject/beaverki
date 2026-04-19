@@ -8,15 +8,16 @@ use async_trait::async_trait;
 use beaverki_automation as automation;
 use beaverki_core::{MemoryKind, MemoryScope, ShellRisk, TaskState, ToolInvocationStatus};
 use beaverki_db::{
-    Database, LuaToolRow, MemoryRow, NewApproval, NewLuaTool, NewLuaToolReview, NewSchedule,
-    NewScript, NewScriptReview, NewTask, TaskRow, UpdateLuaTool, UpdateScript, UserRow,
+    ConnectorIdentityRow, Database, HouseholdDeliveryRow, LuaToolRow, MemoryRow, NewApproval,
+    NewHouseholdDelivery, NewLuaTool, NewLuaToolReview, NewSchedule, NewScript, NewScriptReview,
+    NewTask, TaskRow, UpdateLuaTool, UpdateScript, UserRow,
 };
 use beaverki_memory::{
     MemoryStore, RetrievalScope, SemanticMemoryRecord, SemanticMemoryWriteResult,
 };
 use beaverki_models::{ConversationItem, ModelProvider};
 use beaverki_policy::{
-    can_request_automation_approval, can_request_shell_approval,
+    can_request_automation_approval, can_request_shell_approval, can_schedule_household_delivery,
     can_send_household_direct_delivery, can_spawn_subagents, can_write_household_memory,
     visible_memory_scopes,
 };
@@ -25,6 +26,7 @@ use beaverki_tools::{
     validate_json_schema_contract, validate_json_value_against_schema,
     validate_openai_tool_definitions,
 };
+use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing::{info, warn};
@@ -110,6 +112,12 @@ enum ToolFailureDisposition {
 pub struct ApprovedAutomationAction {
     pub action_type: String,
     pub target_ref: String,
+}
+
+#[derive(Debug, Clone)]
+enum ScheduledDeliveryMode {
+    OneShot { deliver_at: String },
+    Recurring { cron_expr: String, enabled: bool },
 }
 
 #[derive(Debug, Clone)]
@@ -729,7 +737,10 @@ impl PrimaryAgentRunner {
 
         if matches!(
             tool_name,
-            "lua_script_activate" | "lua_script_schedule" | "lua_tool_activate"
+            "lua_script_activate"
+                | "lua_script_schedule"
+                | "lua_tool_activate"
+                | "household_schedule_message"
         ) && let ToolError::Denied { detail, .. } = &error
             && let Some(action_type) = detail.get("action_type").and_then(Value::as_str)
             && let Some(target_ref) = detail.get("target_ref").and_then(Value::as_str)
@@ -878,6 +889,18 @@ impl PrimaryAgentRunner {
             "memory_forget" => self.handle_memory_forget(task, request, arguments).await,
             "household_send_message" => {
                 self.handle_household_send_message(task, request, arguments)
+                    .await
+            }
+            "household_schedule_message" => {
+                self.handle_household_schedule_message(task, request, arguments)
+                    .await
+            }
+            "household_schedule_list" => self.handle_household_schedule_list(request).await,
+            "household_schedule_get" => {
+                self.handle_household_schedule_get(request, arguments).await
+            }
+            "household_schedule_cancel" => {
+                self.handle_household_schedule_cancel(task, request, arguments)
                     .await
             }
             "lua_script_list"
@@ -1086,6 +1109,714 @@ impl PrimaryAgentRunner {
                 "message": message_text,
             }),
         })
+    }
+
+    async fn handle_household_schedule_message(
+        &self,
+        task: &TaskRow,
+        request: &AgentRequest,
+        arguments: Value,
+    ) -> std::result::Result<ToolOutput, ToolError> {
+        let delivery_id = optional_string_arg(&arguments, "delivery_id");
+        let recipient_query =
+            required_string_arg(&arguments, "recipient", "household_schedule_message")?;
+        let message_text =
+            required_string_arg(&arguments, "message", "household_schedule_message")?;
+        let deliver_at = optional_string_arg(&arguments, "deliver_at");
+        let cron_expr = optional_string_arg(&arguments, "cron_expr");
+        let window_start_at = optional_string_arg(&arguments, "window_start_at");
+        let window_end_at = optional_string_arg(&arguments, "window_end_at");
+        let enabled = arguments
+            .get("enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+
+        if !can_schedule_household_delivery(&request.role_ids) {
+            self.record_household_delivery_schedule_denial(
+                task,
+                request,
+                delivery_id,
+                recipient_query,
+                Some(message_text),
+                "sender_not_allowed",
+                json!({
+                    "role_ids": request.role_ids,
+                }),
+            )
+            .await?;
+            return Err(ToolError::Denied {
+                message: "the current user is not allowed to schedule household delivery"
+                    .to_owned(),
+                detail: json!({
+                    "recipient": recipient_query,
+                }),
+            });
+        }
+
+        if deliver_at.is_some() == cron_expr.is_some() {
+            return Err(ToolError::Failed(anyhow!(
+                "household_schedule_message requires exactly one of deliver_at or cron_expr"
+            )));
+        }
+        if deliver_at.is_some() && !enabled {
+            return Err(ToolError::Failed(anyhow!(
+                "one-shot scheduled delivery cannot be created disabled"
+            )));
+        }
+
+        let normalized_deliver_at = deliver_at
+            .map(|value| normalize_rfc3339_timestamp(value, "deliver_at"))
+            .transpose()
+            .map_err(ToolError::Failed)?;
+        let normalized_window_start = window_start_at
+            .map(|value| normalize_rfc3339_timestamp(value, "window_start_at"))
+            .transpose()
+            .map_err(ToolError::Failed)?;
+        let normalized_window_end = window_end_at
+            .map(|value| normalize_rfc3339_timestamp(value, "window_end_at"))
+            .transpose()
+            .map_err(ToolError::Failed)?;
+
+        validate_scheduled_delivery_timing(
+            normalized_deliver_at.as_deref(),
+            normalized_window_start.as_deref(),
+            normalized_window_end.as_deref(),
+            cron_expr,
+        )
+        .map_err(ToolError::Failed)?;
+
+        let recipient = match self
+            .resolve_household_delivery_recipient(&request.owner_user_id, recipient_query)
+            .await
+        {
+            Ok(recipient) => recipient,
+            Err(error) => {
+                self.record_household_delivery_schedule_denial(
+                    task,
+                    request,
+                    delivery_id,
+                    recipient_query,
+                    Some(message_text),
+                    "recipient_resolution_failed",
+                    json!({
+                        "error": error.to_string(),
+                    }),
+                )
+                .await?;
+                return Err(ToolError::Denied {
+                    message: error.to_string(),
+                    detail: json!({
+                        "recipient": recipient_query,
+                    }),
+                });
+            }
+        };
+
+        if recipient.user_id == request.owner_user_id {
+            self.record_household_delivery_schedule_denial(
+                task,
+                request,
+                delivery_id,
+                recipient_query,
+                Some(message_text),
+                "self_delivery_not_allowed",
+                json!({
+                    "recipient_user_id": recipient.user_id,
+                }),
+            )
+            .await?;
+            return Err(ToolError::Denied {
+                message: "scheduled household delivery requires another user as the recipient"
+                    .to_owned(),
+                detail: json!({
+                    "recipient_user_id": recipient.user_id,
+                }),
+            });
+        }
+
+        let route = self
+            .resolve_household_delivery_route(&recipient.user_id)
+            .await?;
+        let mode = if let Some(cron_expr) = cron_expr {
+            ScheduledDeliveryMode::Recurring {
+                cron_expr: cron_expr.to_owned(),
+                enabled,
+            }
+        } else {
+            ScheduledDeliveryMode::OneShot {
+                deliver_at: normalized_deliver_at
+                    .clone()
+                    .expect("validated deliver_at for one-shot"),
+            }
+        };
+        let approval_target_ref = scheduled_delivery_approval_target(
+            delivery_id,
+            &recipient.user_id,
+            message_text,
+            &mode,
+            normalized_window_start.as_deref(),
+            normalized_window_end.as_deref(),
+        );
+        if !self.has_approved_action(request, "household_delivery_schedule", &approval_target_ref) {
+            let rationale = if delivery_id.is_some() {
+                format!(
+                    "Task '{}' wants to update scheduled household delivery for '{}' with target {}.",
+                    task.objective,
+                    recipient.display_name,
+                    scheduled_delivery_rationale_target(&mode)
+                )
+            } else {
+                format!(
+                    "Task '{}' wants to schedule a household delivery for '{}' with target {}.",
+                    task.objective,
+                    recipient.display_name,
+                    scheduled_delivery_rationale_target(&mode)
+                )
+            };
+            return Err(ToolError::Denied {
+                message: "scheduled household delivery requires approval".to_owned(),
+                detail: json!({
+                    "action_type": "household_delivery_schedule",
+                    "target_ref": approval_target_ref,
+                    "rationale": rationale,
+                }),
+            });
+        }
+
+        let mut delivery = if let Some(delivery_id) = delivery_id {
+            let existing = self
+                .db
+                .fetch_scheduled_household_delivery_for_requester(
+                    &request.owner_user_id,
+                    delivery_id,
+                )
+                .await
+                .map_err(ToolError::Failed)?
+                .ok_or_else(|| {
+                    ToolError::Failed(anyhow!(
+                        "scheduled household delivery '{}' not found",
+                        delivery_id
+                    ))
+                })?;
+            if matches!(existing.status.as_str(), "sent" | "failed" | "canceled") {
+                return Err(ToolError::Failed(anyhow!(
+                    "scheduled household delivery '{}' is already {}",
+                    delivery_id,
+                    existing.status
+                )));
+            }
+            self.update_scheduled_household_delivery(
+                &existing,
+                task,
+                request,
+                &recipient,
+                message_text,
+                &route,
+                &mode,
+                normalized_window_start.as_deref(),
+                normalized_window_end.as_deref(),
+            )
+            .await?
+        } else {
+            self.create_scheduled_household_delivery(
+                task,
+                request,
+                &recipient,
+                message_text,
+                &route,
+                &mode,
+                normalized_window_start.as_deref(),
+                normalized_window_end.as_deref(),
+            )
+            .await?
+        };
+
+        self.db
+            .record_audit_event(
+                "agent",
+                &request.assigned_agent_id,
+                "household_delivery_scheduled",
+                json!({
+                    "task_id": task.task_id,
+                    "delivery_id": delivery.delivery_id,
+                    "schedule_id": delivery.schedule_id,
+                    "recipient_user_id": delivery.recipient_user_id,
+                    "delivery_mode": delivery.delivery_mode,
+                    "scheduled_for_at": delivery.scheduled_for_at,
+                    "recurrence_rule": delivery.recurrence_rule,
+                }),
+            )
+            .await
+            .map_err(ToolError::Failed)?;
+
+        delivery = self
+            .db
+            .fetch_household_delivery(&delivery.delivery_id)
+            .await
+            .map_err(ToolError::Failed)?
+            .ok_or_else(|| {
+                ToolError::Failed(anyhow!("scheduled household delivery disappeared"))
+            })?;
+
+        Ok(ToolOutput {
+            payload: self
+                .scheduled_household_delivery_payload(&delivery)
+                .await
+                .map_err(ToolError::Failed)?,
+        })
+    }
+
+    async fn handle_household_schedule_list(
+        &self,
+        request: &AgentRequest,
+    ) -> std::result::Result<ToolOutput, ToolError> {
+        let deliveries = self
+            .db
+            .list_scheduled_household_deliveries_for_requester(&request.owner_user_id)
+            .await
+            .map_err(ToolError::Failed)?;
+        let mut items = Vec::with_capacity(deliveries.len());
+        for delivery in deliveries {
+            items.push(
+                self.scheduled_household_delivery_payload(&delivery)
+                    .await
+                    .map_err(ToolError::Failed)?,
+            );
+        }
+        Ok(ToolOutput {
+            payload: json!({ "items": items }),
+        })
+    }
+
+    async fn handle_household_schedule_get(
+        &self,
+        request: &AgentRequest,
+        arguments: Value,
+    ) -> std::result::Result<ToolOutput, ToolError> {
+        let delivery_id = required_string_arg(&arguments, "delivery_id", "household_schedule_get")?;
+        let delivery = self
+            .db
+            .fetch_scheduled_household_delivery_for_requester(&request.owner_user_id, delivery_id)
+            .await
+            .map_err(ToolError::Failed)?
+            .ok_or_else(|| {
+                ToolError::Failed(anyhow!(
+                    "scheduled household delivery '{}' not found",
+                    delivery_id
+                ))
+            })?;
+        Ok(ToolOutput {
+            payload: self
+                .scheduled_household_delivery_payload(&delivery)
+                .await
+                .map_err(ToolError::Failed)?,
+        })
+    }
+
+    async fn handle_household_schedule_cancel(
+        &self,
+        task: &TaskRow,
+        request: &AgentRequest,
+        arguments: Value,
+    ) -> std::result::Result<ToolOutput, ToolError> {
+        let delivery_id =
+            required_string_arg(&arguments, "delivery_id", "household_schedule_cancel")?;
+        let delivery = self
+            .db
+            .fetch_scheduled_household_delivery_for_requester(&request.owner_user_id, delivery_id)
+            .await
+            .map_err(ToolError::Failed)?
+            .ok_or_else(|| {
+                ToolError::Failed(anyhow!(
+                    "scheduled household delivery '{}' not found",
+                    delivery_id
+                ))
+            })?;
+        if matches!(delivery.status.as_str(), "sent" | "failed" | "canceled") {
+            return Err(ToolError::Failed(anyhow!(
+                "scheduled household delivery '{}' is already {}",
+                delivery_id,
+                delivery.status
+            )));
+        }
+
+        if let Some(schedule_id) = delivery.schedule_id.as_deref() {
+            let schedule = self
+                .db
+                .fetch_schedule_for_owner(&request.owner_user_id, schedule_id)
+                .await
+                .map_err(ToolError::Failed)?
+                .ok_or_else(|| {
+                    ToolError::Failed(anyhow!("schedule '{}' not found", schedule_id))
+                })?;
+            self.db
+                .update_schedule_state(
+                    &schedule.schedule_id,
+                    false,
+                    &schedule.next_run_at,
+                    schedule.last_run_at.as_deref(),
+                )
+                .await
+                .map_err(ToolError::Failed)?;
+        }
+
+        self.db
+            .cancel_household_delivery(&delivery.delivery_id, "canceled_by_requester")
+            .await
+            .map_err(ToolError::Failed)?;
+        self.db
+            .record_audit_event(
+                "agent",
+                &request.assigned_agent_id,
+                "household_delivery_schedule_canceled",
+                json!({
+                    "task_id": task.task_id,
+                    "delivery_id": delivery.delivery_id,
+                    "schedule_id": delivery.schedule_id,
+                }),
+            )
+            .await
+            .map_err(ToolError::Failed)?;
+
+        let updated = self
+            .db
+            .fetch_household_delivery(&delivery.delivery_id)
+            .await
+            .map_err(ToolError::Failed)?
+            .ok_or_else(|| {
+                ToolError::Failed(anyhow!("scheduled household delivery disappeared"))
+            })?;
+        Ok(ToolOutput {
+            payload: self
+                .scheduled_household_delivery_payload(&updated)
+                .await
+                .map_err(ToolError::Failed)?,
+        })
+    }
+
+    async fn create_scheduled_household_delivery(
+        &self,
+        task: &TaskRow,
+        request: &AgentRequest,
+        recipient: &UserRow,
+        message_text: &str,
+        route: &ConnectorIdentityRow,
+        mode: &ScheduledDeliveryMode,
+        window_start_at: Option<&str>,
+        window_end_at: Option<&str>,
+    ) -> std::result::Result<HouseholdDeliveryRow, ToolError> {
+        let (delivery_mode, scheduled_for_at, recurrence_rule, scheduled_job_state) = match mode {
+            ScheduledDeliveryMode::OneShot { deliver_at } => (
+                "scheduled_once",
+                Some(deliver_at.as_str()),
+                None,
+                Some("scheduled"),
+            ),
+            ScheduledDeliveryMode::Recurring { cron_expr, enabled } => (
+                "scheduled_recurring",
+                None,
+                Some(cron_expr.as_str()),
+                Some(if *enabled { "scheduled" } else { "disabled" }),
+            ),
+        };
+        let dedupe_key = scheduled_delivery_dedupe_key(
+            &task.task_id,
+            &recipient.user_id,
+            message_text,
+            mode,
+            window_start_at,
+            window_end_at,
+        );
+        let delivery = self
+            .db
+            .create_or_reuse_household_delivery(NewHouseholdDelivery {
+                task_id: &task.task_id,
+                requester_user_id: &request.owner_user_id,
+                requester_identity_id: &request.initiating_identity_id,
+                recipient_user_id: &recipient.user_id,
+                message_text,
+                delivery_mode,
+                connector_type: &route.connector_type,
+                connector_identity_id: &route.identity_id,
+                target_ref: &route.external_user_id,
+                fallback_target_ref: route.external_channel_id.as_deref(),
+                dedupe_key: &dedupe_key,
+                initial_status: "scheduled",
+                parent_delivery_id: None,
+                schedule_id: None,
+                scheduled_for_at,
+                window_starts_at: window_start_at,
+                window_ends_at: window_end_at,
+                recurrence_rule,
+                scheduled_job_state,
+                materialized_task_id: None,
+            })
+            .await
+            .map_err(ToolError::Failed)?;
+
+        if let ScheduledDeliveryMode::Recurring { cron_expr, enabled } = mode {
+            let next_run_at = if *enabled {
+                automation::next_run_after(cron_expr, &beaverki_core::now_rfc3339())
+                    .map_err(ToolError::Failed)?
+            } else {
+                beaverki_core::now_rfc3339()
+            };
+            let schedule = self
+                .db
+                .create_schedule(NewSchedule {
+                    schedule_id: None,
+                    owner_user_id: &request.owner_user_id,
+                    target_type: "household_delivery",
+                    target_id: &delivery.delivery_id,
+                    cron_expr,
+                    enabled: *enabled,
+                    next_run_at: &next_run_at,
+                })
+                .await
+                .map_err(ToolError::Failed)?;
+            self.db
+                .update_household_delivery_schedule(
+                    &delivery.delivery_id,
+                    &recipient.user_id,
+                    message_text,
+                    &route.connector_type,
+                    &route.identity_id,
+                    &route.external_user_id,
+                    route.external_channel_id.as_deref(),
+                    Some(&schedule.schedule_id),
+                    None,
+                    window_start_at,
+                    window_end_at,
+                    Some(cron_expr),
+                    if *enabled { "scheduled" } else { "disabled" },
+                )
+                .await
+                .map_err(ToolError::Failed)?;
+        } else {
+            let ScheduledDeliveryMode::OneShot { deliver_at } = mode else {
+                unreachable!();
+            };
+            let task_context = json!({
+                "delivery_id": delivery.delivery_id,
+            })
+            .to_string();
+            let scheduled_task = self
+                .db
+                .create_task_with_params(NewTask {
+                    owner_user_id: &request.owner_user_id,
+                    initiating_identity_id: &request.initiating_identity_id,
+                    primary_agent_id: &request.primary_agent_id,
+                    assigned_agent_id: &request.assigned_agent_id,
+                    parent_task_id: Some(&task.task_id),
+                    session_id: task.session_id.as_deref(),
+                    kind: "scheduled_household_delivery",
+                    objective: &format!(
+                        "Deliver scheduled household message to {}",
+                        recipient.display_name
+                    ),
+                    context_summary: Some(&task_context),
+                    scope: request.scope,
+                    wake_at: Some(deliver_at),
+                })
+                .await
+                .map_err(ToolError::Failed)?;
+            self.db
+                .mark_household_delivery_materialized(
+                    &delivery.delivery_id,
+                    &scheduled_task.task_id,
+                )
+                .await
+                .map_err(ToolError::Failed)?;
+        }
+
+        self.db
+            .fetch_household_delivery(&delivery.delivery_id)
+            .await
+            .map_err(ToolError::Failed)?
+            .ok_or_else(|| ToolError::Failed(anyhow!("scheduled household delivery missing")))
+    }
+
+    async fn update_scheduled_household_delivery(
+        &self,
+        delivery: &HouseholdDeliveryRow,
+        task: &TaskRow,
+        request: &AgentRequest,
+        recipient: &UserRow,
+        message_text: &str,
+        route: &ConnectorIdentityRow,
+        mode: &ScheduledDeliveryMode,
+        window_start_at: Option<&str>,
+        window_end_at: Option<&str>,
+    ) -> std::result::Result<HouseholdDeliveryRow, ToolError> {
+        match mode {
+            ScheduledDeliveryMode::Recurring { cron_expr, enabled } => {
+                let Some(schedule_id) = delivery.schedule_id.as_deref() else {
+                    return Err(ToolError::Failed(anyhow!(
+                        "changing a one-shot reminder into a recurring schedule is not supported"
+                    )));
+                };
+                let next_run_at = if *enabled {
+                    automation::next_run_after(cron_expr, &beaverki_core::now_rfc3339())
+                        .map_err(ToolError::Failed)?
+                } else {
+                    let schedule = self
+                        .db
+                        .fetch_schedule_for_owner(&request.owner_user_id, schedule_id)
+                        .await
+                        .map_err(ToolError::Failed)?
+                        .ok_or_else(|| {
+                            ToolError::Failed(anyhow!("schedule '{}' not found", schedule_id))
+                        })?;
+                    schedule.next_run_at
+                };
+                self.db
+                    .upsert_schedule(NewSchedule {
+                        schedule_id: Some(schedule_id),
+                        owner_user_id: &request.owner_user_id,
+                        target_type: "household_delivery",
+                        target_id: &delivery.delivery_id,
+                        cron_expr,
+                        enabled: *enabled,
+                        next_run_at: &next_run_at,
+                    })
+                    .await
+                    .map_err(ToolError::Failed)?;
+                self.db
+                    .update_household_delivery_schedule(
+                        &delivery.delivery_id,
+                        &recipient.user_id,
+                        message_text,
+                        &route.connector_type,
+                        &route.identity_id,
+                        &route.external_user_id,
+                        route.external_channel_id.as_deref(),
+                        Some(schedule_id),
+                        None,
+                        window_start_at,
+                        window_end_at,
+                        Some(cron_expr),
+                        if *enabled { "scheduled" } else { "disabled" },
+                    )
+                    .await
+                    .map_err(ToolError::Failed)?;
+            }
+            ScheduledDeliveryMode::OneShot { deliver_at } => {
+                if delivery.schedule_id.is_some() {
+                    return Err(ToolError::Failed(anyhow!(
+                        "changing a recurring household schedule into a one-shot reminder is not supported"
+                    )));
+                }
+                let Some(materialized_task_id) = delivery.materialized_task_id.as_deref() else {
+                    return Err(ToolError::Failed(anyhow!(
+                        "scheduled reminder '{}' is missing its wake-up task",
+                        delivery.delivery_id
+                    )));
+                };
+                self.db
+                    .update_task_wake_at(materialized_task_id, Some(deliver_at))
+                    .await
+                    .map_err(ToolError::Failed)?;
+                self.db
+                    .update_household_delivery_schedule(
+                        &delivery.delivery_id,
+                        &recipient.user_id,
+                        message_text,
+                        &route.connector_type,
+                        &route.identity_id,
+                        &route.external_user_id,
+                        route.external_channel_id.as_deref(),
+                        None,
+                        Some(deliver_at),
+                        window_start_at,
+                        window_end_at,
+                        None,
+                        "scheduled",
+                    )
+                    .await
+                    .map_err(ToolError::Failed)?;
+            }
+        }
+
+        self.db
+            .append_task_event(
+                &task.task_id,
+                "household_delivery_schedule_updated",
+                "agent",
+                &request.assigned_agent_id,
+                json!({
+                    "delivery_id": delivery.delivery_id,
+                    "recipient_user_id": recipient.user_id,
+                }),
+            )
+            .await
+            .map_err(ToolError::Failed)?;
+
+        self.db
+            .fetch_household_delivery(&delivery.delivery_id)
+            .await
+            .map_err(ToolError::Failed)?
+            .ok_or_else(|| ToolError::Failed(anyhow!("scheduled household delivery missing")))
+    }
+
+    async fn scheduled_household_delivery_payload(
+        &self,
+        delivery: &HouseholdDeliveryRow,
+    ) -> Result<Value> {
+        let recipient = self.db.fetch_user(&delivery.recipient_user_id).await?;
+        let next_run_at = if let Some(schedule_id) = delivery.schedule_id.as_deref() {
+            self.db
+                .fetch_schedule(schedule_id)
+                .await?
+                .map(|schedule| schedule.next_run_at)
+        } else {
+            delivery.scheduled_for_at.clone()
+        };
+        Ok(json!({
+            "delivery_id": delivery.delivery_id,
+            "schedule_id": delivery.schedule_id,
+            "recipient_user_id": delivery.recipient_user_id,
+            "recipient_display_name": recipient.map(|row| row.display_name),
+            "message": delivery.message_text,
+            "delivery_mode": delivery.delivery_mode,
+            "status": delivery.status,
+            "scheduled_job_state": delivery.scheduled_job_state,
+            "scheduled_for_at": delivery.scheduled_for_at,
+            "window_start_at": delivery.window_starts_at,
+            "window_end_at": delivery.window_ends_at,
+            "recurrence_rule": delivery.recurrence_rule,
+            "next_run_at": next_run_at,
+            "materialized_task_id": delivery.materialized_task_id,
+            "delivered_at": delivery.delivered_at,
+            "completed_at": delivery.completed_at,
+            "canceled_at": delivery.canceled_at,
+            "failure_reason": delivery.failure_reason,
+        }))
+    }
+
+    async fn resolve_household_delivery_route(
+        &self,
+        recipient_user_id: &str,
+    ) -> std::result::Result<ConnectorIdentityRow, ToolError> {
+        let identities = self
+            .db
+            .list_connector_identities_for_mapped_user(recipient_user_id)
+            .await
+            .map_err(ToolError::Failed)?;
+        let Some(identity) = identities
+            .into_iter()
+            .find(|identity| identity.connector_type == "discord")
+        else {
+            return Err(ToolError::Denied {
+                message: format!(
+                    "recipient '{}' does not have a mapped delivery route",
+                    recipient_user_id
+                ),
+                detail: json!({
+                    "recipient_user_id": recipient_user_id,
+                }),
+            });
+        };
+        Ok(identity)
     }
 
     async fn handle_memory_read(
@@ -2654,6 +3385,36 @@ impl PrimaryAgentRunner {
         Ok(())
     }
 
+    async fn record_household_delivery_schedule_denial(
+        &self,
+        task: &TaskRow,
+        request: &AgentRequest,
+        delivery_id: Option<&str>,
+        recipient: &str,
+        message_text: Option<&str>,
+        reason: &str,
+        detail: Value,
+    ) -> Result<()> {
+        self.db
+            .record_audit_event(
+                "agent",
+                &request.assigned_agent_id,
+                "household_delivery_schedule_denied",
+                json!({
+                    "task_id": task.task_id,
+                    "delivery_id": delivery_id,
+                    "owner_user_id": request.owner_user_id,
+                    "initiating_identity_id": request.initiating_identity_id,
+                    "recipient": recipient,
+                    "message_text": message_text,
+                    "reason": reason,
+                    "detail": detail,
+                }),
+            )
+            .await?;
+        Ok(())
+    }
+
     async fn review_shell_command(
         &self,
         task_id: &str,
@@ -3138,6 +3899,61 @@ fn tool_definitions(tools: &ToolRegistry) -> Vec<ToolDefinition> {
         }),
     });
     definitions.push(ToolDefinition {
+        name: "household_schedule_message".to_owned(),
+        description: "Create or update a deferred or recurring household delivery. Use this for reminders or scheduled messages to another mapped household user later. Provide exactly one of `deliver_at` or `cron_expr` as RFC3339 or cron-structured scheduling input.".to_owned(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "delivery_id": { "type": ["string", "null"] },
+                "recipient": { "type": "string" },
+                "message": { "type": "string" },
+                "deliver_at": { "type": ["string", "null"] },
+                "cron_expr": { "type": ["string", "null"] },
+                "window_start_at": { "type": ["string", "null"] },
+                "window_end_at": { "type": ["string", "null"] },
+                "enabled": { "type": ["boolean", "null"] }
+            },
+            "required": ["delivery_id", "recipient", "message", "deliver_at", "cron_expr", "window_start_at", "window_end_at", "enabled"],
+            "additionalProperties": false
+        }),
+    });
+    definitions.push(ToolDefinition {
+        name: "household_schedule_list".to_owned(),
+        description: "List scheduled household deliveries created by the current user, including pending reminders, recurring schedules, and their current execution state.".to_owned(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "additionalProperties": false
+        }),
+    });
+    definitions.push(ToolDefinition {
+        name: "household_schedule_get".to_owned(),
+        description: "Inspect one scheduled household delivery by delivery ID.".to_owned(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "delivery_id": { "type": "string" }
+            },
+            "required": ["delivery_id"],
+            "additionalProperties": false
+        }),
+    });
+    definitions.push(ToolDefinition {
+        name: "household_schedule_cancel".to_owned(),
+        description:
+            "Cancel a pending one-shot reminder or recurring household delivery by delivery ID."
+                .to_owned(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "delivery_id": { "type": "string" }
+            },
+            "required": ["delivery_id"],
+            "additionalProperties": false
+        }),
+    });
+    definitions.push(ToolDefinition {
         name: "agent_spawn_subagent".to_owned(),
         description: "Spawn a bounded sub-agent with a tightly scoped task slice. Use only when a separate focused workstream materially helps complete the parent task.".to_owned(),
         input_schema: json!({
@@ -3377,7 +4193,7 @@ fn system_prompt(kind: &str, role_ids: &[String], allowed_roots: &[PathBuf]) -> 
 
     format!(
         "You are BeaverKI M1, a local multi-user CLI-first assistant.
-    Current milestone: M5 household direct delivery.
+    Current milestone: M5.5 household reminders and scheduled delivery.
 Current agent kind: {kind}.
 Current role set: {roles}.
 Use tools when needed, but keep the task focused and auditable.
@@ -3390,6 +4206,7 @@ Automatic memory retrieval for the current conversation may be narrower than you
 Use memory_remember only for durable semantic facts that are likely to matter in future conversations, such as names, identities, stable preferences, or long-lived household facts. Do not store transient task progress or one-off summaries with memory_remember. Use `private` scope by default and only use `household` for explicitly shared facts. Reuse the same subject_key when correcting an existing fact.
 Use memory_forget when a previously stored memory row is wrong or should stop affecting future tasks. If the user says an earlier remembered fact was incorrect, forget the wrong row and then store the corrected fact if appropriate.
 Use household_send_message only when the user explicitly wants BeaverKI to pass an immediate message to another mapped household user now. Keep the delivery payload concise, use the intended recipient's name or user identifier, and do not use this tool for later reminders or recurring schedules. If the recipient is ambiguous or unmapped, ask for clarification instead of pretending delivery succeeded.
+Use household_schedule_message for deferred reminders or recurring cross-user delivery. Provide exactly one of `deliver_at` or `cron_expr`. Use household_schedule_list, household_schedule_get, and household_schedule_cancel to inspect or manage scheduled household delivery instead of claiming you changed a schedule without tool confirmation.
 Never claim memory was persisted unless a memory_write or memory_remember tool call returned success in this task.
 For file writes, prefer filesystem_write_text. Never claim a denied tool succeeded.
 Use agent_spawn_subagent only for a tightly bounded, materially useful child task. Any sub-agent receives only the explicit task slice you provide.
@@ -3537,6 +4354,136 @@ fn optional_string_arg<'a>(arguments: &'a Value, key: &str) -> Option<&'a str> {
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
+}
+
+fn normalize_rfc3339_timestamp(value: &str, label: &str) -> Result<String> {
+    DateTime::parse_from_rfc3339(value)
+        .with_context(|| format!("failed to parse {label} as RFC3339"))
+        .map(|timestamp| timestamp.with_timezone(&Utc).to_rfc3339())
+}
+
+fn validate_scheduled_delivery_timing(
+    deliver_at: Option<&str>,
+    window_start_at: Option<&str>,
+    window_end_at: Option<&str>,
+    cron_expr: Option<&str>,
+) -> Result<()> {
+    let now = DateTime::parse_from_rfc3339(&beaverki_core::now_rfc3339())
+        .context("failed to read current time")?
+        .with_timezone(&Utc);
+
+    if let Some(deliver_at) = deliver_at {
+        let deliver_at = DateTime::parse_from_rfc3339(deliver_at)
+            .with_context(|| format!("failed to parse deliver_at '{deliver_at}'"))?
+            .with_timezone(&Utc);
+        if deliver_at <= now {
+            return Err(anyhow!("deliver_at must be in the future"));
+        }
+        if let Some(window_start_at) = window_start_at {
+            let window_start = DateTime::parse_from_rfc3339(window_start_at)
+                .with_context(|| format!("failed to parse window_start_at '{window_start_at}'"))?
+                .with_timezone(&Utc);
+            if window_start > deliver_at {
+                return Err(anyhow!("window_start_at cannot be after deliver_at"));
+            }
+        }
+    } else if window_start_at.is_some() && cron_expr.is_some() {
+        return Err(anyhow!(
+            "window_start_at is only supported for one-shot scheduled delivery"
+        ));
+    }
+
+    if let Some(window_end_at) = window_end_at {
+        let window_end = DateTime::parse_from_rfc3339(window_end_at)
+            .with_context(|| format!("failed to parse window_end_at '{window_end_at}'"))?
+            .with_timezone(&Utc);
+        if window_end <= now {
+            return Err(anyhow!("window_end_at must be in the future"));
+        }
+        if let Some(deliver_at) = deliver_at {
+            let deliver_at = DateTime::parse_from_rfc3339(deliver_at)
+                .with_context(|| format!("failed to parse deliver_at '{deliver_at}'"))?
+                .with_timezone(&Utc);
+            if window_end < deliver_at {
+                return Err(anyhow!("window_end_at cannot be before deliver_at"));
+            }
+        }
+        if let Some(window_start_at) = window_start_at {
+            let window_start = DateTime::parse_from_rfc3339(window_start_at)
+                .with_context(|| format!("failed to parse window_start_at '{window_start_at}'"))?
+                .with_timezone(&Utc);
+            if window_end < window_start {
+                return Err(anyhow!("window_end_at cannot be before window_start_at"));
+            }
+        }
+    }
+
+    if let Some(cron_expr) = cron_expr {
+        automation::next_run_after(cron_expr, &beaverki_core::now_rfc3339())?;
+    }
+
+    Ok(())
+}
+
+fn scheduled_delivery_approval_target(
+    delivery_id: Option<&str>,
+    recipient_user_id: &str,
+    message_text: &str,
+    mode: &ScheduledDeliveryMode,
+    window_start_at: Option<&str>,
+    window_end_at: Option<&str>,
+) -> String {
+    match mode {
+        ScheduledDeliveryMode::OneShot { deliver_at } => json!({
+            "delivery_id": delivery_id,
+            "recipient_user_id": recipient_user_id,
+            "message_text": message_text,
+            "mode": "scheduled_once",
+            "deliver_at": deliver_at,
+            "window_start_at": window_start_at,
+            "window_end_at": window_end_at,
+        })
+        .to_string(),
+        ScheduledDeliveryMode::Recurring { cron_expr, enabled } => json!({
+            "delivery_id": delivery_id,
+            "recipient_user_id": recipient_user_id,
+            "message_text": message_text,
+            "mode": "scheduled_recurring",
+            "cron_expr": cron_expr,
+            "enabled": enabled,
+            "window_start_at": window_start_at,
+            "window_end_at": window_end_at,
+        })
+        .to_string(),
+    }
+}
+
+fn scheduled_delivery_rationale_target(mode: &ScheduledDeliveryMode) -> String {
+    match mode {
+        ScheduledDeliveryMode::OneShot { deliver_at } => format!("deliver_at {}", deliver_at),
+        ScheduledDeliveryMode::Recurring { cron_expr, enabled } => {
+            format!("cron {} enabled={}", cron_expr, enabled)
+        }
+    }
+}
+
+fn scheduled_delivery_dedupe_key(
+    task_id: &str,
+    recipient_user_id: &str,
+    message_text: &str,
+    mode: &ScheduledDeliveryMode,
+    window_start_at: Option<&str>,
+    window_end_at: Option<&str>,
+) -> String {
+    format!(
+        "{}:{}:{}:{}:{}:{}",
+        task_id,
+        recipient_user_id,
+        message_text.trim(),
+        scheduled_delivery_rationale_target(mode),
+        window_start_at.unwrap_or(""),
+        window_end_at.unwrap_or(""),
+    )
 }
 
 fn roles_label(role_ids: &[String]) -> String {
@@ -3712,6 +4659,30 @@ mod tests {
             .collect()
     }
 
+    fn test_request(
+        user: &UserRow,
+        roles: &[String],
+        objective: &str,
+        approved_automation_actions: Vec<ApprovedAutomationAction>,
+    ) -> AgentRequest {
+        AgentRequest {
+            owner_user_id: user.user_id.clone(),
+            initiating_identity_id: format!("cli:{}", user.user_id),
+            primary_agent_id: user.primary_agent_id.clone().expect("agent"),
+            assigned_agent_id: user.primary_agent_id.clone().expect("agent"),
+            role_ids: roles.to_vec(),
+            objective: objective.to_owned(),
+            scope: MemoryScope::Private,
+            kind: "interactive".to_owned(),
+            parent_task_id: None,
+            task_context: None,
+            visible_scopes: visible_memory_scopes(roles),
+            memory_mode: AgentMemoryMode::ScopedRetrieval,
+            approved_shell_commands: Vec::new(),
+            approved_automation_actions,
+        }
+    }
+
     async fn create_active_lua_tool(
         db: &Database,
         owner_user_id: &str,
@@ -3872,6 +4843,117 @@ mod tests {
 
         assert_eq!(resumed.task.state, TaskState::Completed.as_str());
         assert_eq!(resumed.task.result_text.as_deref(), Some("finished"));
+    }
+
+    #[tokio::test]
+    async fn scheduled_household_delivery_can_be_created_listed_fetched_and_canceled() {
+        let (db, runner) = test_runner(FakeProvider::new(vec![])).await;
+        let default_user = db.default_user().await.expect("default").expect("user");
+        let roles = db
+            .list_user_roles(&default_user.user_id)
+            .await
+            .expect("roles")
+            .into_iter()
+            .map(|row| row.role_id)
+            .collect::<Vec<_>>();
+        let recipient = db
+            .create_user("Casey", &["adult".to_owned()])
+            .await
+            .expect("create Casey");
+        db.upsert_connector_identity(
+            "discord",
+            "discord-casey",
+            None,
+            &recipient.user_id,
+            "authenticated_message",
+        )
+        .await
+        .expect("map Casey");
+        let task = db
+            .create_task(
+                &default_user.user_id,
+                default_user.primary_agent_id.as_deref().expect("agent"),
+                "Schedule a reminder for Casey",
+                MemoryScope::Private,
+            )
+            .await
+            .expect("task");
+        let deliver_at = normalize_rfc3339_timestamp("2099-01-01T09:00:00Z", "deliver_at")
+            .expect("normalize deliver_at");
+        let target_ref = scheduled_delivery_approval_target(
+            None,
+            &recipient.user_id,
+            "Buy kiwis.",
+            &ScheduledDeliveryMode::OneShot {
+                deliver_at: deliver_at.clone(),
+            },
+            None,
+            None,
+        );
+        let request = test_request(
+            &default_user,
+            &roles,
+            "Schedule a reminder for Casey",
+            vec![ApprovedAutomationAction {
+                action_type: "household_delivery_schedule".to_owned(),
+                target_ref,
+            }],
+        );
+
+        let created = runner
+            .handle_household_schedule_message(
+                &task,
+                &request,
+                json!({
+                    "delivery_id": null,
+                    "recipient": "Casey",
+                    "message": "Buy kiwis.",
+                    "deliver_at": deliver_at,
+                    "cron_expr": null,
+                    "window_start_at": null,
+                    "window_end_at": null,
+                    "enabled": true
+                }),
+            )
+            .await
+            .expect("schedule delivery");
+        let delivery_id = created.payload["delivery_id"]
+            .as_str()
+            .expect("delivery_id")
+            .to_owned();
+        assert_eq!(created.payload["status"], json!("scheduled"));
+        assert_eq!(created.payload["delivery_mode"], json!("scheduled_once"));
+
+        let listed = runner
+            .handle_household_schedule_list(&request)
+            .await
+            .expect("list");
+        assert_eq!(listed.payload["items"].as_array().expect("items").len(), 1);
+
+        let fetched = runner
+            .handle_household_schedule_get(
+                &request,
+                json!({
+                    "delivery_id": delivery_id,
+                }),
+            )
+            .await
+            .expect("get");
+        assert_eq!(fetched.payload["recipient_display_name"], json!("Casey"));
+        assert_eq!(fetched.payload["message"], json!("Buy kiwis."));
+
+        let canceled = runner
+            .handle_household_schedule_cancel(
+                &task,
+                &request,
+                json!({
+                    "delivery_id": fetched.payload["delivery_id"],
+                }),
+            )
+            .await
+            .expect("cancel");
+        assert_eq!(canceled.payload["status"], json!("canceled"));
+        assert_eq!(canceled.payload["scheduled_job_state"], json!("canceled"));
     }
 
     #[tokio::test]

@@ -24,7 +24,10 @@ use beaverki_db::{
 };
 use beaverki_memory::MemoryStore;
 use beaverki_models::{ModelProvider, OpenAiProvider};
-use beaverki_policy::{can_grant_approvals, can_write_household_memory, visible_memory_scopes};
+use beaverki_policy::{
+    can_grant_approvals, can_send_household_direct_delivery, can_write_household_memory,
+    visible_memory_scopes,
+};
 use beaverki_tools::{ToolContext, builtin_registry};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -163,6 +166,15 @@ impl HouseholdDeliveryDelegate for RuntimeHouseholdDeliveryDelegate {
                 target_ref: &identity.external_user_id,
                 fallback_target_ref: identity.external_channel_id.as_deref(),
                 dedupe_key: request.dedupe_key,
+                initial_status: "dispatching",
+                parent_delivery_id: None,
+                schedule_id: None,
+                scheduled_for_at: None,
+                window_starts_at: None,
+                window_ends_at: None,
+                recurrence_rule: None,
+                scheduled_job_state: None,
+                materialized_task_id: None,
             })
             .await
             .map_err(beaverki_tools::ToolError::Failed)?;
@@ -195,6 +207,8 @@ impl HouseholdDeliveryDelegate for RuntimeHouseholdDeliveryDelegate {
                     self.db
                         .mark_household_delivery_sent(
                             &delivery.delivery_id,
+                            &identity.connector_type,
+                            &identity.identity_id,
                             &sent.target_ref,
                             Some(&sent.message_id),
                         )
@@ -595,6 +609,9 @@ impl Runtime {
     }
 
     pub async fn execute_task(&self, task: TaskRow) -> Result<AgentResult> {
+        if task.kind == "scheduled_household_delivery" {
+            return self.execute_scheduled_household_delivery_task(task).await;
+        }
         if task.kind == "scheduled_lua" || task.kind == "lua_script" {
             return self.execute_lua_task(task).await;
         }
@@ -1153,72 +1170,6 @@ impl Runtime {
         let mut tasks = Vec::new();
         for schedule in due {
             let next_run_at = automation::next_run_after(&schedule.cron_expr, &now)?;
-            let Some(script) = self.db.fetch_script(&schedule.target_id).await? else {
-                self.db
-                    .update_schedule_state(
-                        &schedule.schedule_id,
-                        automation::schedule_enabled(&schedule),
-                        &next_run_at,
-                        Some(&now),
-                    )
-                    .await?;
-                self.db
-                    .record_audit_event(
-                        "runtime",
-                        &self.config.runtime.instance_id,
-                        "schedule_skipped",
-                        json!({
-                            "schedule_id": schedule.schedule_id,
-                            "target_id": schedule.target_id,
-                            "reason": "script_missing",
-                            "next_run_at": next_run_at,
-                        }),
-                    )
-                    .await?;
-                continue;
-            };
-            if script.status != "active" || script.safety_status != "approved" {
-                let reason = if script.status != "active" {
-                    "script_not_active"
-                } else {
-                    "script_not_approved"
-                };
-                self.db
-                    .update_schedule_state(
-                        &schedule.schedule_id,
-                        automation::schedule_enabled(&schedule),
-                        &next_run_at,
-                        Some(&now),
-                    )
-                    .await?;
-                self.db
-                    .record_audit_event(
-                        "runtime",
-                        &self.config.runtime.instance_id,
-                        "schedule_skipped",
-                        json!({
-                            "schedule_id": schedule.schedule_id,
-                            "script_id": script.script_id,
-                            "reason": reason,
-                            "script_status": script.status,
-                            "safety_status": script.safety_status,
-                            "next_run_at": next_run_at,
-                        }),
-                    )
-                    .await?;
-                continue;
-            }
-            let primary_agent_id = self
-                .primary_agent_id_for_owner(&schedule.owner_user_id)
-                .await?;
-            let initiating_identity_id = format!("schedule:{}", schedule.schedule_id);
-            let objective = format!("Run Lua automation {}", script.script_id);
-            let task_context = json!({
-                "script_id": script.script_id,
-                "schedule_id": schedule.schedule_id,
-            })
-            .to_string();
-            let session = self.create_cron_run_session(&schedule.schedule_id).await?;
             self.db
                 .update_schedule_state(
                     &schedule.schedule_id,
@@ -1227,38 +1178,547 @@ impl Runtime {
                     Some(&now),
                 )
                 .await?;
-            let task = self
-                .db
-                .create_task_with_params(NewTask {
-                    owner_user_id: &schedule.owner_user_id,
-                    initiating_identity_id: &initiating_identity_id,
-                    primary_agent_id: &primary_agent_id,
-                    assigned_agent_id: &primary_agent_id,
-                    parent_task_id: None,
-                    session_id: Some(&session.session_id),
-                    kind: "scheduled_lua",
-                    objective: &objective,
-                    context_summary: Some(&task_context),
-                    scope: MemoryScope::Private,
-                    wake_at: None,
-                })
-                .await?;
-            self.db
-                .record_audit_event(
-                    "runtime",
-                    &self.config.runtime.instance_id,
-                    "schedule_triggered",
-                    json!({
-                        "schedule_id": schedule.schedule_id,
-                        "task_id": task.task_id,
+            match schedule.target_type.as_str() {
+                "lua_script" => {
+                    let Some(script) = self.db.fetch_script(&schedule.target_id).await? else {
+                        self.db
+                            .record_audit_event(
+                                "runtime",
+                                &self.config.runtime.instance_id,
+                                "schedule_skipped",
+                                json!({
+                                    "schedule_id": schedule.schedule_id,
+                                    "target_id": schedule.target_id,
+                                    "reason": "script_missing",
+                                    "next_run_at": next_run_at,
+                                }),
+                            )
+                            .await?;
+                        continue;
+                    };
+                    if script.status != "active" || script.safety_status != "approved" {
+                        let reason = if script.status != "active" {
+                            "script_not_active"
+                        } else {
+                            "script_not_approved"
+                        };
+                        self.db
+                            .record_audit_event(
+                                "runtime",
+                                &self.config.runtime.instance_id,
+                                "schedule_skipped",
+                                json!({
+                                    "schedule_id": schedule.schedule_id,
+                                    "script_id": script.script_id,
+                                    "reason": reason,
+                                    "script_status": script.status,
+                                    "safety_status": script.safety_status,
+                                    "next_run_at": next_run_at,
+                                }),
+                            )
+                            .await?;
+                        continue;
+                    }
+                    let primary_agent_id = self
+                        .primary_agent_id_for_owner(&schedule.owner_user_id)
+                        .await?;
+                    let initiating_identity_id = format!("schedule:{}", schedule.schedule_id);
+                    let objective = format!("Run Lua automation {}", script.script_id);
+                    let task_context = json!({
                         "script_id": script.script_id,
-                        "next_run_at": next_run_at,
-                    }),
-                )
-                .await?;
-            tasks.push(task);
+                        "schedule_id": schedule.schedule_id,
+                    })
+                    .to_string();
+                    let session = self.create_cron_run_session(&schedule.schedule_id).await?;
+                    let task = self
+                        .db
+                        .create_task_with_params(NewTask {
+                            owner_user_id: &schedule.owner_user_id,
+                            initiating_identity_id: &initiating_identity_id,
+                            primary_agent_id: &primary_agent_id,
+                            assigned_agent_id: &primary_agent_id,
+                            parent_task_id: None,
+                            session_id: Some(&session.session_id),
+                            kind: "scheduled_lua",
+                            objective: &objective,
+                            context_summary: Some(&task_context),
+                            scope: MemoryScope::Private,
+                            wake_at: None,
+                        })
+                        .await?;
+                    self.db
+                        .record_audit_event(
+                            "runtime",
+                            &self.config.runtime.instance_id,
+                            "schedule_triggered",
+                            json!({
+                                "schedule_id": schedule.schedule_id,
+                                "task_id": task.task_id,
+                                "script_id": script.script_id,
+                                "next_run_at": next_run_at,
+                            }),
+                        )
+                        .await?;
+                    tasks.push(task);
+                }
+                "household_delivery" => {
+                    let Some(template) = self
+                        .db
+                        .fetch_household_delivery(&schedule.target_id)
+                        .await?
+                    else {
+                        self.db
+                            .record_audit_event(
+                                "runtime",
+                                &self.config.runtime.instance_id,
+                                "schedule_skipped",
+                                json!({
+                                    "schedule_id": schedule.schedule_id,
+                                    "target_id": schedule.target_id,
+                                    "reason": "delivery_template_missing",
+                                    "next_run_at": next_run_at,
+                                }),
+                            )
+                            .await?;
+                        continue;
+                    };
+                    if template.status == "canceled" {
+                        self.db
+                            .record_audit_event(
+                                "runtime",
+                                &self.config.runtime.instance_id,
+                                "schedule_skipped",
+                                json!({
+                                    "schedule_id": schedule.schedule_id,
+                                    "delivery_id": template.delivery_id,
+                                    "reason": "delivery_canceled",
+                                    "next_run_at": next_run_at,
+                                }),
+                            )
+                            .await?;
+                        continue;
+                    }
+                    let occurrence_dedupe_key =
+                        format!("schedule:{}:{}", schedule.schedule_id, schedule.next_run_at);
+                    let occurrence = self
+                        .db
+                        .create_or_reuse_household_delivery(NewHouseholdDelivery {
+                            task_id: &template.task_id,
+                            requester_user_id: &template.requester_user_id,
+                            requester_identity_id: &template.requester_identity_id,
+                            recipient_user_id: &template.recipient_user_id,
+                            message_text: &template.message_text,
+                            delivery_mode: "scheduled_occurrence",
+                            connector_type: &template.connector_type,
+                            connector_identity_id: &template.connector_identity_id,
+                            target_ref: &template.target_ref,
+                            fallback_target_ref: template.fallback_target_ref.as_deref(),
+                            dedupe_key: &occurrence_dedupe_key,
+                            initial_status: "scheduled",
+                            parent_delivery_id: Some(&template.delivery_id),
+                            schedule_id: Some(&schedule.schedule_id),
+                            scheduled_for_at: Some(&schedule.next_run_at),
+                            window_starts_at: template.window_starts_at.as_deref(),
+                            window_ends_at: template.window_ends_at.as_deref(),
+                            recurrence_rule: Some(&schedule.cron_expr),
+                            scheduled_job_state: Some("scheduled"),
+                            materialized_task_id: None,
+                        })
+                        .await?;
+                    let objective = format!(
+                        "Deliver scheduled household message to {}",
+                        template.recipient_user_id
+                    );
+                    let task_context = json!({
+                        "delivery_id": occurrence.delivery_id,
+                        "schedule_id": schedule.schedule_id,
+                    })
+                    .to_string();
+                    if let Some(existing_task_id) = occurrence.materialized_task_id.as_deref() {
+                        if let Some(existing_task) = self.db.fetch_task(existing_task_id).await? {
+                            tasks.push(existing_task);
+                            continue;
+                        }
+                    }
+                    let primary_agent_id = self
+                        .primary_agent_id_for_owner(&schedule.owner_user_id)
+                        .await?;
+                    let task = self
+                        .db
+                        .create_task_with_params(NewTask {
+                            owner_user_id: &schedule.owner_user_id,
+                            initiating_identity_id: &template.requester_identity_id,
+                            primary_agent_id: &primary_agent_id,
+                            assigned_agent_id: &primary_agent_id,
+                            parent_task_id: None,
+                            session_id: None,
+                            kind: "scheduled_household_delivery",
+                            objective: &objective,
+                            context_summary: Some(&task_context),
+                            scope: MemoryScope::Private,
+                            wake_at: None,
+                        })
+                        .await?;
+                    self.db
+                        .mark_household_delivery_materialized(
+                            &occurrence.delivery_id,
+                            &task.task_id,
+                        )
+                        .await?;
+                    self.db
+                        .record_audit_event(
+                            "runtime",
+                            &self.config.runtime.instance_id,
+                            "schedule_triggered",
+                            json!({
+                                "schedule_id": schedule.schedule_id,
+                                "task_id": task.task_id,
+                                "delivery_id": occurrence.delivery_id,
+                                "template_delivery_id": template.delivery_id,
+                                "next_run_at": next_run_at,
+                            }),
+                        )
+                        .await?;
+                    tasks.push(task);
+                }
+                other => {
+                    self.db
+                        .record_audit_event(
+                            "runtime",
+                            &self.config.runtime.instance_id,
+                            "schedule_skipped",
+                            json!({
+                                "schedule_id": schedule.schedule_id,
+                                "target_type": other,
+                                "reason": "unsupported_target_type",
+                                "next_run_at": next_run_at,
+                            }),
+                        )
+                        .await?;
+                }
+            }
         }
         Ok(tasks)
+    }
+
+    async fn execute_scheduled_household_delivery_task(
+        &self,
+        task: TaskRow,
+    ) -> Result<AgentResult> {
+        self.db.clear_task_result(&task.task_id).await?;
+        self.db
+            .update_task_state(&task.task_id, TaskState::Running)
+            .await?;
+        self.db
+            .append_task_event(
+                &task.task_id,
+                "household_delivery_task_started",
+                "runtime",
+                &self.config.runtime.instance_id,
+                json!({ "objective": task.objective }),
+            )
+            .await?;
+
+        let context: Value = task
+            .context_summary
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()
+            .context("failed to parse scheduled household delivery task context")?
+            .unwrap_or_else(|| json!({}));
+        let delivery_id = context
+            .get("delivery_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                anyhow!(
+                    "scheduled household delivery task '{}' is missing delivery_id context",
+                    task.task_id
+                )
+            })?;
+        let Some(delivery) = self.db.fetch_household_delivery(delivery_id).await? else {
+            self.db
+                .fail_task(&task.task_id, "scheduled household delivery is missing")
+                .await?;
+            let failed = self
+                .db
+                .fetch_task_for_owner(&task.owner_user_id, &task.task_id)
+                .await?
+                .ok_or_else(|| anyhow!("scheduled task '{}' disappeared", task.task_id))?;
+            return Ok(AgentResult { task: failed });
+        };
+
+        if delivery.status == "sent" {
+            self.db
+                .complete_task(
+                    &task.task_id,
+                    "scheduled household delivery was already sent",
+                )
+                .await?;
+            let completed = self
+                .db
+                .fetch_task_for_owner(&task.owner_user_id, &task.task_id)
+                .await?
+                .ok_or_else(|| anyhow!("scheduled task '{}' disappeared", task.task_id))?;
+            return Ok(AgentResult { task: completed });
+        }
+        if delivery.status == "canceled" {
+            self.db
+                .complete_task(
+                    &task.task_id,
+                    "scheduled household delivery was canceled before execution",
+                )
+                .await?;
+            let completed = self
+                .db
+                .fetch_task_for_owner(&task.owner_user_id, &task.task_id)
+                .await?
+                .ok_or_else(|| anyhow!("scheduled task '{}' disappeared", task.task_id))?;
+            return Ok(AgentResult { task: completed });
+        }
+        if let Some(window_ends_at) = delivery.window_ends_at.as_deref() {
+            let now = DateTime::parse_from_rfc3339(&now_rfc3339())?.with_timezone(&Utc);
+            let window_end = DateTime::parse_from_rfc3339(window_ends_at)?.with_timezone(&Utc);
+            if now > window_end {
+                let reason = format!(
+                    "scheduled household delivery window expired at {}",
+                    window_ends_at
+                );
+                self.db
+                    .mark_household_delivery_failed(&delivery.delivery_id, &reason)
+                    .await?;
+                self.db.fail_task(&task.task_id, &reason).await?;
+                let failed = self
+                    .db
+                    .fetch_task_for_owner(&task.owner_user_id, &task.task_id)
+                    .await?
+                    .ok_or_else(|| anyhow!("scheduled task '{}' disappeared", task.task_id))?;
+                return Ok(AgentResult { task: failed });
+            }
+        }
+
+        let requester = match self.db.fetch_user(&delivery.requester_user_id).await? {
+            Some(user) => user,
+            None => {
+                let reason = format!(
+                    "requester '{}' no longer exists for scheduled household delivery",
+                    delivery.requester_user_id
+                );
+                self.db
+                    .mark_household_delivery_failed(&delivery.delivery_id, &reason)
+                    .await?;
+                self.db.fail_task(&task.task_id, &reason).await?;
+                let failed = self
+                    .db
+                    .fetch_task_for_owner(&task.owner_user_id, &task.task_id)
+                    .await?
+                    .ok_or_else(|| anyhow!("scheduled task '{}' disappeared", task.task_id))?;
+                return Ok(AgentResult { task: failed });
+            }
+        };
+        let requester_roles = self
+            .db
+            .list_user_roles(&requester.user_id)
+            .await?
+            .into_iter()
+            .map(|row| row.role_id)
+            .collect::<Vec<_>>();
+        if !can_send_household_direct_delivery(&requester_roles) {
+            let reason = format!(
+                "requester '{}' is no longer allowed to send household delivery",
+                requester.user_id
+            );
+            self.db
+                .mark_household_delivery_failed(&delivery.delivery_id, &reason)
+                .await?;
+            self.db.fail_task(&task.task_id, &reason).await?;
+            let failed = self
+                .db
+                .fetch_task_for_owner(&task.owner_user_id, &task.task_id)
+                .await?
+                .ok_or_else(|| anyhow!("scheduled task '{}' disappeared", task.task_id))?;
+            return Ok(AgentResult { task: failed });
+        }
+
+        let recipient = match self.db.fetch_user(&delivery.recipient_user_id).await? {
+            Some(user) => user,
+            None => {
+                let reason = format!(
+                    "recipient '{}' no longer exists for household delivery",
+                    delivery.recipient_user_id
+                );
+                self.db
+                    .mark_household_delivery_failed(&delivery.delivery_id, &reason)
+                    .await?;
+                self.db.fail_task(&task.task_id, &reason).await?;
+                let failed = self
+                    .db
+                    .fetch_task_for_owner(&task.owner_user_id, &task.task_id)
+                    .await?
+                    .ok_or_else(|| anyhow!("scheduled task '{}' disappeared", task.task_id))?;
+                return Ok(AgentResult { task: failed });
+            }
+        };
+        if requester.user_id == recipient.user_id {
+            let reason = "scheduled household delivery requires another user as the recipient";
+            self.db
+                .mark_household_delivery_failed(&delivery.delivery_id, reason)
+                .await?;
+            self.db.fail_task(&task.task_id, reason).await?;
+            let failed = self
+                .db
+                .fetch_task_for_owner(&task.owner_user_id, &task.task_id)
+                .await?
+                .ok_or_else(|| anyhow!("scheduled task '{}' disappeared", task.task_id))?;
+            return Ok(AgentResult { task: failed });
+        }
+
+        let delegate = RuntimeHouseholdDeliveryDelegate {
+            db: self.db.clone(),
+            runtime_actor_id: self.config.runtime.instance_id.clone(),
+            discord_bot_token: self.discord_bot_token.clone(),
+        };
+        let identity = match delegate
+            .select_household_delivery_identity(&recipient.user_id)
+            .await
+        {
+            Ok(identity) => identity,
+            Err(error) => {
+                let reason = match error {
+                    beaverki_tools::ToolError::Denied { message, .. } => message,
+                    beaverki_tools::ToolError::Failed(error) => error.to_string(),
+                };
+                self.db
+                    .mark_household_delivery_failed(&delivery.delivery_id, &reason)
+                    .await?;
+                self.db.fail_task(&task.task_id, &reason).await?;
+                let failed = self
+                    .db
+                    .fetch_task_for_owner(&task.owner_user_id, &task.task_id)
+                    .await?
+                    .ok_or_else(|| anyhow!("scheduled task '{}' disappeared", task.task_id))?;
+                return Ok(AgentResult { task: failed });
+            }
+        };
+
+        match delegate
+            .send_household_delivery(&delivery, &identity, &requester)
+            .await
+        {
+            Ok(sent) => {
+                self.db
+                    .mark_household_delivery_sent(
+                        &delivery.delivery_id,
+                        &identity.connector_type,
+                        &identity.identity_id,
+                        &sent.target_ref,
+                        Some(&sent.message_id),
+                    )
+                    .await?;
+                self.db
+                    .append_task_event(
+                        &task.task_id,
+                        "household_delivery_sent",
+                        "runtime",
+                        &self.config.runtime.instance_id,
+                        json!({
+                            "delivery_id": delivery.delivery_id,
+                            "requester_user_id": requester.user_id,
+                            "requester_identity_id": delivery.requester_identity_id,
+                            "recipient_user_id": recipient.user_id,
+                            "recipient_display_name": recipient.display_name,
+                            "connector_type": identity.connector_type,
+                            "connector_identity_id": identity.identity_id,
+                            "target_kind": sent.target_kind,
+                            "target_ref": sent.target_ref,
+                            "schedule_id": delivery.schedule_id,
+                        }),
+                    )
+                    .await?;
+                self.db
+                    .record_audit_event(
+                        "runtime",
+                        &self.config.runtime.instance_id,
+                        "household_delivery_sent",
+                        json!({
+                            "delivery_id": delivery.delivery_id,
+                            "task_id": task.task_id,
+                            "requester_user_id": requester.user_id,
+                            "requester_identity_id": delivery.requester_identity_id,
+                            "requester_display_name": requester.display_name,
+                            "recipient_user_id": recipient.user_id,
+                            "recipient_display_name": recipient.display_name,
+                            "connector_type": identity.connector_type,
+                            "connector_identity_id": identity.identity_id,
+                            "target_kind": sent.target_kind,
+                            "target_ref": sent.target_ref,
+                            "schedule_id": delivery.schedule_id,
+                        }),
+                    )
+                    .await?;
+                self.db
+                    .complete_task(
+                        &task.task_id,
+                        &format!(
+                            "Delivered scheduled household message to {}.",
+                            recipient.display_name
+                        ),
+                    )
+                    .await?;
+            }
+            Err(error) => {
+                let reason = error.to_string();
+                self.db
+                    .mark_household_delivery_failed(&delivery.delivery_id, &reason)
+                    .await?;
+                self.db
+                    .append_task_event(
+                        &task.task_id,
+                        "household_delivery_failed",
+                        "runtime",
+                        &self.config.runtime.instance_id,
+                        json!({
+                            "delivery_id": delivery.delivery_id,
+                            "requester_user_id": requester.user_id,
+                            "recipient_user_id": recipient.user_id,
+                            "connector_type": identity.connector_type,
+                            "connector_identity_id": identity.identity_id,
+                            "schedule_id": delivery.schedule_id,
+                            "error": reason,
+                        }),
+                    )
+                    .await?;
+                self.db
+                    .record_audit_event(
+                        "runtime",
+                        &self.config.runtime.instance_id,
+                        "household_delivery_failed",
+                        json!({
+                            "delivery_id": delivery.delivery_id,
+                            "task_id": task.task_id,
+                            "requester_user_id": requester.user_id,
+                            "recipient_user_id": recipient.user_id,
+                            "connector_type": identity.connector_type,
+                            "connector_identity_id": identity.identity_id,
+                            "schedule_id": delivery.schedule_id,
+                            "error": reason,
+                        }),
+                    )
+                    .await?;
+                self.db.fail_task(&task.task_id, &reason).await?;
+            }
+        }
+
+        let task = self
+            .db
+            .fetch_task_for_owner(&task.owner_user_id, &task.task_id)
+            .await?
+            .ok_or_else(|| {
+                anyhow!(
+                    "scheduled task '{}' disappeared after execution",
+                    task.task_id
+                )
+            })?;
+        Ok(AgentResult { task })
     }
 
     async fn execute_lua_task(&self, task: TaskRow) -> Result<AgentResult> {
@@ -4937,6 +5397,254 @@ end"#,
         assert!(calls[0].contains("recipient=discord-casey"));
         assert!(calls[0].contains("Household message from Alex"));
         assert!(calls[0].contains("Dinner is ready."));
+    }
+
+    #[tokio::test]
+    async fn scheduled_household_delivery_pauses_for_approval_and_executes_later() {
+        let (_tempdir, runtime) = test_runtime_with_discord_token(
+            vec![
+                ModelTurnResponse {
+                    output_items: vec![json!({
+                        "type": "function_call",
+                        "call_id": "call_1",
+                        "name": "household_schedule_message",
+                        "arguments": "{\"delivery_id\":null,\"recipient\":\"Casey\",\"message\":\"Buy kiwis.\",\"deliver_at\":\"2099-01-01T09:00:00Z\",\"cron_expr\":null,\"window_start_at\":null,\"window_end_at\":null,\"enabled\":true}"
+                    })],
+                    tool_calls: vec![beaverki_models::ModelToolCall {
+                        call_id: "call_1".to_owned(),
+                        name: "household_schedule_message".to_owned(),
+                        arguments: json!({
+                            "delivery_id": Value::Null,
+                            "recipient": "Casey",
+                            "message": "Buy kiwis.",
+                            "deliver_at": "2099-01-01T09:00:00Z",
+                            "cron_expr": Value::Null,
+                            "window_start_at": Value::Null,
+                            "window_end_at": Value::Null,
+                            "enabled": true
+                        }),
+                    }],
+                    output_text: String::new(),
+                    usage: None,
+                },
+                ModelTurnResponse {
+                    output_items: vec![json!({
+                        "type": "function_call",
+                        "call_id": "call_2",
+                        "name": "household_schedule_message",
+                        "arguments": "{\"delivery_id\":null,\"recipient\":\"Casey\",\"message\":\"Buy kiwis.\",\"deliver_at\":\"2099-01-01T09:00:00Z\",\"cron_expr\":null,\"window_start_at\":null,\"window_end_at\":null,\"enabled\":true}"
+                    })],
+                    tool_calls: vec![beaverki_models::ModelToolCall {
+                        call_id: "call_2".to_owned(),
+                        name: "household_schedule_message".to_owned(),
+                        arguments: json!({
+                            "delivery_id": Value::Null,
+                            "recipient": "Casey",
+                            "message": "Buy kiwis.",
+                            "deliver_at": "2099-01-01T09:00:00Z",
+                            "cron_expr": Value::Null,
+                            "window_start_at": Value::Null,
+                            "window_end_at": Value::Null,
+                            "enabled": true
+                        }),
+                    }],
+                    output_text: String::new(),
+                    usage: None,
+                },
+                ModelTurnResponse {
+                    output_items: vec![json!({
+                        "type": "message",
+                        "content": [{ "type": "output_text", "text": "I scheduled that reminder for Casey." }]
+                    })],
+                    tool_calls: vec![],
+                    output_text: "I scheduled that reminder for Casey.".to_owned(),
+                    usage: None,
+                },
+            ],
+            Some("discord-token".to_owned()),
+        )
+        .await;
+        let recipient = runtime
+            .create_user("Casey", &[String::from("adult")])
+            .await
+            .expect("create Casey");
+        runtime
+            .db
+            .upsert_connector_identity(
+                "discord",
+                "discord-casey",
+                None,
+                &recipient.user_id,
+                "authenticated_message",
+            )
+            .await
+            .expect("map Casey");
+
+        let first = runtime
+            .run_objective(
+                None,
+                "Remind Casey to buy kiwis tomorrow morning.",
+                MemoryScope::Private,
+            )
+            .await
+            .expect("first run");
+        assert_eq!(first.task.state, TaskState::WaitingApproval.as_str());
+
+        let approval = runtime
+            .list_approvals(None, Some("pending"))
+            .await
+            .expect("approvals")
+            .into_iter()
+            .next()
+            .expect("approval");
+        let resumed = runtime
+            .resolve_approval(None, &approval.approval_id, true)
+            .await
+            .expect("approve");
+        assert_eq!(resumed.state, TaskState::Completed.as_str());
+
+        let deliveries = runtime
+            .db
+            .list_scheduled_household_deliveries_for_requester(&runtime.default_user.user_id)
+            .await
+            .expect("scheduled deliveries");
+        assert_eq!(deliveries.len(), 1);
+        let delivery = &deliveries[0];
+        assert_eq!(delivery.delivery_mode, "scheduled_once");
+        let scheduled_task_id = delivery
+            .materialized_task_id
+            .as_deref()
+            .expect("scheduled task id");
+
+        runtime
+            .db
+            .update_task_wake_at(scheduled_task_id, Some(&now_rfc3339()))
+            .await
+            .expect("wake task");
+        let direct_send_calls = Arc::new(Mutex::new(Vec::new()));
+        discord::set_test_direct_send_capture(Some(Arc::clone(&direct_send_calls)));
+
+        let executed = runtime
+            .execute_next_runnable_task()
+            .await
+            .expect("execute next")
+            .expect("scheduled task");
+
+        discord::set_test_direct_send_capture(None);
+
+        assert_eq!(executed.task.state, TaskState::Completed.as_str());
+        let sent = runtime
+            .db
+            .fetch_household_delivery(&delivery.delivery_id)
+            .await
+            .expect("fetch delivery")
+            .expect("delivery");
+        assert_eq!(sent.status, "sent");
+        assert_eq!(sent.recipient_user_id, recipient.user_id);
+
+        let calls = direct_send_calls.lock().expect("captured sends");
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].contains("Buy kiwis."));
+    }
+
+    #[tokio::test]
+    async fn recurring_household_delivery_revalidates_requester_roles_at_send_time() {
+        let (_tempdir, runtime) =
+            test_runtime_with_discord_token(vec![], Some("discord-token".to_owned())).await;
+        let requester = runtime
+            .create_user("Sam", &[String::from("child")])
+            .await
+            .expect("create requester");
+        let recipient = runtime
+            .create_user("Casey", &[String::from("adult")])
+            .await
+            .expect("create recipient");
+        runtime
+            .db
+            .upsert_connector_identity(
+                "discord",
+                "discord-casey",
+                None,
+                &recipient.user_id,
+                "authenticated_message",
+            )
+            .await
+            .expect("map Casey");
+        let template = runtime
+            .db
+            .create_or_reuse_household_delivery(NewHouseholdDelivery {
+                task_id: "task_seed",
+                requester_user_id: &requester.user_id,
+                requester_identity_id: "cli:sam",
+                recipient_user_id: &recipient.user_id,
+                message_text: "This should be blocked later.",
+                delivery_mode: "scheduled_recurring",
+                connector_type: "discord",
+                connector_identity_id: "discord-casey",
+                target_ref: "discord-casey",
+                fallback_target_ref: None,
+                dedupe_key: "schedule-template",
+                initial_status: "scheduled",
+                parent_delivery_id: None,
+                schedule_id: None,
+                scheduled_for_at: None,
+                window_starts_at: None,
+                window_ends_at: None,
+                recurrence_rule: Some("0/5 * * * * * *"),
+                scheduled_job_state: Some("scheduled"),
+                materialized_task_id: None,
+            })
+            .await
+            .expect("template");
+        let scheduled_for = now_rfc3339();
+        runtime
+            .db
+            .create_schedule(NewSchedule {
+                schedule_id: Some("sched_household_blocked"),
+                owner_user_id: &requester.user_id,
+                target_type: "household_delivery",
+                target_id: &template.delivery_id,
+                cron_expr: "0/5 * * * * * *",
+                enabled: true,
+                next_run_at: &scheduled_for,
+            })
+            .await
+            .expect("schedule");
+        let direct_send_calls = Arc::new(Mutex::new(Vec::new()));
+        discord::set_test_direct_send_capture(Some(Arc::clone(&direct_send_calls)));
+
+        let tasks = runtime
+            .materialize_due_schedules()
+            .await
+            .expect("materialize");
+        assert_eq!(tasks.len(), 1);
+        let result = runtime
+            .execute_task(tasks[0].clone())
+            .await
+            .expect("execute scheduled task");
+
+        discord::set_test_direct_send_capture(None);
+
+        assert_eq!(result.task.state, TaskState::Failed.as_str());
+        let occurrence = runtime
+            .db
+            .fetch_household_delivery_by_dedupe_key(&format!(
+                "schedule:{}:{}",
+                "sched_household_blocked", scheduled_for,
+            ))
+            .await
+            .expect("occurrence")
+            .expect("occurrence row");
+        assert_eq!(occurrence.status, "failed");
+        assert!(
+            occurrence
+                .failure_reason
+                .as_deref()
+                .expect("failure reason")
+                .contains("no longer allowed")
+        );
+        let calls = direct_send_calls.lock().expect("captured sends");
+        assert!(calls.is_empty());
     }
 
     #[tokio::test]

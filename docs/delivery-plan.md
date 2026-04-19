@@ -387,58 +387,6 @@ Exit criteria:
 - Lua-defined tools remain constrained to Rust-controlled capabilities and fail closed on disallowed operations
 - schema validation, safety review, and auditability work end to end for both storage modes
 
-## 3.10.1 M4.9 Scheduled Workflow Pipelines
-
-Goal:
-
-Extend the scheduler from single-target Lua execution into reviewed durable workflow pipelines so cron and reminder features can combine multiple Lua stages with later bounded agent interaction.
-
-Status:
-
-- proposed after M4.8
-
-Why this stage exists:
-
-- the current runtime already has durable schedules, reviewed Lua scripts, Lua-defined tools, fresh cron-run sessions, and agent execution, but those pieces are not yet composable under one scheduled run
-- today a due schedule materializes only a `lua_script` target and the follow-up path is limited to another deferred Lua run rather than an explicit workflow handoff
-- many useful reminders, digests, maintenance tasks, and coordination flows need a scripted preparation phase before an agent interprets results or decides the next action
-
-Implementation notes:
-
-- keep the current single-script schedule path as the simple baseline, but make `target_type` genuinely extensible by supporting workflow targets in the runtime
-- add a reviewed workflow definition model with ordered stages so the runtime, not an opaque Lua script chain, owns stage boundaries, state handoff, retries, and auditability
-- initial stage kinds should be `lua_script`, `lua_tool`, `agent_task`, and `user_notify`
-- workflow runs should persist owner identity, initiating identity, triggering schedule, current stage, stage outputs, carried artifacts, wake-up state, and fail-closed block reasons across restart
-- agent stages should receive an explicit bounded task slice built from prior workflow outputs rather than inheriting broad hidden context, and should support a stored stage-specific prompt contract plus allowed tool or Lua-artifact references
-- changing a workflow definition should go through blocking safety review and activation gating even when the referenced Lua artifacts were already reviewed individually
-- scheduled workflow runs should not enter interactive approval waits; if the workflow and its referenced stages are approved and active, the run should execute autonomously, and if a stage exceeds that approved envelope at runtime the run should fail closed or block with audit visibility
-- workflow-level user notification should be a first-class stage so a scheduled run can actually surface its result to a human; that delivery stage should align with and later reuse the M5 household-delivery routing and persistence foundation rather than creating a second notification subsystem
-- later reminder and scheduled-delivery work should build on this workflow foundation instead of adding a second bespoke cron orchestration path
-
-Out of scope:
-
-- unrestricted arbitrary workflow graphs or general-purpose branching languages in the first slice
-- opaque script-to-script dispatch where the runtime cannot see stage boundaries
-- connector-specific scheduled UX beyond what is needed to prove the runtime workflow foundation; the first `user_notify` slice may stay minimal as long as it is aligned with the later M5 delivery model
-
-Stories:
-
-- `M4.9-001` Add persistent workflow-definition storage with ownership, ordered stages, review metadata, activation state, and originating task linkage.
-- `M4.9-002` Extend schedule materialization so `target_type=workflow` creates durable workflow-run state instead of assuming every due schedule maps directly to one Lua script task.
-- `M4.9-003` Implement initial workflow stages for reviewed Lua script execution, reviewed Lua-defined tool execution, bounded agent-task handoff with explicit task-slice construction and output capture, and a minimal connector-agnostic `user_notify` stage for surfacing workflow results.
-- `M4.9-004` Persist workflow-run progression, defer or wake-up behavior, retry state, fail-closed block reasons, and per-stage artifacts so scheduled pipelines survive restart without losing where they were.
-- `M4.9-005` Add CLI and agent-facing workflow creation, activation, scheduling, inspection, and replay flows so staged automation becomes operable rather than an internal-only runtime abstraction.
-- `M4.9-006` Add safety-review coverage, RBAC enforcement, audit events, and end-to-end tests for workflow activation, autonomous scheduled execution inside the approved envelope, fail-closed behavior when a stage exceeds that envelope, result delivery through `user_notify`, and compatibility with existing single-script schedules.
-
-Exit criteria:
-
-- a scheduled trigger can run one or more reviewed Lua stages and then hand off to a bounded agent stage within one durable auditable pipeline
-- simple existing single-script schedules still work without forced migration
-- each stage has explicit input or output state, retry behavior, and audit visibility
-- scheduled workflow runs execute autonomously once the workflow and its referenced parts are approved, and they fail closed rather than pausing for fresh approval
-- a workflow can surface its result to a user through a first-class notification or delivery stage that can later converge with the M5 delivery foundation
-- later reminder and recurring household-delivery work can reuse the same workflow-run machinery instead of introducing a separate scheduled orchestration model
-
 ## 3.11 M5 Household Direct Delivery
 
 Goal:
@@ -485,7 +433,7 @@ Build first-class deferred and recurring household delivery on top of the direct
 
 Status:
 
-- proposed after M5
+- implemented in the repository
 
 Implementation notes:
 
@@ -517,7 +465,59 @@ Exit criteria:
 - cross-user deferred delivery is policy-gated and fully auditable
 - natural-language reminder and scheduling requests are normalized into structured scheduled work rather than handled as ad hoc connector replies
 
-## 3.13 Post-V1
+## 3.13 M6 Scheduled Workflow Pipelines
+
+Goal:
+
+Extend the scheduler from single-target Lua execution into reviewed durable workflow pipelines so cron and reminder features can combine multiple Lua stages with later bounded agent interaction.
+
+Status:
+
+- proposed after M5.5
+
+Why this stage exists:
+
+- the current runtime already has durable schedules, reviewed Lua scripts, Lua-defined tools, fresh cron-run sessions, and agent execution, but those pieces are not yet composable under one scheduled run
+- today a due schedule materializes only a `lua_script` target and the follow-up path is limited to another deferred Lua run rather than an explicit workflow handoff
+- many useful reminders, digests, maintenance tasks, and coordination flows need a scripted preparation phase before an agent interprets results or decides the next action
+
+Implementation notes:
+
+- keep the current single-script schedule path as the simple baseline, but make `target_type` genuinely extensible by supporting workflow targets in the runtime
+- add a reviewed workflow definition model with ordered stages so the runtime, not an opaque Lua script chain, owns stage boundaries, state handoff, retries, and auditability
+- initial stage kinds should be `lua_script`, `lua_tool`, `agent_task`, and `user_notify`
+- workflow runs should persist owner identity, initiating identity, triggering schedule, current stage, stage outputs, carried artifacts, wake-up state, and fail-closed block reasons across restart
+- agent stages should receive an explicit bounded task slice built from prior workflow outputs rather than inheriting broad hidden context, and should support a stored stage-specific prompt contract plus allowed tool or Lua-artifact references
+- changing a workflow definition should go through blocking safety review and activation gating even when the referenced Lua artifacts were already reviewed individually
+- scheduled workflow runs should not enter interactive approval waits; if the workflow and its referenced stages are approved and active, the run should execute autonomously, and if a stage exceeds that approved envelope at runtime the run should fail closed or block with audit visibility
+- workflow-level user notification should be a first-class stage so a scheduled run can actually surface its result to a human; that delivery stage should align with and later reuse the M5 household-delivery routing and persistence foundation rather than creating a second notification subsystem
+- later reminder and scheduled-delivery work should build on this workflow foundation instead of adding a second bespoke cron orchestration path
+
+Out of scope:
+
+- unrestricted arbitrary workflow graphs or general-purpose branching languages in the first slice
+- opaque script-to-script dispatch where the runtime cannot see stage boundaries
+- connector-specific scheduled UX beyond what is needed to prove the runtime workflow foundation; the first `user_notify` slice may stay minimal as long as it is aligned with the later M5 delivery model
+
+Stories:
+
+- `M6-001` Add persistent workflow-definition storage with ownership, ordered stages, review metadata, activation state, and originating task linkage.
+- `M6-002` Extend schedule materialization so `target_type=workflow` creates durable workflow-run state instead of assuming every due schedule maps directly to one Lua script task.
+- `M6-003` Implement initial workflow stages for reviewed Lua script execution, reviewed Lua-defined tool execution, bounded agent-task handoff with explicit task-slice construction and output capture, and a minimal connector-agnostic `user_notify` stage for surfacing workflow results.
+- `M6-004` Persist workflow-run progression, defer or wake-up behavior, retry state, fail-closed block reasons, and per-stage artifacts so scheduled pipelines survive restart without losing where they were.
+- `M6-005` Add CLI and agent-facing workflow creation, activation, scheduling, inspection, and replay flows so staged automation becomes operable rather than an internal-only runtime abstraction.
+- `M6-006` Add safety-review coverage, RBAC enforcement, audit events, and end-to-end tests for workflow activation, autonomous scheduled execution inside the approved envelope, fail-closed behavior when a stage exceeds that envelope, result delivery through `user_notify`, and compatibility with existing single-script schedules.
+
+Exit criteria:
+
+- a scheduled trigger can run one or more reviewed Lua stages and then hand off to a bounded agent stage within one durable auditable pipeline
+- simple existing single-script schedules still work without forced migration
+- each stage has explicit input or output state, retry behavior, and audit visibility
+- scheduled workflow runs execute autonomously once the workflow and its referenced parts are approved, and they fail closed rather than pausing for fresh approval
+- a workflow can surface its result to a user through a first-class notification or delivery stage that can later converge with the M5 delivery foundation
+- later reminder and recurring household-delivery work can reuse the same workflow-run machinery instead of introducing a separate scheduled orchestration model
+
+## 3.14 Post-V1
 
 Candidate follow-up work:
 

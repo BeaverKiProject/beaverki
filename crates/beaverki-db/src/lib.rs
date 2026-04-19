@@ -594,6 +594,19 @@ impl Database {
         Ok(())
     }
 
+    pub async fn update_task_wake_at(&self, task_id: &str, wake_at: Option<&str>) -> Result<()> {
+        let timestamp = now_rfc3339();
+        sqlx::query("UPDATE tasks SET wake_at = ?, updated_at = ? WHERE task_id = ?")
+            .bind(wake_at)
+            .bind(&timestamp)
+            .bind(task_id)
+            .execute(&self.pool)
+            .await
+            .context("failed to update task wake_at")?;
+        self.touch_session_for_task(task_id, &timestamp).await?;
+        Ok(())
+    }
+
     pub async fn set_task_waiting_approval(&self, task_id: &str, message: &str) -> Result<()> {
         let timestamp = now_rfc3339();
         sqlx::query(
@@ -2323,8 +2336,8 @@ impl Database {
         let timestamp = now_rfc3339();
         sqlx::query(
             "INSERT INTO household_deliveries
-             (delivery_id, task_id, requester_user_id, requester_identity_id, recipient_user_id, message_text, delivery_mode, connector_type, connector_identity_id, target_ref, fallback_target_ref, dedupe_key, status, failure_reason, external_message_id, delivered_at, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'dispatching', NULL, NULL, NULL, ?, ?)",
+             (delivery_id, task_id, requester_user_id, requester_identity_id, recipient_user_id, message_text, delivery_mode, connector_type, connector_identity_id, target_ref, fallback_target_ref, dedupe_key, status, failure_reason, external_message_id, delivered_at, parent_delivery_id, schedule_id, scheduled_for_at, window_starts_at, window_ends_at, recurrence_rule, scheduled_job_state, materialized_task_id, completed_at, canceled_at, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)",
         )
         .bind(&delivery_id)
         .bind(input.task_id)
@@ -2338,6 +2351,15 @@ impl Database {
         .bind(input.target_ref)
         .bind(input.fallback_target_ref)
         .bind(input.dedupe_key)
+        .bind(input.initial_status)
+        .bind(input.parent_delivery_id)
+        .bind(input.schedule_id)
+        .bind(input.scheduled_for_at)
+        .bind(input.window_starts_at)
+        .bind(input.window_ends_at)
+        .bind(input.recurrence_rule)
+        .bind(input.scheduled_job_state)
+        .bind(input.materialized_task_id)
         .bind(&timestamp)
         .bind(&timestamp)
         .execute(&self.pool)
@@ -2354,7 +2376,7 @@ impl Database {
         delivery_id: &str,
     ) -> Result<Option<HouseholdDeliveryRow>> {
         let row = sqlx::query_as::<_, HouseholdDeliveryRow>(
-            "SELECT delivery_id, task_id, requester_user_id, requester_identity_id, recipient_user_id, message_text, delivery_mode, connector_type, connector_identity_id, target_ref, fallback_target_ref, dedupe_key, status, failure_reason, external_message_id, delivered_at, created_at, updated_at
+            "SELECT delivery_id, task_id, requester_user_id, requester_identity_id, recipient_user_id, message_text, delivery_mode, connector_type, connector_identity_id, target_ref, fallback_target_ref, dedupe_key, status, failure_reason, external_message_id, delivered_at, parent_delivery_id, schedule_id, scheduled_for_at, window_starts_at, window_ends_at, recurrence_rule, scheduled_job_state, materialized_task_id, completed_at, canceled_at, created_at, updated_at
              FROM household_deliveries
              WHERE delivery_id = ?",
         )
@@ -2370,7 +2392,7 @@ impl Database {
         dedupe_key: &str,
     ) -> Result<Option<HouseholdDeliveryRow>> {
         let row = sqlx::query_as::<_, HouseholdDeliveryRow>(
-            "SELECT delivery_id, task_id, requester_user_id, requester_identity_id, recipient_user_id, message_text, delivery_mode, connector_type, connector_identity_id, target_ref, fallback_target_ref, dedupe_key, status, failure_reason, external_message_id, delivered_at, created_at, updated_at
+            "SELECT delivery_id, task_id, requester_user_id, requester_identity_id, recipient_user_id, message_text, delivery_mode, connector_type, connector_identity_id, target_ref, fallback_target_ref, dedupe_key, status, failure_reason, external_message_id, delivered_at, parent_delivery_id, schedule_id, scheduled_for_at, window_starts_at, window_ends_at, recurrence_rule, scheduled_job_state, materialized_task_id, completed_at, canceled_at, created_at, updated_at
              FROM household_deliveries
              WHERE dedupe_key = ?",
         )
@@ -2386,7 +2408,7 @@ impl Database {
         task_id: &str,
     ) -> Result<Vec<HouseholdDeliveryRow>> {
         let rows = sqlx::query_as::<_, HouseholdDeliveryRow>(
-            "SELECT delivery_id, task_id, requester_user_id, requester_identity_id, recipient_user_id, message_text, delivery_mode, connector_type, connector_identity_id, target_ref, fallback_target_ref, dedupe_key, status, failure_reason, external_message_id, delivered_at, created_at, updated_at
+            "SELECT delivery_id, task_id, requester_user_id, requester_identity_id, recipient_user_id, message_text, delivery_mode, connector_type, connector_identity_id, target_ref, fallback_target_ref, dedupe_key, status, failure_reason, external_message_id, delivered_at, parent_delivery_id, schedule_id, scheduled_for_at, window_starts_at, window_ends_at, recurrence_rule, scheduled_job_state, materialized_task_id, completed_at, canceled_at, created_at, updated_at
              FROM household_deliveries
              WHERE task_id = ?
              ORDER BY created_at ASC",
@@ -2398,20 +2420,65 @@ impl Database {
         Ok(rows)
     }
 
+    pub async fn fetch_scheduled_household_delivery_for_requester(
+        &self,
+        requester_user_id: &str,
+        delivery_id: &str,
+    ) -> Result<Option<HouseholdDeliveryRow>> {
+        let row = sqlx::query_as::<_, HouseholdDeliveryRow>(
+            "SELECT delivery_id, task_id, requester_user_id, requester_identity_id, recipient_user_id, message_text, delivery_mode, connector_type, connector_identity_id, target_ref, fallback_target_ref, dedupe_key, status, failure_reason, external_message_id, delivered_at, parent_delivery_id, schedule_id, scheduled_for_at, window_starts_at, window_ends_at, recurrence_rule, scheduled_job_state, materialized_task_id, completed_at, canceled_at, created_at, updated_at
+             FROM household_deliveries
+             WHERE requester_user_id = ?
+               AND delivery_id = ?
+               AND parent_delivery_id IS NULL
+               AND delivery_mode != 'immediate'",
+        )
+        .bind(requester_user_id)
+        .bind(delivery_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to fetch scheduled household delivery")?;
+        Ok(row)
+    }
+
+    pub async fn list_scheduled_household_deliveries_for_requester(
+        &self,
+        requester_user_id: &str,
+    ) -> Result<Vec<HouseholdDeliveryRow>> {
+        let rows = sqlx::query_as::<_, HouseholdDeliveryRow>(
+            "SELECT delivery_id, task_id, requester_user_id, requester_identity_id, recipient_user_id, message_text, delivery_mode, connector_type, connector_identity_id, target_ref, fallback_target_ref, dedupe_key, status, failure_reason, external_message_id, delivered_at, parent_delivery_id, schedule_id, scheduled_for_at, window_starts_at, window_ends_at, recurrence_rule, scheduled_job_state, materialized_task_id, completed_at, canceled_at, created_at, updated_at
+             FROM household_deliveries
+             WHERE requester_user_id = ?
+               AND parent_delivery_id IS NULL
+               AND delivery_mode != 'immediate'
+             ORDER BY created_at DESC",
+        )
+        .bind(requester_user_id)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list scheduled household deliveries")?;
+        Ok(rows)
+    }
+
     pub async fn mark_household_delivery_sent(
         &self,
         delivery_id: &str,
+        connector_type: &str,
+        connector_identity_id: &str,
         target_ref: &str,
         external_message_id: Option<&str>,
     ) -> Result<()> {
         let timestamp = now_rfc3339();
         sqlx::query(
             "UPDATE household_deliveries
-             SET status = 'sent', target_ref = ?, external_message_id = ?, delivered_at = ?, failure_reason = NULL, updated_at = ?
+             SET status = 'sent', connector_type = ?, connector_identity_id = ?, target_ref = ?, external_message_id = ?, delivered_at = ?, failure_reason = NULL, scheduled_job_state = 'completed', completed_at = ?, updated_at = ?
              WHERE delivery_id = ?",
         )
+        .bind(connector_type)
+        .bind(connector_identity_id)
         .bind(target_ref)
         .bind(external_message_id)
+        .bind(&timestamp)
         .bind(&timestamp)
         .bind(&timestamp)
         .bind(delivery_id)
@@ -2426,17 +2493,97 @@ impl Database {
         delivery_id: &str,
         reason: &str,
     ) -> Result<()> {
+        let timestamp = now_rfc3339();
         sqlx::query(
             "UPDATE household_deliveries
-             SET status = 'failed', failure_reason = ?, updated_at = ?
+             SET status = 'failed', failure_reason = ?, scheduled_job_state = 'failed', completed_at = ?, updated_at = ?
              WHERE delivery_id = ?",
         )
         .bind(reason)
-        .bind(now_rfc3339())
+        .bind(&timestamp)
+        .bind(&timestamp)
         .bind(delivery_id)
         .execute(&self.pool)
         .await
         .context("failed to mark household delivery failed")?;
+        Ok(())
+    }
+
+    pub async fn mark_household_delivery_materialized(
+        &self,
+        delivery_id: &str,
+        materialized_task_id: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE household_deliveries
+             SET materialized_task_id = ?, scheduled_job_state = 'materialized', updated_at = ?
+             WHERE delivery_id = ?",
+        )
+        .bind(materialized_task_id)
+        .bind(now_rfc3339())
+        .bind(delivery_id)
+        .execute(&self.pool)
+        .await
+        .context("failed to mark household delivery materialized")?;
+        Ok(())
+    }
+
+    pub async fn update_household_delivery_schedule(
+        &self,
+        delivery_id: &str,
+        recipient_user_id: &str,
+        message_text: &str,
+        connector_type: &str,
+        connector_identity_id: &str,
+        target_ref: &str,
+        fallback_target_ref: Option<&str>,
+        schedule_id: Option<&str>,
+        scheduled_for_at: Option<&str>,
+        window_starts_at: Option<&str>,
+        window_ends_at: Option<&str>,
+        recurrence_rule: Option<&str>,
+        scheduled_job_state: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE household_deliveries
+             SET recipient_user_id = ?, message_text = ?, connector_type = ?, connector_identity_id = ?, target_ref = ?, fallback_target_ref = ?, schedule_id = ?, scheduled_for_at = ?, window_starts_at = ?, window_ends_at = ?, recurrence_rule = ?, scheduled_job_state = ?, failure_reason = NULL, canceled_at = NULL, updated_at = ?
+             WHERE delivery_id = ?",
+        )
+        .bind(recipient_user_id)
+        .bind(message_text)
+        .bind(connector_type)
+        .bind(connector_identity_id)
+        .bind(target_ref)
+        .bind(fallback_target_ref)
+        .bind(schedule_id)
+        .bind(scheduled_for_at)
+        .bind(window_starts_at)
+        .bind(window_ends_at)
+        .bind(recurrence_rule)
+        .bind(scheduled_job_state)
+        .bind(now_rfc3339())
+        .bind(delivery_id)
+        .execute(&self.pool)
+        .await
+        .context("failed to update scheduled household delivery")?;
+        Ok(())
+    }
+
+    pub async fn cancel_household_delivery(&self, delivery_id: &str, reason: &str) -> Result<()> {
+        let timestamp = now_rfc3339();
+        sqlx::query(
+            "UPDATE household_deliveries
+             SET status = 'canceled', failure_reason = ?, scheduled_job_state = 'canceled', canceled_at = ?, completed_at = ?, updated_at = ?
+             WHERE delivery_id = ?",
+        )
+        .bind(reason)
+        .bind(&timestamp)
+        .bind(&timestamp)
+        .bind(&timestamp)
+        .bind(delivery_id)
+        .execute(&self.pool)
+        .await
+        .context("failed to cancel household delivery")?;
         Ok(())
     }
 
@@ -2724,6 +2871,15 @@ pub struct NewHouseholdDelivery<'a> {
     pub target_ref: &'a str,
     pub fallback_target_ref: Option<&'a str>,
     pub dedupe_key: &'a str,
+    pub initial_status: &'a str,
+    pub parent_delivery_id: Option<&'a str>,
+    pub schedule_id: Option<&'a str>,
+    pub scheduled_for_at: Option<&'a str>,
+    pub window_starts_at: Option<&'a str>,
+    pub window_ends_at: Option<&'a str>,
+    pub recurrence_rule: Option<&'a str>,
+    pub scheduled_job_state: Option<&'a str>,
+    pub materialized_task_id: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3073,6 +3229,16 @@ pub struct HouseholdDeliveryRow {
     pub failure_reason: Option<String>,
     pub external_message_id: Option<String>,
     pub delivered_at: Option<String>,
+    pub parent_delivery_id: Option<String>,
+    pub schedule_id: Option<String>,
+    pub scheduled_for_at: Option<String>,
+    pub window_starts_at: Option<String>,
+    pub window_ends_at: Option<String>,
+    pub recurrence_rule: Option<String>,
+    pub scheduled_job_state: Option<String>,
+    pub materialized_task_id: Option<String>,
+    pub completed_at: Option<String>,
+    pub canceled_at: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
