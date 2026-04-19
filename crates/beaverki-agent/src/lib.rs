@@ -3392,22 +3392,6 @@ impl PrimaryAgentRunner {
                 workflow.workflow_id
             )));
         }
-        let target_ref = format!(
-            "schedule_id={schedule_id};workflow_id={workflow_id};cron={cron_expr};enabled={enabled}"
-        );
-        if !self.has_approved_action(request, "workflow_schedule", &target_ref) {
-            return Err(ToolError::Denied {
-                message: "Workflow scheduling requires approval".to_owned(),
-                detail: json!({
-                    "action_type": "workflow_schedule",
-                    "target_ref": target_ref,
-                    "rationale": format!(
-                        "Task '{}' wants to schedule workflow '{}' with cron '{}'.",
-                        task.objective, workflow.workflow_id, cron_expr
-                    ),
-                }),
-            });
-        }
         let next_run_at = automation::next_run_after(
             cron_expr,
             &beaverki_core::now_rfc3339(),
@@ -4981,7 +4965,7 @@ fn tool_definitions(tools: &ToolRegistry) -> Vec<ToolDefinition> {
     });
     definitions.push(ToolDefinition {
         name: "workflow_schedule".to_owned(),
-        description: "Create or update a recurring schedule for an active reviewed workflow after user approval. `cron_expr` accepts standard 5-field cron by default, also accepts 6- or 7-field cron with leading seconds, and may include a leading `TZ=Area/City` or `CRON_TZ=Area/City` timezone hint such as `TZ=Europe/Vienna 0 7 * * *`.".to_owned(),
+        description: "Create or update a recurring schedule for an active reviewed workflow. Prior workflow review plus activation is the approval boundary. `cron_expr` accepts standard 5-field cron by default, also accepts 6- or 7-field cron with leading seconds, and may include a leading `TZ=Area/City` or `CRON_TZ=Area/City` timezone hint such as `TZ=Europe/Vienna 0 7 * * *`.".to_owned(),
         input_schema: json!({
             "type": "object",
             "properties": {
@@ -5104,8 +5088,8 @@ Current role set: {roles}.
 Use tools when needed, but keep the task focused and auditable.
 Only low-risk read-only shell commands are allowed by default. Medium/high/critical shell commands require user approval.
 For exploring allowed roots and locating files, prefer filesystem_list, filesystem_read_text, and filesystem_search over shell_exec.
-Use Lua tools when recurring or structured automation materially helps. Writing a Lua script triggers safety review. New scripts require explicit activation later, while rewrites of already active scripts stay active if the new version passes safety review. Scheduling requires user approval. When writing Lua, prefer `return function(ctx) ... end`, use BeaverKI host APIs such as `ctx.log_info`, `ctx.notify_user`, `ctx.task_defer`, `ctx.memory_read`, `ctx.memory_write`, and `ctx.tool_call`, and avoid legacy globals like `run()`, `log()`, or `notify()`.
-Use workflow tools for staged recurring automation. Reuse the same workflow_id when revising a workflow so BeaverKI creates a new workflow version instead of inventing unrelated workflows. Safety-approved workflows can be activated directly; scheduling still requires user approval.
+Use Lua tools when recurring or structured automation materially helps. Writing a Lua script triggers safety review. New scripts require explicit activation later, while rewrites of already active scripts stay active if the new version passes safety review. Scheduling standalone Lua automations requires user approval. When writing Lua, prefer `return function(ctx) ... end`, use BeaverKI host APIs such as `ctx.log_info`, `ctx.notify_user`, `ctx.task_defer`, `ctx.memory_read`, `ctx.memory_write`, and `ctx.tool_call`, and avoid legacy globals like `run()`, `log()`, or `notify()`.
+Use workflow tools for staged recurring automation. Reuse the same workflow_id when revising a workflow so BeaverKI creates a new workflow version instead of inventing unrelated workflows. Safety-approved workflows can be activated directly, and once active they can be scheduled without an extra approval step.
 When a user is building or debugging a workflow, inspect existing state before proposing changes: use workflow_get for the current definition, workflow_run_list to see recent runs, and workflow_run_get to inspect persisted artifacts, final results, retry state, and block reasons for a specific run.
 If a workflow run failed or blocked, prefer reading the run state and artifacts first, then revise the workflow with workflow_write using the same workflow_id, and only then suggest activation, replay, or rescheduling as needed.
 Never claim a workflow was created, revised, activated, scheduled, replayed, or successfully completed unless the corresponding workflow tool returned success in this task.
@@ -6631,37 +6615,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn workflow_schedule_pauses_for_approval_and_resumes() {
+    async fn workflow_schedule_completes_without_extra_approval() {
         let provider = FakeProvider::new(vec![
             ModelTurnResponse {
                 output_items: vec![json!({
                     "type": "function_call",
-                    "call_id": "call_workflow_schedule_wait",
+                    "call_id": "call_workflow_schedule",
                     "name": "workflow_schedule",
                     "arguments": "{\"workflow_id\":\"workflow_sched\",\"schedule_id\":\"sched_workflow_agent_test\",\"cron_expr\":\"TZ=Europe/Vienna 0 7 * * *\",\"enabled\":true}"
                 })],
                 tool_calls: vec![beaverki_models::ModelToolCall {
-                    call_id: "call_workflow_schedule_wait".to_owned(),
-                    name: "workflow_schedule".to_owned(),
-                    arguments: json!({
-                        "workflow_id": "workflow_sched",
-                        "schedule_id": "sched_workflow_agent_test",
-                        "cron_expr": "TZ=Europe/Vienna 0 7 * * *",
-                        "enabled": true
-                    }),
-                }],
-                output_text: String::new(),
-                usage: None,
-            },
-            ModelTurnResponse {
-                output_items: vec![json!({
-                    "type": "function_call",
-                    "call_id": "call_workflow_schedule_ok",
-                    "name": "workflow_schedule",
-                    "arguments": "{\"workflow_id\":\"workflow_sched\",\"schedule_id\":\"sched_workflow_agent_test\",\"cron_expr\":\"TZ=Europe/Vienna 0 7 * * *\",\"enabled\":true}"
-                })],
-                tool_calls: vec![beaverki_models::ModelToolCall {
-                    call_id: "call_workflow_schedule_ok".to_owned(),
+                    call_id: "call_workflow_schedule".to_owned(),
                     name: "workflow_schedule".to_owned(),
                     arguments: json!({
                         "workflow_id": "workflow_sched",
@@ -6714,7 +6678,7 @@ mod tests {
         .await
         .expect("workflow");
 
-        let first = runner
+        let result = runner
             .run_task(AgentRequest {
                 owner_user_id: default_user.user_id.clone(),
                 initiating_identity_id: format!("cli:{}", default_user.user_id),
@@ -6732,55 +6696,8 @@ mod tests {
                 approved_automation_actions: Vec::new(),
             })
             .await
-            .expect("first run");
-        assert_eq!(first.task.state, TaskState::WaitingApproval.as_str());
-
-        let approval = db
-            .list_approvals_for_user(&default_user.user_id, Some("pending"))
-            .await
-            .expect("approvals")
-            .into_iter()
-            .next()
-            .expect("approval");
-        assert_eq!(approval.action_type, "workflow_schedule");
-        db.resolve_approval(&approval.approval_id, "approved")
-            .await
-            .expect("approve");
-        let resumed_task = db
-            .fetch_task_for_owner(&default_user.user_id, &first.task.task_id)
-            .await
-            .expect("fetch task")
-            .expect("task");
-
-        let resumed = runner
-            .resume_task(
-                resumed_task,
-                AgentRequest {
-                    owner_user_id: default_user.user_id.clone(),
-                    initiating_identity_id: format!("cli:{}", default_user.user_id),
-                    primary_agent_id: default_user.primary_agent_id.clone().expect("agent"),
-                    assigned_agent_id: default_user.primary_agent_id.clone().expect("agent"),
-                    role_ids: roles.clone(),
-                    objective: "Schedule a workflow".to_owned(),
-                    scope: MemoryScope::Private,
-                    kind: "interactive".to_owned(),
-                    parent_task_id: None,
-                    task_context: None,
-                    visible_scopes: visible_memory_scopes(&roles),
-                    memory_mode: AgentMemoryMode::ScopedRetrieval,
-                    approved_shell_commands: Vec::new(),
-                    approved_automation_actions: approved_actions_for_task(
-                        &db,
-                        &default_user.user_id,
-                        &first.task.task_id,
-                    )
-                    .await,
-                },
-            )
-            .await
-            .expect("resume");
-
-        assert_eq!(resumed.task.state, TaskState::Completed.as_str());
+            .expect("run");
+        assert_eq!(result.task.state, TaskState::Completed.as_str());
         let schedule = db
             .fetch_schedule_for_owner(&default_user.user_id, "sched_workflow_agent_test")
             .await
@@ -6788,6 +6705,11 @@ mod tests {
             .expect("schedule");
         assert_eq!(schedule.target_type, "workflow");
         assert_eq!(schedule.target_id, "workflow_sched");
+        assert!(db
+            .list_approvals_for_user(&default_user.user_id, Some("pending"))
+            .await
+            .expect("approvals")
+            .is_empty());
     }
 
     #[tokio::test]
@@ -7974,7 +7896,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn workflow_schedule_still_requires_explicit_approval() {
+    async fn workflow_schedule_allows_active_reviewed_workflows_without_explicit_approval() {
         let (db, runner) = test_runner(FakeProvider::new(vec![])).await;
         let default_user = db.default_user().await.expect("default").expect("user");
         let roles = db
@@ -8022,7 +7944,7 @@ mod tests {
         .await
         .expect("workflow");
 
-        let error = runner
+        let output = runner
             .handle_workflow_schedule(
                 &task,
                 &test_request(&default_user, &roles, "Schedule a workflow", Vec::new()),
@@ -8034,12 +7956,16 @@ mod tests {
                 }),
             )
             .await
-            .expect_err("schedule should still require approval");
+            .expect("schedule should succeed without approval");
 
-        let ToolError::Denied { detail, .. } = error else {
-            panic!("expected ToolError::Denied");
-        };
-        assert_eq!(detail["action_type"], json!("workflow_schedule"));
+        assert_eq!(output.payload["schedule_id"], json!("sched_workflow_schedule_gate"));
+        assert_eq!(output.payload["workflow_id"], json!("workflow_schedule_gate"));
+        assert_eq!(output.payload["enabled"], json!(true));
+        let approvals = db
+            .list_approvals_for_user(&default_user.user_id, Some("pending"))
+            .await
+            .expect("approvals");
+        assert!(approvals.is_empty());
     }
 
     #[test]
