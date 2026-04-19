@@ -150,6 +150,67 @@ cargo run -p beaverki-cli -- approval deny --approval-id <approval-id>
 
 Approvals are especially relevant for generated shell actions that exceed the allowed risk threshold.
 
+## Workflow Pipelines
+
+For the durable workflow model, stage semantics, and the agent-side workflow authoring tool surface, see [Workflow Pipelines](workflow-pipelines.md).
+
+Example workflow definition:
+
+```text
+docs/examples/morning-news-digest-workflow.json
+```
+
+Create a workflow definition from JSON:
+
+```bash
+cargo run -p beaverki-cli -- automation workflow create \
+  --definition-file docs/examples/morning-news-digest-workflow.json \
+  --summary "Fetch news, summarize it, hand it to an agent, and notify the owner."
+```
+
+Re-run the same command with the same `--workflow-id` to create a new workflow version and replace the current editable definition:
+
+```bash
+cargo run -p beaverki-cli -- automation workflow create \
+  --workflow-id morning_digest \
+  --definition-file /tmp/revised-workflow.json \
+  --summary "Revise the workflow after a failed run."
+```
+
+List and inspect workflows:
+
+```bash
+cargo run -p beaverki-cli -- automation workflow list
+cargo run -p beaverki-cli -- automation workflow show --workflow-id <workflow-id>
+```
+
+Review, activate, and replay a workflow:
+
+```bash
+cargo run -p beaverki-cli -- automation workflow review \
+  --workflow-id <workflow-id> \
+  --summary "Re-run workflow review after editing referenced artifacts."
+
+cargo run -p beaverki-cli -- automation workflow activate --workflow-id <workflow-id>
+cargo run -p beaverki-cli -- automation workflow replay --workflow-id <workflow-id>
+```
+
+Schedule a workflow instead of a single Lua script:
+
+```bash
+cargo run -p beaverki-cli -- automation schedule add \
+  --workflow-id <workflow-id> \
+  --schedule-id morning_digest \
+  --cron "0 8 * * *"
+```
+
+The schedule command now accepts exactly one of:
+
+- `--script-id`
+- `--workflow-id`
+
+Cron input accepts standard 5-field expressions such as `0 7 * * *`. It also accepts 6- or 7-field variants with a leading seconds field, and an optional leading timezone hint such as `TZ=Europe/Vienna 0 7 * * *` or `CRON_TZ=Europe/Vienna 0 7 * * *`.
+
 ## Memory Inspection
 
 List memories:

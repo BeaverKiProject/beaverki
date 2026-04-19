@@ -8,15 +8,17 @@ use async_trait::async_trait;
 use beaverki_automation as automation;
 use beaverki_core::{MemoryKind, MemoryScope, ShellRisk, TaskState, ToolInvocationStatus};
 use beaverki_db::{
-    Database, LuaToolRow, MemoryRow, NewApproval, NewLuaTool, NewLuaToolReview, NewSchedule,
-    NewScript, NewScriptReview, NewTask, TaskRow, UpdateLuaTool, UpdateScript, UserRow,
+    ConnectorIdentityRow, Database, HouseholdDeliveryRow, LuaToolRow, MemoryRow, NewApproval,
+    NewHouseholdDelivery, NewLuaTool, NewLuaToolReview, NewSchedule, NewScript, NewScriptReview,
+    NewTask, NewWorkflowDefinition, NewWorkflowReview, NewWorkflowStage, TaskRow, UpdateLuaTool,
+    UpdateScript, UserRow, WorkflowDefinitionRow, WorkflowStageRow,
 };
 use beaverki_memory::{
     MemoryStore, RetrievalScope, SemanticMemoryRecord, SemanticMemoryWriteResult,
 };
 use beaverki_models::{ConversationItem, ModelProvider};
 use beaverki_policy::{
-    can_request_automation_approval, can_request_shell_approval,
+    can_request_automation_approval, can_request_shell_approval, can_schedule_household_delivery,
     can_send_household_direct_delivery, can_spawn_subagents, can_write_household_memory,
     visible_memory_scopes,
 };
@@ -25,6 +27,7 @@ use beaverki_tools::{
     validate_json_schema_contract, validate_json_value_against_schema,
     validate_openai_tool_definitions,
 };
+use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing::{info, warn};
@@ -110,6 +113,12 @@ enum ToolFailureDisposition {
 pub struct ApprovedAutomationAction {
     pub action_type: String,
     pub target_ref: String,
+}
+
+#[derive(Debug, Clone)]
+enum ScheduledDeliveryMode {
+    OneShot { deliver_at: String },
+    Recurring { cron_expr: String, enabled: bool },
 }
 
 #[derive(Debug, Clone)]
@@ -729,7 +738,10 @@ impl PrimaryAgentRunner {
 
         if matches!(
             tool_name,
-            "lua_script_activate" | "lua_script_schedule" | "lua_tool_activate"
+            "lua_script_activate"
+                | "lua_script_schedule"
+                | "lua_tool_activate"
+                | "household_schedule_message"
         ) && let ToolError::Denied { detail, .. } = &error
             && let Some(action_type) = detail.get("action_type").and_then(Value::as_str)
             && let Some(target_ref) = detail.get("target_ref").and_then(Value::as_str)
@@ -880,6 +892,18 @@ impl PrimaryAgentRunner {
                 self.handle_household_send_message(task, request, arguments)
                     .await
             }
+            "household_schedule_message" => {
+                self.handle_household_schedule_message(task, request, arguments)
+                    .await
+            }
+            "household_schedule_list" => self.handle_household_schedule_list(request).await,
+            "household_schedule_get" => {
+                self.handle_household_schedule_get(request, arguments).await
+            }
+            "household_schedule_cancel" => {
+                self.handle_household_schedule_cancel(task, request, arguments)
+                    .await
+            }
             "lua_script_list"
             | "lua_script_get"
             | "lua_script_write"
@@ -889,7 +913,15 @@ impl PrimaryAgentRunner {
             | "lua_tool_list"
             | "lua_tool_get"
             | "lua_tool_write"
-            | "lua_tool_activate" => {
+            | "lua_tool_activate"
+            | "workflow_list"
+            | "workflow_get"
+            | "workflow_write"
+            | "workflow_activate"
+            | "workflow_schedule"
+            | "workflow_replay"
+            | "workflow_run_list"
+            | "workflow_run_get" => {
                 self.handle_lua_tool_call(task, request, tool_name, arguments, tool_context)
                     .await
             }
@@ -945,6 +977,18 @@ impl PrimaryAgentRunner {
                 self.handle_lua_tool_activate(task, request, arguments)
                     .await
             }
+            "workflow_list" => self.handle_workflow_list(request).await,
+            "workflow_get" => self.handle_workflow_get(request, arguments).await,
+            "workflow_write" => self.handle_workflow_write(task, request, arguments).await,
+            "workflow_activate" => {
+                self.handle_workflow_activate(task, request, arguments).await
+            }
+            "workflow_schedule" => {
+                self.handle_workflow_schedule(task, request, arguments).await
+            }
+            "workflow_replay" => self.handle_workflow_replay(task, request, arguments).await,
+            "workflow_run_list" => self.handle_workflow_run_list(request, arguments).await,
+            "workflow_run_get" => self.handle_workflow_run_get(request, arguments).await,
             _ => Err(ToolError::Failed(anyhow!("unknown Lua tool: {tool_name}"))),
         }
     }
@@ -1086,6 +1130,701 @@ impl PrimaryAgentRunner {
                 "message": message_text,
             }),
         })
+    }
+
+    async fn handle_household_schedule_message(
+        &self,
+        task: &TaskRow,
+        request: &AgentRequest,
+        arguments: Value,
+    ) -> std::result::Result<ToolOutput, ToolError> {
+        let delivery_id = optional_string_arg(&arguments, "delivery_id");
+        let recipient_query =
+            required_string_arg(&arguments, "recipient", "household_schedule_message")?;
+        let message_text =
+            required_string_arg(&arguments, "message", "household_schedule_message")?;
+        let deliver_at = optional_string_arg(&arguments, "deliver_at");
+        let cron_expr = optional_string_arg(&arguments, "cron_expr");
+        let window_start_at = optional_string_arg(&arguments, "window_start_at");
+        let window_end_at = optional_string_arg(&arguments, "window_end_at");
+        let enabled = arguments
+            .get("enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+
+        if !can_schedule_household_delivery(&request.role_ids) {
+            self.record_household_delivery_schedule_denial(
+                task,
+                request,
+                delivery_id,
+                recipient_query,
+                Some(message_text),
+                "sender_not_allowed",
+                json!({
+                    "role_ids": request.role_ids,
+                }),
+            )
+            .await?;
+            return Err(ToolError::Denied {
+                message: "the current user is not allowed to schedule household delivery"
+                    .to_owned(),
+                detail: json!({
+                    "recipient": recipient_query,
+                }),
+            });
+        }
+
+        if deliver_at.is_some() == cron_expr.is_some() {
+            return Err(ToolError::Failed(anyhow!(
+                "household_schedule_message requires exactly one of deliver_at or cron_expr"
+            )));
+        }
+        if deliver_at.is_some() && !enabled {
+            return Err(ToolError::Failed(anyhow!(
+                "one-shot scheduled delivery cannot be created disabled"
+            )));
+        }
+
+        let normalized_deliver_at = deliver_at
+            .map(|value| normalize_rfc3339_timestamp(value, "deliver_at"))
+            .transpose()
+            .map_err(ToolError::Failed)?;
+        let normalized_window_start = window_start_at
+            .map(|value| normalize_rfc3339_timestamp(value, "window_start_at"))
+            .transpose()
+            .map_err(ToolError::Failed)?;
+        let normalized_window_end = window_end_at
+            .map(|value| normalize_rfc3339_timestamp(value, "window_end_at"))
+            .transpose()
+            .map_err(ToolError::Failed)?;
+
+        validate_scheduled_delivery_timing(
+            normalized_deliver_at.as_deref(),
+            normalized_window_start.as_deref(),
+            normalized_window_end.as_deref(),
+            cron_expr,
+            self.base_tool_context.default_timezone.as_deref(),
+        )
+        .map_err(ToolError::Failed)?;
+
+        let recipient = match self
+            .resolve_household_delivery_recipient(&request.owner_user_id, recipient_query)
+            .await
+        {
+            Ok(recipient) => recipient,
+            Err(error) => {
+                self.record_household_delivery_schedule_denial(
+                    task,
+                    request,
+                    delivery_id,
+                    recipient_query,
+                    Some(message_text),
+                    "recipient_resolution_failed",
+                    json!({
+                        "error": error.to_string(),
+                    }),
+                )
+                .await?;
+                return Err(ToolError::Denied {
+                    message: error.to_string(),
+                    detail: json!({
+                        "recipient": recipient_query,
+                    }),
+                });
+            }
+        };
+
+        let route = self
+            .resolve_household_delivery_route(&recipient.user_id)
+            .await?;
+        let mode = if let Some(cron_expr) = cron_expr {
+            ScheduledDeliveryMode::Recurring {
+                cron_expr: cron_expr.to_owned(),
+                enabled,
+            }
+        } else {
+            ScheduledDeliveryMode::OneShot {
+                deliver_at: normalized_deliver_at
+                    .clone()
+                    .expect("validated deliver_at for one-shot"),
+            }
+        };
+        let approval_target_ref = scheduled_delivery_approval_target(
+            delivery_id,
+            &recipient.user_id,
+            message_text,
+            &mode,
+            normalized_window_start.as_deref(),
+            normalized_window_end.as_deref(),
+        );
+        if !self.has_approved_action(request, "household_delivery_schedule", &approval_target_ref) {
+            let rationale = if delivery_id.is_some() {
+                format!(
+                    "Task '{}' wants to update scheduled household delivery for '{}' with target {}.",
+                    task.objective,
+                    recipient.display_name,
+                    scheduled_delivery_rationale_target(&mode)
+                )
+            } else {
+                format!(
+                    "Task '{}' wants to schedule a household delivery for '{}' with target {}.",
+                    task.objective,
+                    recipient.display_name,
+                    scheduled_delivery_rationale_target(&mode)
+                )
+            };
+            return Err(ToolError::Denied {
+                message: "scheduled household delivery requires approval".to_owned(),
+                detail: json!({
+                    "action_type": "household_delivery_schedule",
+                    "target_ref": approval_target_ref,
+                    "rationale": rationale,
+                }),
+            });
+        }
+
+        let mut delivery = if let Some(delivery_id) = delivery_id {
+            let existing = self
+                .db
+                .fetch_scheduled_household_delivery_for_requester(
+                    &request.owner_user_id,
+                    delivery_id,
+                )
+                .await
+                .map_err(ToolError::Failed)?
+                .ok_or_else(|| {
+                    ToolError::Failed(anyhow!(
+                        "scheduled household delivery '{}' not found",
+                        delivery_id
+                    ))
+                })?;
+            if matches!(existing.status.as_str(), "sent" | "failed" | "canceled") {
+                return Err(ToolError::Failed(anyhow!(
+                    "scheduled household delivery '{}' is already {}",
+                    delivery_id,
+                    existing.status
+                )));
+            }
+            self.update_scheduled_household_delivery(
+                &existing,
+                task,
+                request,
+                &recipient,
+                message_text,
+                &route,
+                &mode,
+                normalized_window_start.as_deref(),
+                normalized_window_end.as_deref(),
+            )
+            .await?
+        } else {
+            self.create_scheduled_household_delivery(
+                task,
+                request,
+                &recipient,
+                message_text,
+                &route,
+                &mode,
+                normalized_window_start.as_deref(),
+                normalized_window_end.as_deref(),
+            )
+            .await?
+        };
+
+        self.db
+            .record_audit_event(
+                "agent",
+                &request.assigned_agent_id,
+                "household_delivery_scheduled",
+                json!({
+                    "task_id": task.task_id,
+                    "delivery_id": delivery.delivery_id,
+                    "schedule_id": delivery.schedule_id,
+                    "recipient_user_id": delivery.recipient_user_id,
+                    "delivery_mode": delivery.delivery_mode,
+                    "scheduled_for_at": delivery.scheduled_for_at,
+                    "recurrence_rule": delivery.recurrence_rule,
+                }),
+            )
+            .await
+            .map_err(ToolError::Failed)?;
+
+        delivery = self
+            .db
+            .fetch_household_delivery(&delivery.delivery_id)
+            .await
+            .map_err(ToolError::Failed)?
+            .ok_or_else(|| {
+                ToolError::Failed(anyhow!("scheduled household delivery disappeared"))
+            })?;
+
+        Ok(ToolOutput {
+            payload: self
+                .scheduled_household_delivery_payload(&delivery)
+                .await
+                .map_err(ToolError::Failed)?,
+        })
+    }
+
+    async fn handle_household_schedule_list(
+        &self,
+        request: &AgentRequest,
+    ) -> std::result::Result<ToolOutput, ToolError> {
+        let deliveries = self
+            .db
+            .list_scheduled_household_deliveries_for_requester(&request.owner_user_id)
+            .await
+            .map_err(ToolError::Failed)?;
+        let mut items = Vec::with_capacity(deliveries.len());
+        for delivery in deliveries {
+            items.push(
+                self.scheduled_household_delivery_payload(&delivery)
+                    .await
+                    .map_err(ToolError::Failed)?,
+            );
+        }
+        Ok(ToolOutput {
+            payload: json!({ "items": items }),
+        })
+    }
+
+    async fn handle_household_schedule_get(
+        &self,
+        request: &AgentRequest,
+        arguments: Value,
+    ) -> std::result::Result<ToolOutput, ToolError> {
+        let delivery_id = required_string_arg(&arguments, "delivery_id", "household_schedule_get")?;
+        let delivery = self
+            .db
+            .fetch_scheduled_household_delivery_for_requester(&request.owner_user_id, delivery_id)
+            .await
+            .map_err(ToolError::Failed)?
+            .ok_or_else(|| {
+                ToolError::Failed(anyhow!(
+                    "scheduled household delivery '{}' not found",
+                    delivery_id
+                ))
+            })?;
+        Ok(ToolOutput {
+            payload: self
+                .scheduled_household_delivery_payload(&delivery)
+                .await
+                .map_err(ToolError::Failed)?,
+        })
+    }
+
+    async fn handle_household_schedule_cancel(
+        &self,
+        task: &TaskRow,
+        request: &AgentRequest,
+        arguments: Value,
+    ) -> std::result::Result<ToolOutput, ToolError> {
+        let delivery_id =
+            required_string_arg(&arguments, "delivery_id", "household_schedule_cancel")?;
+        let delivery = self
+            .db
+            .fetch_scheduled_household_delivery_for_requester(&request.owner_user_id, delivery_id)
+            .await
+            .map_err(ToolError::Failed)?
+            .ok_or_else(|| {
+                ToolError::Failed(anyhow!(
+                    "scheduled household delivery '{}' not found",
+                    delivery_id
+                ))
+            })?;
+        if matches!(delivery.status.as_str(), "sent" | "failed" | "canceled") {
+            return Err(ToolError::Failed(anyhow!(
+                "scheduled household delivery '{}' is already {}",
+                delivery_id,
+                delivery.status
+            )));
+        }
+
+        if let Some(schedule_id) = delivery.schedule_id.as_deref() {
+            let schedule = self
+                .db
+                .fetch_schedule_for_owner(&request.owner_user_id, schedule_id)
+                .await
+                .map_err(ToolError::Failed)?
+                .ok_or_else(|| {
+                    ToolError::Failed(anyhow!("schedule '{}' not found", schedule_id))
+                })?;
+            self.db
+                .update_schedule_state(
+                    &schedule.schedule_id,
+                    false,
+                    &schedule.next_run_at,
+                    schedule.last_run_at.as_deref(),
+                )
+                .await
+                .map_err(ToolError::Failed)?;
+        }
+
+        self.db
+            .cancel_household_delivery(&delivery.delivery_id, "canceled_by_requester")
+            .await
+            .map_err(ToolError::Failed)?;
+        self.db
+            .record_audit_event(
+                "agent",
+                &request.assigned_agent_id,
+                "household_delivery_schedule_canceled",
+                json!({
+                    "task_id": task.task_id,
+                    "delivery_id": delivery.delivery_id,
+                    "schedule_id": delivery.schedule_id,
+                }),
+            )
+            .await
+            .map_err(ToolError::Failed)?;
+
+        let updated = self
+            .db
+            .fetch_household_delivery(&delivery.delivery_id)
+            .await
+            .map_err(ToolError::Failed)?
+            .ok_or_else(|| {
+                ToolError::Failed(anyhow!("scheduled household delivery disappeared"))
+            })?;
+        Ok(ToolOutput {
+            payload: self
+                .scheduled_household_delivery_payload(&updated)
+                .await
+                .map_err(ToolError::Failed)?,
+        })
+    }
+
+    async fn create_scheduled_household_delivery(
+        &self,
+        task: &TaskRow,
+        request: &AgentRequest,
+        recipient: &UserRow,
+        message_text: &str,
+        route: &ConnectorIdentityRow,
+        mode: &ScheduledDeliveryMode,
+        window_start_at: Option<&str>,
+        window_end_at: Option<&str>,
+    ) -> std::result::Result<HouseholdDeliveryRow, ToolError> {
+        let (delivery_mode, scheduled_for_at, recurrence_rule, scheduled_job_state) = match mode {
+            ScheduledDeliveryMode::OneShot { deliver_at } => (
+                "scheduled_once",
+                Some(deliver_at.as_str()),
+                None,
+                Some("scheduled"),
+            ),
+            ScheduledDeliveryMode::Recurring { cron_expr, enabled } => (
+                "scheduled_recurring",
+                None,
+                Some(cron_expr.as_str()),
+                Some(if *enabled { "scheduled" } else { "disabled" }),
+            ),
+        };
+        let dedupe_key = scheduled_delivery_dedupe_key(
+            &task.task_id,
+            &recipient.user_id,
+            message_text,
+            mode,
+            window_start_at,
+            window_end_at,
+        );
+        let delivery = self
+            .db
+            .create_or_reuse_household_delivery(NewHouseholdDelivery {
+                task_id: &task.task_id,
+                requester_user_id: &request.owner_user_id,
+                requester_identity_id: &request.initiating_identity_id,
+                recipient_user_id: &recipient.user_id,
+                message_text,
+                delivery_mode,
+                connector_type: &route.connector_type,
+                connector_identity_id: &route.identity_id,
+                target_ref: &route.external_user_id,
+                fallback_target_ref: route.external_channel_id.as_deref(),
+                dedupe_key: &dedupe_key,
+                initial_status: "scheduled",
+                parent_delivery_id: None,
+                schedule_id: None,
+                scheduled_for_at,
+                window_starts_at: window_start_at,
+                window_ends_at: window_end_at,
+                recurrence_rule,
+                scheduled_job_state,
+                materialized_task_id: None,
+            })
+            .await
+            .map_err(ToolError::Failed)?;
+
+        if let ScheduledDeliveryMode::Recurring { cron_expr, enabled } = mode {
+            let next_run_at = if *enabled {
+                automation::next_run_after(
+                    cron_expr,
+                    &beaverki_core::now_rfc3339(),
+                    self.base_tool_context.default_timezone.as_deref(),
+                )
+                    .map_err(ToolError::Failed)?
+            } else {
+                beaverki_core::now_rfc3339()
+            };
+            let schedule = self
+                .db
+                .create_schedule(NewSchedule {
+                    schedule_id: None,
+                    owner_user_id: &request.owner_user_id,
+                    target_type: "household_delivery",
+                    target_id: &delivery.delivery_id,
+                    cron_expr,
+                    enabled: *enabled,
+                    next_run_at: &next_run_at,
+                })
+                .await
+                .map_err(ToolError::Failed)?;
+            self.db
+                .update_household_delivery_schedule(
+                    &delivery.delivery_id,
+                    &recipient.user_id,
+                    message_text,
+                    &route.connector_type,
+                    &route.identity_id,
+                    &route.external_user_id,
+                    route.external_channel_id.as_deref(),
+                    Some(&schedule.schedule_id),
+                    None,
+                    window_start_at,
+                    window_end_at,
+                    Some(cron_expr),
+                    if *enabled { "scheduled" } else { "disabled" },
+                )
+                .await
+                .map_err(ToolError::Failed)?;
+        } else {
+            let ScheduledDeliveryMode::OneShot { deliver_at } = mode else {
+                unreachable!();
+            };
+            let task_context = json!({
+                "delivery_id": delivery.delivery_id,
+            })
+            .to_string();
+            let scheduled_task = self
+                .db
+                .create_task_with_params(NewTask {
+                    owner_user_id: &request.owner_user_id,
+                    initiating_identity_id: &request.initiating_identity_id,
+                    primary_agent_id: &request.primary_agent_id,
+                    assigned_agent_id: &request.assigned_agent_id,
+                    parent_task_id: Some(&task.task_id),
+                    session_id: task.session_id.as_deref(),
+                    kind: "scheduled_household_delivery",
+                    objective: &format!(
+                        "Deliver scheduled household message to {}",
+                        recipient.display_name
+                    ),
+                    context_summary: Some(&task_context),
+                    scope: request.scope,
+                    wake_at: Some(deliver_at),
+                })
+                .await
+                .map_err(ToolError::Failed)?;
+            self.db
+                .mark_household_delivery_materialized(
+                    &delivery.delivery_id,
+                    &scheduled_task.task_id,
+                )
+                .await
+                .map_err(ToolError::Failed)?;
+        }
+
+        self.db
+            .fetch_household_delivery(&delivery.delivery_id)
+            .await
+            .map_err(ToolError::Failed)?
+            .ok_or_else(|| ToolError::Failed(anyhow!("scheduled household delivery missing")))
+    }
+
+    async fn update_scheduled_household_delivery(
+        &self,
+        delivery: &HouseholdDeliveryRow,
+        task: &TaskRow,
+        request: &AgentRequest,
+        recipient: &UserRow,
+        message_text: &str,
+        route: &ConnectorIdentityRow,
+        mode: &ScheduledDeliveryMode,
+        window_start_at: Option<&str>,
+        window_end_at: Option<&str>,
+    ) -> std::result::Result<HouseholdDeliveryRow, ToolError> {
+        match mode {
+            ScheduledDeliveryMode::Recurring { cron_expr, enabled } => {
+                let Some(schedule_id) = delivery.schedule_id.as_deref() else {
+                    return Err(ToolError::Failed(anyhow!(
+                        "changing a one-shot reminder into a recurring schedule is not supported"
+                    )));
+                };
+                let next_run_at = if *enabled {
+                    automation::next_run_after(
+                        cron_expr,
+                        &beaverki_core::now_rfc3339(),
+                        self.base_tool_context.default_timezone.as_deref(),
+                    )
+                        .map_err(ToolError::Failed)?
+                } else {
+                    let schedule = self
+                        .db
+                        .fetch_schedule_for_owner(&request.owner_user_id, schedule_id)
+                        .await
+                        .map_err(ToolError::Failed)?
+                        .ok_or_else(|| {
+                            ToolError::Failed(anyhow!("schedule '{}' not found", schedule_id))
+                        })?;
+                    schedule.next_run_at
+                };
+                self.db
+                    .upsert_schedule(NewSchedule {
+                        schedule_id: Some(schedule_id),
+                        owner_user_id: &request.owner_user_id,
+                        target_type: "household_delivery",
+                        target_id: &delivery.delivery_id,
+                        cron_expr,
+                        enabled: *enabled,
+                        next_run_at: &next_run_at,
+                    })
+                    .await
+                    .map_err(ToolError::Failed)?;
+                self.db
+                    .update_household_delivery_schedule(
+                        &delivery.delivery_id,
+                        &recipient.user_id,
+                        message_text,
+                        &route.connector_type,
+                        &route.identity_id,
+                        &route.external_user_id,
+                        route.external_channel_id.as_deref(),
+                        Some(schedule_id),
+                        None,
+                        window_start_at,
+                        window_end_at,
+                        Some(cron_expr),
+                        if *enabled { "scheduled" } else { "disabled" },
+                    )
+                    .await
+                    .map_err(ToolError::Failed)?;
+            }
+            ScheduledDeliveryMode::OneShot { deliver_at } => {
+                if delivery.schedule_id.is_some() {
+                    return Err(ToolError::Failed(anyhow!(
+                        "changing a recurring household schedule into a one-shot reminder is not supported"
+                    )));
+                }
+                let Some(materialized_task_id) = delivery.materialized_task_id.as_deref() else {
+                    return Err(ToolError::Failed(anyhow!(
+                        "scheduled reminder '{}' is missing its wake-up task",
+                        delivery.delivery_id
+                    )));
+                };
+                self.db
+                    .update_task_wake_at(materialized_task_id, Some(deliver_at))
+                    .await
+                    .map_err(ToolError::Failed)?;
+                self.db
+                    .update_household_delivery_schedule(
+                        &delivery.delivery_id,
+                        &recipient.user_id,
+                        message_text,
+                        &route.connector_type,
+                        &route.identity_id,
+                        &route.external_user_id,
+                        route.external_channel_id.as_deref(),
+                        None,
+                        Some(deliver_at),
+                        window_start_at,
+                        window_end_at,
+                        None,
+                        "scheduled",
+                    )
+                    .await
+                    .map_err(ToolError::Failed)?;
+            }
+        }
+
+        self.db
+            .append_task_event(
+                &task.task_id,
+                "household_delivery_schedule_updated",
+                "agent",
+                &request.assigned_agent_id,
+                json!({
+                    "delivery_id": delivery.delivery_id,
+                    "recipient_user_id": recipient.user_id,
+                }),
+            )
+            .await
+            .map_err(ToolError::Failed)?;
+
+        self.db
+            .fetch_household_delivery(&delivery.delivery_id)
+            .await
+            .map_err(ToolError::Failed)?
+            .ok_or_else(|| ToolError::Failed(anyhow!("scheduled household delivery missing")))
+    }
+
+    async fn scheduled_household_delivery_payload(
+        &self,
+        delivery: &HouseholdDeliveryRow,
+    ) -> Result<Value> {
+        let recipient = self.db.fetch_user(&delivery.recipient_user_id).await?;
+        let next_run_at = if let Some(schedule_id) = delivery.schedule_id.as_deref() {
+            self.db
+                .fetch_schedule(schedule_id)
+                .await?
+                .map(|schedule| schedule.next_run_at)
+        } else {
+            delivery.scheduled_for_at.clone()
+        };
+        Ok(json!({
+            "delivery_id": delivery.delivery_id,
+            "schedule_id": delivery.schedule_id,
+            "recipient_user_id": delivery.recipient_user_id,
+            "recipient_display_name": recipient.map(|row| row.display_name),
+            "message": delivery.message_text,
+            "delivery_mode": delivery.delivery_mode,
+            "status": delivery.status,
+            "scheduled_job_state": delivery.scheduled_job_state,
+            "scheduled_for_at": delivery.scheduled_for_at,
+            "window_start_at": delivery.window_starts_at,
+            "window_end_at": delivery.window_ends_at,
+            "recurrence_rule": delivery.recurrence_rule,
+            "next_run_at": next_run_at,
+            "materialized_task_id": delivery.materialized_task_id,
+            "delivered_at": delivery.delivered_at,
+            "completed_at": delivery.completed_at,
+            "canceled_at": delivery.canceled_at,
+            "failure_reason": delivery.failure_reason,
+        }))
+    }
+
+    async fn resolve_household_delivery_route(
+        &self,
+        recipient_user_id: &str,
+    ) -> std::result::Result<ConnectorIdentityRow, ToolError> {
+        let identities = self
+            .db
+            .list_connector_identities_for_mapped_user(recipient_user_id)
+            .await
+            .map_err(ToolError::Failed)?;
+        let Some(identity) = identities
+            .into_iter()
+            .find(|identity| identity.connector_type == "discord")
+        else {
+            return Err(ToolError::Denied {
+                message: format!(
+                    "recipient '{}' does not have a mapped delivery route",
+                    recipient_user_id
+                ),
+                detail: json!({
+                    "recipient_user_id": recipient_user_id,
+                }),
+            });
+        };
+        Ok(identity)
     }
 
     async fn handle_memory_read(
@@ -1940,8 +2679,12 @@ impl PrimaryAgentRunner {
             });
         }
 
-        let next_run_at = automation::next_run_after(cron_expr, &beaverki_core::now_rfc3339())
-            .map_err(ToolError::Failed)?;
+        let next_run_at = automation::next_run_after(
+            cron_expr,
+            &beaverki_core::now_rfc3339(),
+            self.base_tool_context.default_timezone.as_deref(),
+        )
+        .map_err(ToolError::Failed)?;
         let schedule = self
             .db
             .upsert_schedule(NewSchedule {
@@ -2283,6 +3026,565 @@ impl PrimaryAgentRunner {
                 "tool_id": tool.tool_id,
                 "status": "active",
             }),
+        })
+    }
+
+    async fn handle_workflow_list(
+        &self,
+        request: &AgentRequest,
+    ) -> std::result::Result<ToolOutput, ToolError> {
+        let workflows = self
+            .db
+            .list_workflow_definitions_for_owner(&request.owner_user_id)
+            .await
+            .map_err(ToolError::Failed)?;
+        Ok(ToolOutput {
+            payload: json!({
+                "workflows": workflows.into_iter().map(|workflow| json!({
+                    "workflow_id": workflow.workflow_id,
+                    "name": workflow.name,
+                    "description": workflow.description,
+                    "status": workflow.status,
+                    "safety_status": workflow.safety_status,
+                    "safety_summary": workflow.safety_summary,
+                    "created_from_task_id": workflow.created_from_task_id,
+                    "updated_at": workflow.updated_at,
+                })).collect::<Vec<_>>(),
+            }),
+        })
+    }
+
+    async fn handle_workflow_get(
+        &self,
+        request: &AgentRequest,
+        arguments: Value,
+    ) -> std::result::Result<ToolOutput, ToolError> {
+        let workflow_id = required_string_arg(&arguments, "workflow_id", "workflow_get")?;
+        let workflow = self
+            .db
+            .fetch_workflow_definition_for_owner(&request.owner_user_id, workflow_id)
+            .await
+            .map_err(ToolError::Failed)?
+            .ok_or_else(|| ToolError::Failed(anyhow!("workflow '{workflow_id}' not found")))?;
+        let stages = self
+            .db
+            .list_workflow_stages(&workflow.workflow_id)
+            .await
+            .map_err(ToolError::Failed)?;
+        let versions = self
+            .db
+            .list_workflow_versions(&workflow.workflow_id)
+            .await
+            .map_err(ToolError::Failed)?;
+        let reviews = self
+            .db
+            .list_workflow_reviews(&workflow.workflow_id)
+            .await
+            .map_err(ToolError::Failed)?;
+        let runs = self
+            .db
+            .list_workflow_runs_for_workflow(&workflow.workflow_id)
+            .await
+            .map_err(ToolError::Failed)?;
+        let schedules = self
+            .db
+            .list_schedules_for_owner(&request.owner_user_id)
+            .await
+            .map_err(ToolError::Failed)?
+            .into_iter()
+            .filter(|row| row.target_type == "workflow" && row.target_id == workflow.workflow_id)
+            .collect::<Vec<_>>();
+        Ok(ToolOutput {
+            payload: json!({
+                "workflow": workflow_definition_to_json(&workflow),
+                "versions": versions.into_iter().map(|version| json!({
+                    "version_id": version.version_id,
+                    "version_number": version.version_number,
+                    "name": version.name,
+                    "description": version.description,
+                    "created_from_task_id": version.created_from_task_id,
+                    "created_at": version.created_at,
+                })).collect::<Vec<_>>(),
+                "stages": stages.iter().map(workflow_stage_to_json).collect::<Result<Vec<_>, _>>().map_err(ToolError::Failed)?,
+                "reviews": reviews.into_iter().map(|review| json!({
+                    "review_id": review.review_id,
+                    "version_number": review.version_number,
+                    "verdict": review.verdict,
+                    "risk_level": review.risk_level,
+                    "findings_json": review.findings_json,
+                    "summary_text": review.summary_text,
+                    "created_at": review.created_at,
+                })).collect::<Vec<_>>(),
+                "runs": runs.into_iter().map(|run| json!({
+                    "workflow_run_id": run.workflow_run_id,
+                    "state": run.state,
+                    "current_stage_index": run.current_stage_index,
+                    "wake_at": run.wake_at,
+                    "block_reason": run.block_reason,
+                    "last_error": run.last_error,
+                    "completed_at": run.completed_at,
+                    "updated_at": run.updated_at,
+                })).collect::<Vec<_>>(),
+                "schedules": schedules.into_iter().map(|schedule| json!({
+                    "schedule_id": schedule.schedule_id,
+                    "cron_expr": schedule.cron_expr,
+                    "enabled": schedule.enabled != 0,
+                    "next_run_at": schedule.next_run_at,
+                })).collect::<Vec<_>>(),
+            }),
+        })
+    }
+
+    async fn handle_workflow_write(
+        &self,
+        task: &TaskRow,
+        request: &AgentRequest,
+        arguments: Value,
+    ) -> std::result::Result<ToolOutput, ToolError> {
+        let workflow_id = arguments
+            .get("workflow_id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+        let name = required_string_arg(&arguments, "name", "workflow_write")?;
+        let description = optional_string_arg(&arguments, "description").map(str::to_owned);
+        let intended_behavior_summary = required_string_arg(
+            &arguments,
+            "intended_behavior_summary",
+            "workflow_write",
+        )?;
+        let stages_value = arguments
+            .get("stages")
+            .cloned()
+            .ok_or_else(|| ToolError::Failed(anyhow!("workflow_write requires stages")))?;
+        let stage_inputs = workflow_stage_inputs_from_value(&stages_value).map_err(ToolError::Failed)?;
+        if stage_inputs.is_empty() {
+            return Err(ToolError::Failed(anyhow!(
+                "workflow_write requires at least one stage"
+            )));
+        }
+        let stage_rows = stage_inputs
+            .iter()
+            .map(|stage| NewWorkflowStage {
+                stage_id: None,
+                stage_kind: stage.kind.as_str(),
+                stage_label: stage.label.as_deref(),
+                artifact_ref: stage.artifact_ref.as_deref(),
+                stage_config_json: stage.config.clone(),
+            })
+            .collect::<Vec<_>>();
+        let workflow = if let Some(existing_id) = workflow_id.as_deref()
+            && self
+                .db
+                .fetch_workflow_definition_for_owner(&request.owner_user_id, existing_id)
+                .await
+                .map_err(ToolError::Failed)?
+                .is_some()
+        {
+            self.db
+                .update_workflow_definition_contents(
+                    beaverki_db::UpdateWorkflowDefinition {
+                        workflow_id: existing_id,
+                        owner_user_id: &request.owner_user_id,
+                        name,
+                        description: description.as_deref(),
+                        created_from_task_id: Some(&task.task_id),
+                        status: "draft",
+                        safety_status: "pending",
+                        safety_summary: Some("Awaiting workflow safety review."),
+                    },
+                    &stage_rows,
+                )
+                .await
+                .map_err(ToolError::Failed)?
+        } else {
+            self.db
+                .create_workflow_definition(
+                    NewWorkflowDefinition {
+                        workflow_id: workflow_id.as_deref(),
+                        owner_user_id: &request.owner_user_id,
+                        name,
+                        description: description.as_deref(),
+                        status: "draft",
+                        created_from_task_id: Some(&task.task_id),
+                        safety_status: "pending",
+                        safety_summary: Some("Awaiting workflow safety review."),
+                    },
+                    &stage_rows,
+                )
+                .await
+                .map_err(ToolError::Failed)?
+        };
+        let stages = self
+            .db
+            .list_workflow_stages(&workflow.workflow_id)
+            .await
+            .map_err(ToolError::Failed)?;
+        let definition_json =
+            workflow_definition_json(&workflow, &stages).map_err(ToolError::Failed)?;
+        let review = automation::review_workflow_definition(
+            &self.provider,
+            &workflow.workflow_id,
+            Some(&task.task_id),
+            &request.owner_user_id,
+            &definition_json,
+            intended_behavior_summary,
+        )
+        .await
+        .map_err(ToolError::Failed)?;
+        let application = automation::apply_script_review(&review, "draft", Some("draft"));
+        self.db
+            .update_workflow_definition_safety(
+                &workflow.workflow_id,
+                &application.safety_status,
+                &review.summary,
+                Some(&application.resulting_status),
+            )
+            .await
+            .map_err(ToolError::Failed)?;
+        self.db
+            .create_workflow_review(NewWorkflowReview {
+                workflow_id: &workflow.workflow_id,
+                version_number: workflow.current_version_number,
+                reviewer_agent_id: automation::SAFETY_AGENT_ID,
+                review_type: "workflow_definition",
+                verdict: &review.verdict,
+                risk_level: &review.risk_level,
+                findings_json: review.as_findings_json(),
+                summary_text: &review.summary,
+                reviewed_artifact_text: &definition_json.to_string(),
+            })
+            .await
+            .map_err(ToolError::Failed)?;
+        self.db
+            .record_audit_event(
+                "agent",
+                &request.assigned_agent_id,
+                "workflow_written",
+                json!({
+                    "task_id": task.task_id,
+                    "workflow_id": workflow.workflow_id,
+                    "stage_count": stage_inputs.len(),
+                    "current_version_number": workflow.current_version_number,
+                    "safety_status": application.safety_status,
+                    "verdict": review.verdict,
+                }),
+            )
+            .await
+            .map_err(ToolError::Failed)?;
+
+        let updated = self
+            .db
+            .fetch_workflow_definition_for_owner(&request.owner_user_id, &workflow.workflow_id)
+            .await
+            .map_err(ToolError::Failed)?
+            .ok_or_else(|| ToolError::Failed(anyhow!("workflow missing after review")))?;
+
+        Ok(ToolOutput {
+            payload: json!({
+                "workflow_id": updated.workflow_id,
+                "name": updated.name,
+                "status": updated.status,
+                "safety_status": updated.safety_status,
+                "safety_summary": updated.safety_summary,
+                "review_verdict": review.verdict,
+                "risk_level": review.risk_level,
+                "findings": review.findings,
+                "required_changes": review.required_changes,
+                "stage_count": stage_inputs.len(),
+                "current_version_number": updated.current_version_number,
+            }),
+        })
+    }
+
+    async fn handle_workflow_activate(
+        &self,
+        task: &TaskRow,
+        request: &AgentRequest,
+        arguments: Value,
+    ) -> std::result::Result<ToolOutput, ToolError> {
+        let workflow_id = required_string_arg(&arguments, "workflow_id", "workflow_activate")?;
+        let workflow = self
+            .db
+            .fetch_workflow_definition_for_owner(&request.owner_user_id, workflow_id)
+            .await
+            .map_err(ToolError::Failed)?
+            .ok_or_else(|| ToolError::Failed(anyhow!("workflow '{workflow_id}' not found")))?;
+        if workflow.safety_status != "approved" {
+            return Err(ToolError::Failed(anyhow!(
+                "workflow '{}' must pass safety review before activation",
+                workflow.workflow_id
+            )));
+        }
+        let stages = self
+            .db
+            .list_workflow_stages(&workflow.workflow_id)
+            .await
+            .map_err(ToolError::Failed)?;
+        validate_workflow_stage_references(&self.db, &workflow, &stages)
+            .await
+            .map_err(ToolError::Failed)?;
+        if workflow.status == "active" {
+            return Ok(ToolOutput {
+                payload: json!({
+                    "workflow_id": workflow.workflow_id,
+                    "status": workflow.status,
+                }),
+            });
+        }
+        if !self.has_approved_action(request, "workflow_activate", &workflow.workflow_id) {
+            return Err(ToolError::Denied {
+                message: "Workflow activation requires approval".to_owned(),
+                detail: json!({
+                    "action_type": "workflow_activate",
+                    "target_ref": workflow.workflow_id,
+                    "rationale": format!(
+                        "Task '{}' wants to activate workflow '{}'.",
+                        task.objective, workflow.workflow_id
+                    ),
+                }),
+            });
+        }
+        self.db
+            .update_workflow_definition_status(&workflow.workflow_id, "active")
+            .await
+            .map_err(ToolError::Failed)?;
+        self.db
+            .record_audit_event(
+                "agent",
+                &request.assigned_agent_id,
+                "workflow_activated",
+                json!({
+                    "task_id": task.task_id,
+                    "workflow_id": workflow.workflow_id,
+                }),
+            )
+            .await
+            .map_err(ToolError::Failed)?;
+        Ok(ToolOutput {
+            payload: json!({
+                "workflow_id": workflow.workflow_id,
+                "status": "active",
+            }),
+        })
+    }
+
+    async fn handle_workflow_schedule(
+        &self,
+        task: &TaskRow,
+        request: &AgentRequest,
+        arguments: Value,
+    ) -> std::result::Result<ToolOutput, ToolError> {
+        let workflow_id = required_string_arg(&arguments, "workflow_id", "workflow_schedule")?;
+        let schedule_id = required_string_arg(&arguments, "schedule_id", "workflow_schedule")?;
+        let cron_expr = required_string_arg(&arguments, "cron_expr", "workflow_schedule")?;
+        let enabled = arguments
+            .get("enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        let workflow = self
+            .db
+            .fetch_workflow_definition_for_owner(&request.owner_user_id, workflow_id)
+            .await
+            .map_err(ToolError::Failed)?
+            .ok_or_else(|| ToolError::Failed(anyhow!("workflow '{workflow_id}' not found")))?;
+        if workflow.safety_status != "approved" || workflow.status != "active" {
+            return Err(ToolError::Failed(anyhow!(
+                "workflow '{}' must be active and safety-approved before it can be scheduled",
+                workflow.workflow_id
+            )));
+        }
+        let target_ref = format!(
+            "schedule_id={schedule_id};workflow_id={workflow_id};cron={cron_expr};enabled={enabled}"
+        );
+        if !self.has_approved_action(request, "workflow_schedule", &target_ref) {
+            return Err(ToolError::Denied {
+                message: "Workflow scheduling requires approval".to_owned(),
+                detail: json!({
+                    "action_type": "workflow_schedule",
+                    "target_ref": target_ref,
+                    "rationale": format!(
+                        "Task '{}' wants to schedule workflow '{}' with cron '{}'.",
+                        task.objective, workflow.workflow_id, cron_expr
+                    ),
+                }),
+            });
+        }
+        let next_run_at = automation::next_run_after(
+            cron_expr,
+            &beaverki_core::now_rfc3339(),
+            self.base_tool_context.default_timezone.as_deref(),
+        )
+        .map_err(ToolError::Failed)?;
+        let schedule = self
+            .db
+            .upsert_schedule(NewSchedule {
+                schedule_id: Some(schedule_id),
+                owner_user_id: &request.owner_user_id,
+                target_type: "workflow",
+                target_id: &workflow.workflow_id,
+                cron_expr,
+                enabled,
+                next_run_at: &next_run_at,
+            })
+            .await
+            .map_err(ToolError::Failed)?;
+        self.db
+            .record_audit_event(
+                "agent",
+                &request.assigned_agent_id,
+                "workflow_scheduled",
+                json!({
+                    "task_id": task.task_id,
+                    "workflow_id": workflow.workflow_id,
+                    "schedule_id": schedule.schedule_id,
+                    "cron_expr": schedule.cron_expr,
+                }),
+            )
+            .await
+            .map_err(ToolError::Failed)?;
+        Ok(ToolOutput {
+            payload: json!({
+                "schedule_id": schedule.schedule_id,
+                "workflow_id": schedule.target_id,
+                "cron_expr": schedule.cron_expr,
+                "enabled": schedule.enabled != 0,
+                "next_run_at": schedule.next_run_at,
+            }),
+        })
+    }
+
+    async fn handle_workflow_replay(
+        &self,
+        task: &TaskRow,
+        request: &AgentRequest,
+        arguments: Value,
+    ) -> std::result::Result<ToolOutput, ToolError> {
+        let workflow_id = required_string_arg(&arguments, "workflow_id", "workflow_replay")?;
+        let workflow = self
+            .db
+            .fetch_workflow_definition_for_owner(&request.owner_user_id, workflow_id)
+            .await
+            .map_err(ToolError::Failed)?
+            .ok_or_else(|| ToolError::Failed(anyhow!("workflow '{workflow_id}' not found")))?;
+        if workflow.safety_status != "approved" || workflow.status != "active" {
+            return Err(ToolError::Failed(anyhow!(
+                "workflow '{}' must be active and safety-approved before it can be replayed",
+                workflow.workflow_id
+            )));
+        }
+        let primary_agent_id = request.primary_agent_id.clone();
+        let started_at = beaverki_core::now_rfc3339();
+        let run = self
+            .db
+            .create_workflow_run(beaverki_db::NewWorkflowRun {
+                workflow_run_id: None,
+                workflow_id: &workflow.workflow_id,
+                owner_user_id: &request.owner_user_id,
+                initiating_identity_id: &request.initiating_identity_id,
+                schedule_id: None,
+                source_task_id: Some(&task.task_id),
+                state: "running",
+                current_stage_index: 0,
+                artifacts_json: json!({
+                    "workflow_id": workflow.workflow_id,
+                    "workflow_name": workflow.name,
+                    "stages": {},
+                    "last_result": Value::Null,
+                }),
+                wake_at: None,
+                block_reason: None,
+                last_error: None,
+                retry_count: 0,
+                started_at: &started_at,
+            })
+            .await
+            .map_err(ToolError::Failed)?;
+        let context_summary = json!({
+            "workflow_run_id": run.workflow_run_id,
+            "workflow_id": workflow.workflow_id,
+            "schedule_id": Value::Null,
+        })
+        .to_string();
+        let queued_task = self
+            .db
+            .create_task_with_params(NewTask {
+                owner_user_id: &request.owner_user_id,
+                initiating_identity_id: &request.initiating_identity_id,
+                primary_agent_id: &primary_agent_id,
+                assigned_agent_id: &primary_agent_id,
+                parent_task_id: Some(&task.task_id),
+                session_id: task.session_id.as_deref(),
+                kind: "workflow_run",
+                objective: &format!("Run workflow {}", workflow.name),
+                context_summary: Some(&context_summary),
+                scope: request.scope,
+                wake_at: None,
+            })
+            .await
+            .map_err(ToolError::Failed)?;
+        self.db
+            .record_audit_event(
+                "agent",
+                &request.assigned_agent_id,
+                "workflow_replay_queued",
+                json!({
+                    "task_id": task.task_id,
+                    "workflow_id": workflow.workflow_id,
+                    "workflow_run_id": run.workflow_run_id,
+                    "queued_task_id": queued_task.task_id,
+                }),
+            )
+            .await
+            .map_err(ToolError::Failed)?;
+        Ok(ToolOutput {
+            payload: json!({
+                "workflow_id": workflow.workflow_id,
+                "workflow_run_id": run.workflow_run_id,
+                "queued_task_id": queued_task.task_id,
+                "status": "queued",
+            }),
+        })
+    }
+
+    async fn handle_workflow_run_list(
+        &self,
+        request: &AgentRequest,
+        arguments: Value,
+    ) -> std::result::Result<ToolOutput, ToolError> {
+        let workflow_id = required_string_arg(&arguments, "workflow_id", "workflow_run_list")?;
+        let runs = self
+            .db
+            .list_workflow_runs_for_workflow(workflow_id)
+            .await
+            .map_err(ToolError::Failed)?;
+        Ok(ToolOutput {
+            payload: json!({
+                "workflow_id": workflow_id,
+                "runs": runs.into_iter()
+                    .filter(|run| run.owner_user_id == request.owner_user_id)
+                    .map(workflow_run_to_json)
+                    .collect::<Result<Vec<_>>>()
+                    .map_err(ToolError::Failed)?,
+            }),
+        })
+    }
+
+    async fn handle_workflow_run_get(
+        &self,
+        request: &AgentRequest,
+        arguments: Value,
+    ) -> std::result::Result<ToolOutput, ToolError> {
+        let workflow_run_id = required_string_arg(&arguments, "workflow_run_id", "workflow_run_get")?;
+        let run = self
+            .db
+            .fetch_workflow_run_for_owner(&request.owner_user_id, workflow_run_id)
+            .await
+            .map_err(ToolError::Failed)?
+            .ok_or_else(|| ToolError::Failed(anyhow!("workflow run '{workflow_run_id}' not found")))?;
+        Ok(ToolOutput {
+            payload: workflow_run_to_json(run).map_err(ToolError::Failed)?,
         })
     }
 
@@ -2654,6 +3956,36 @@ impl PrimaryAgentRunner {
         Ok(())
     }
 
+    async fn record_household_delivery_schedule_denial(
+        &self,
+        task: &TaskRow,
+        request: &AgentRequest,
+        delivery_id: Option<&str>,
+        recipient: &str,
+        message_text: Option<&str>,
+        reason: &str,
+        detail: Value,
+    ) -> Result<()> {
+        self.db
+            .record_audit_event(
+                "agent",
+                &request.assigned_agent_id,
+                "household_delivery_schedule_denied",
+                json!({
+                    "task_id": task.task_id,
+                    "delivery_id": delivery_id,
+                    "owner_user_id": request.owner_user_id,
+                    "initiating_identity_id": request.initiating_identity_id,
+                    "recipient": recipient,
+                    "message_text": message_text,
+                    "reason": reason,
+                    "detail": detail,
+                }),
+            )
+            .await?;
+        Ok(())
+    }
+
     async fn review_shell_command(
         &self,
         task_id: &str,
@@ -2801,6 +4133,224 @@ impl PrimaryAgentRunner {
 
 fn parse_json_field(raw: &str, label: &str) -> Result<Value> {
     serde_json::from_str(raw).with_context(|| format!("failed to parse {label}"))
+}
+
+#[derive(Debug, Clone)]
+struct WorkflowStageInput {
+    kind: String,
+    label: Option<String>,
+    artifact_ref: Option<String>,
+    config: Value,
+}
+
+fn workflow_stage_inputs_from_value(value: &Value) -> Result<Vec<WorkflowStageInput>> {
+    let items = value
+        .as_array()
+        .ok_or_else(|| anyhow!("workflow stages must be an array"))?;
+    items
+        .iter()
+        .enumerate()
+        .map(|(index, item)| {
+            let object = item.as_object().ok_or_else(|| {
+                anyhow!("workflow stage at index {index} must be an object")
+            })?;
+            let kind = object
+                .get("kind")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| anyhow!("workflow stage at index {index} requires kind"))?
+                .to_owned();
+            let label = object
+                .get("label")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned);
+            let artifact_ref = object
+                .get("artifact_ref")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned);
+            let config = match object.get("config") {
+                Some(Value::String(raw)) => parse_json_field(raw, "workflow stage config")?,
+                Some(Value::Null) | None => json!({}),
+                Some(_) => {
+                    return Err(anyhow!(
+                        "workflow stage at index {index} requires config to be a JSON-encoded string or null"
+                    ));
+                }
+            };
+            match kind.as_str() {
+                "lua_script" | "lua_tool" => {
+                    if artifact_ref.is_none() {
+                        return Err(anyhow!(
+                            "workflow stage at index {index} with kind '{kind}' requires artifact_ref"
+                        ));
+                    }
+                }
+                "agent_task" => {
+                    if config
+                        .get("prompt")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .is_none()
+                    {
+                        return Err(anyhow!(
+                            "workflow stage at index {index} with kind 'agent_task' requires config.prompt"
+                        ));
+                    }
+                }
+                "user_notify" => {}
+                other => {
+                    return Err(anyhow!(
+                        "workflow stage at index {index} uses unsupported kind '{other}'"
+                    ));
+                }
+            }
+            Ok(WorkflowStageInput {
+                kind,
+                label,
+                artifact_ref,
+                config,
+            })
+        })
+        .collect()
+}
+
+fn workflow_stage_to_json(stage: &WorkflowStageRow) -> Result<Value> {
+    Ok(json!({
+        "stage_id": stage.stage_id,
+        "stage_index": stage.stage_index,
+        "kind": stage.stage_kind,
+        "label": stage.stage_label,
+        "artifact_ref": stage.artifact_ref,
+        "config": parse_json_field(&stage.stage_config_json, "workflow stage config")?,
+    }))
+}
+
+fn workflow_definition_to_json(workflow: &WorkflowDefinitionRow) -> Value {
+    json!({
+        "workflow_id": workflow.workflow_id,
+        "name": workflow.name,
+        "description": workflow.description,
+        "status": workflow.status,
+        "safety_status": workflow.safety_status,
+        "safety_summary": workflow.safety_summary,
+        "current_version_number": workflow.current_version_number,
+        "created_from_task_id": workflow.created_from_task_id,
+        "updated_at": workflow.updated_at,
+    })
+}
+
+fn workflow_definition_json(
+    workflow: &WorkflowDefinitionRow,
+    stages: &[WorkflowStageRow],
+) -> Result<Value> {
+    Ok(json!({
+        "workflow_id": workflow.workflow_id,
+        "owner_user_id": workflow.owner_user_id,
+        "name": workflow.name,
+        "description": workflow.description,
+        "status": workflow.status,
+        "safety_status": workflow.safety_status,
+        "current_version_number": workflow.current_version_number,
+        "stages": stages
+            .iter()
+            .map(workflow_stage_to_json)
+            .collect::<Result<Vec<_>>>()?,
+    }))
+}
+
+fn workflow_run_to_json(run: beaverki_db::WorkflowRunRow) -> Result<Value> {
+    Ok(json!({
+        "workflow_run_id": run.workflow_run_id,
+        "workflow_id": run.workflow_id,
+        "state": run.state,
+        "current_stage_index": run.current_stage_index,
+        "artifacts": parse_json_field(&run.artifacts_json, "workflow run artifacts")?,
+        "wake_at": run.wake_at,
+        "block_reason": run.block_reason,
+        "last_error": run.last_error,
+        "retry_count": run.retry_count,
+        "started_at": run.started_at,
+        "completed_at": run.completed_at,
+        "created_at": run.created_at,
+        "updated_at": run.updated_at,
+        "schedule_id": run.schedule_id,
+        "source_task_id": run.source_task_id,
+    }))
+}
+
+async fn validate_workflow_stage_references(
+    db: &Database,
+    workflow: &WorkflowDefinitionRow,
+    stages: &[WorkflowStageRow],
+) -> Result<()> {
+    if stages.is_empty() {
+        return Err(anyhow!(
+            "workflow '{}' must contain at least one stage",
+            workflow.workflow_id
+        ));
+    }
+    for stage in stages {
+        match stage.stage_kind.as_str() {
+            "lua_script" => {
+                let script_id = stage
+                    .artifact_ref
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("workflow stage '{}' is missing script_id", stage.stage_id))?;
+                let script = db
+                    .fetch_script_for_owner(&workflow.owner_user_id, script_id)
+                    .await?
+                    .ok_or_else(|| anyhow!("workflow stage references missing script '{}'", script_id))?;
+                if script.status != "active" || script.safety_status != "approved" {
+                    return Err(anyhow!(
+                        "workflow script '{}' must be active and approved",
+                        script.script_id
+                    ));
+                }
+            }
+            "lua_tool" => {
+                let tool_id = stage
+                    .artifact_ref
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("workflow stage '{}' is missing tool_id", stage.stage_id))?;
+                let tool = db
+                    .fetch_lua_tool_for_owner(&workflow.owner_user_id, tool_id)
+                    .await?
+                    .ok_or_else(|| anyhow!("workflow stage references missing Lua tool '{}'", tool_id))?;
+                if tool.status != "active" || tool.safety_status != "approved" {
+                    return Err(anyhow!(
+                        "workflow Lua tool '{}' must be active and approved",
+                        tool.tool_id
+                    ));
+                }
+            }
+            "agent_task" => {
+                let config = parse_json_field(&stage.stage_config_json, "workflow stage config")?;
+                if config
+                    .get("prompt")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .is_none()
+                {
+                    return Err(anyhow!(
+                        "workflow agent stage '{}' requires config.prompt",
+                        stage.stage_id
+                    ));
+                }
+            }
+            "user_notify" => {}
+            other => {
+                return Err(anyhow!("unsupported workflow stage kind '{other}'"));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn build_lua_tool_review_artifact(
@@ -3138,6 +4688,61 @@ fn tool_definitions(tools: &ToolRegistry) -> Vec<ToolDefinition> {
         }),
     });
     definitions.push(ToolDefinition {
+        name: "household_schedule_message".to_owned(),
+        description: "Create or update a deferred or recurring household delivery. Use this for reminders or scheduled messages to a mapped household user later, including yourself if you have a mapped delivery route. Provide exactly one of `deliver_at` or `cron_expr`. `deliver_at` must be RFC3339. `cron_expr` accepts standard 5-field cron by default, also accepts 6- or 7-field cron with leading seconds, and may include a leading `TZ=Area/City` or `CRON_TZ=Area/City` timezone hint such as `TZ=Europe/Vienna 0 7 * * *`.".to_owned(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "delivery_id": { "type": ["string", "null"] },
+                "recipient": { "type": "string" },
+                "message": { "type": "string" },
+                "deliver_at": { "type": ["string", "null"] },
+                "cron_expr": { "type": ["string", "null"] },
+                "window_start_at": { "type": ["string", "null"] },
+                "window_end_at": { "type": ["string", "null"] },
+                "enabled": { "type": ["boolean", "null"] }
+            },
+            "required": ["delivery_id", "recipient", "message", "deliver_at", "cron_expr", "window_start_at", "window_end_at", "enabled"],
+            "additionalProperties": false
+        }),
+    });
+    definitions.push(ToolDefinition {
+        name: "household_schedule_list".to_owned(),
+        description: "List scheduled household deliveries created by the current user, including pending reminders, recurring schedules, and their current execution state.".to_owned(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "additionalProperties": false
+        }),
+    });
+    definitions.push(ToolDefinition {
+        name: "household_schedule_get".to_owned(),
+        description: "Inspect one scheduled household delivery by delivery ID.".to_owned(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "delivery_id": { "type": "string" }
+            },
+            "required": ["delivery_id"],
+            "additionalProperties": false
+        }),
+    });
+    definitions.push(ToolDefinition {
+        name: "household_schedule_cancel".to_owned(),
+        description:
+            "Cancel a pending one-shot reminder or recurring household delivery by delivery ID."
+                .to_owned(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "delivery_id": { "type": "string" }
+            },
+            "required": ["delivery_id"],
+            "additionalProperties": false
+        }),
+    });
+    definitions.push(ToolDefinition {
         name: "agent_spawn_subagent".to_owned(),
         description: "Spawn a bounded sub-agent with a tightly scoped task slice. Use only when a separate focused workstream materially helps complete the parent task.".to_owned(),
         input_schema: json!({
@@ -3230,7 +4835,7 @@ fn tool_definitions(tools: &ToolRegistry) -> Vec<ToolDefinition> {
     });
     definitions.push(ToolDefinition {
         name: "lua_script_schedule".to_owned(),
-        description: "Create or update a recurring schedule for an active Lua automation script after user approval.".to_owned(),
+        description: "Create or update a recurring schedule for an active Lua automation script after user approval. `cron_expr` accepts standard 5-field cron by default, also accepts 6- or 7-field cron with leading seconds, and may include a leading `TZ=Area/City` or `CRON_TZ=Area/City` timezone hint such as `TZ=Europe/Vienna 0 7 * * *`.".to_owned(),
         input_schema: json!({
             "type": "object",
             "properties": {
@@ -3309,6 +4914,120 @@ fn tool_definitions(tools: &ToolRegistry) -> Vec<ToolDefinition> {
             "additionalProperties": false
         }),
     });
+    definitions.push(ToolDefinition {
+        name: "workflow_list".to_owned(),
+        description: "List reviewed workflow definitions owned by the current user, including activation and safety metadata.".to_owned(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "additionalProperties": false
+        }),
+    });
+    definitions.push(ToolDefinition {
+        name: "workflow_get".to_owned(),
+        description: "Fetch a workflow definition's stages, review history, schedules, and recent runs by workflow ID.".to_owned(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "workflow_id": { "type": "string" }
+            },
+            "required": ["workflow_id"],
+            "additionalProperties": false
+        }),
+    });
+    definitions.push(ToolDefinition {
+        name: "workflow_write".to_owned(),
+        description: "Create or update a reviewed workflow definition with ordered stages. Reusing an existing `workflow_id` creates a new workflow version and makes that version the current editable definition. Stages support `lua_script`, `lua_tool`, `agent_task`, and `user_notify`. Each stage's `config` must be a JSON-encoded object string.".to_owned(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "workflow_id": { "type": ["string", "null"] },
+                "name": { "type": "string" },
+                "description": { "type": ["string", "null"] },
+                "stages": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "kind": { "type": "string" },
+                            "label": { "type": ["string", "null"] },
+                            "artifact_ref": { "type": ["string", "null"] },
+                            "config": { "type": ["string", "null"] }
+                        },
+                        "required": ["kind", "label", "artifact_ref", "config"],
+                        "additionalProperties": false
+                    }
+                },
+                "intended_behavior_summary": { "type": "string" }
+            },
+            "required": ["workflow_id", "name", "description", "stages", "intended_behavior_summary"],
+            "additionalProperties": false
+        }),
+    });
+    definitions.push(ToolDefinition {
+        name: "workflow_activate".to_owned(),
+        description: "Activate a reviewed workflow definition after user approval so it can run on schedule or via replay.".to_owned(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "workflow_id": { "type": "string" }
+            },
+            "required": ["workflow_id"],
+            "additionalProperties": false
+        }),
+    });
+    definitions.push(ToolDefinition {
+        name: "workflow_schedule".to_owned(),
+        description: "Create or update a recurring schedule for an active reviewed workflow after user approval. `cron_expr` accepts standard 5-field cron by default, also accepts 6- or 7-field cron with leading seconds, and may include a leading `TZ=Area/City` or `CRON_TZ=Area/City` timezone hint such as `TZ=Europe/Vienna 0 7 * * *`.".to_owned(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "workflow_id": { "type": "string" },
+                "schedule_id": { "type": "string" },
+                "cron_expr": { "type": "string" },
+                "enabled": { "type": ["boolean", "null"] }
+            },
+            "required": ["workflow_id", "schedule_id", "cron_expr", "enabled"],
+            "additionalProperties": false
+        }),
+    });
+    definitions.push(ToolDefinition {
+        name: "workflow_replay".to_owned(),
+        description: "Queue an immediate execution of an active reviewed workflow definition and return the new workflow-run and task IDs.".to_owned(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "workflow_id": { "type": "string" }
+            },
+            "required": ["workflow_id"],
+            "additionalProperties": false
+        }),
+    });
+    definitions.push(ToolDefinition {
+        name: "workflow_run_list".to_owned(),
+        description: "List recorded workflow runs for a workflow, including current state, artifacts, and block reasons so failed runs can be debugged and the workflow can be revised.".to_owned(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "workflow_id": { "type": "string" }
+            },
+            "required": ["workflow_id"],
+            "additionalProperties": false
+        }),
+    });
+    definitions.push(ToolDefinition {
+        name: "workflow_run_get".to_owned(),
+        description: "Fetch one workflow run by run ID, including persisted artifacts, state, block reason, retry count, and final result context.".to_owned(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "workflow_run_id": { "type": "string" }
+            },
+            "required": ["workflow_run_id"],
+            "additionalProperties": false
+        }),
+    });
     definitions.sort_by(|left, right| left.name.cmp(&right.name));
     definitions
 }
@@ -3377,19 +5096,24 @@ fn system_prompt(kind: &str, role_ids: &[String], allowed_roots: &[PathBuf]) -> 
 
     format!(
         "You are BeaverKI M1, a local multi-user CLI-first assistant.
-    Current milestone: M5 household direct delivery.
+    Current milestone: M6 scheduled workflow pipelines.
 Current agent kind: {kind}.
 Current role set: {roles}.
 Use tools when needed, but keep the task focused and auditable.
 Only low-risk read-only shell commands are allowed by default. Medium/high/critical shell commands require user approval.
 For exploring allowed roots and locating files, prefer filesystem_list, filesystem_read_text, and filesystem_search over shell_exec.
 Use Lua tools when recurring or structured automation materially helps. Writing a Lua script triggers safety review. New scripts require explicit activation later, while rewrites of already active scripts stay active if the new version passes safety review. Scheduling requires user approval. When writing Lua, prefer `return function(ctx) ... end`, use BeaverKI host APIs such as `ctx.log_info`, `ctx.notify_user`, `ctx.task_defer`, `ctx.memory_read`, `ctx.memory_write`, and `ctx.tool_call`, and avoid legacy globals like `run()`, `log()`, or `notify()`.
+Use workflow tools for staged recurring automation. Reuse the same workflow_id when revising a workflow so BeaverKI creates a new workflow version instead of inventing unrelated workflows.
+When a user is building or debugging a workflow, inspect existing state before proposing changes: use workflow_get for the current definition, workflow_run_list to see recent runs, and workflow_run_get to inspect persisted artifacts, final results, retry state, and block reasons for a specific run.
+If a workflow run failed or blocked, prefer reading the run state and artifacts first, then revise the workflow with workflow_write using the same workflow_id, and only then suggest activation, replay, or rescheduling as needed.
+Never claim a workflow was created, revised, activated, scheduled, replayed, or successfully completed unless the corresponding workflow tool returned success in this task.
 Use memory_read before updating existing mutable memory or when you need to confirm the current canonical value under a subject key.
 Use memory_write for mutable durable scoped state such as shopping lists, inventories, checklists, and shared notes. When updating keyed state, write the full latest canonical value under the same subject_key rather than describing a partial edit in prose.
 Automatic memory retrieval for the current conversation may be narrower than your role-based memory tool access. In a private DM, you may still use explicit memory tools against household scope when the user clearly asks for a household update and the current user is allowed to access household memory.
 Use memory_remember only for durable semantic facts that are likely to matter in future conversations, such as names, identities, stable preferences, or long-lived household facts. Do not store transient task progress or one-off summaries with memory_remember. Use `private` scope by default and only use `household` for explicitly shared facts. Reuse the same subject_key when correcting an existing fact.
 Use memory_forget when a previously stored memory row is wrong or should stop affecting future tasks. If the user says an earlier remembered fact was incorrect, forget the wrong row and then store the corrected fact if appropriate.
 Use household_send_message only when the user explicitly wants BeaverKI to pass an immediate message to another mapped household user now. Keep the delivery payload concise, use the intended recipient's name or user identifier, and do not use this tool for later reminders or recurring schedules. If the recipient is ambiguous or unmapped, ask for clarification instead of pretending delivery succeeded.
+Use household_schedule_message for deferred reminders or recurring delivery to a mapped household user, including the current user if they want BeaverKI to remind them later and they have a mapped route. Provide exactly one of `deliver_at` or `cron_expr`. For recurring schedules, prefer standard 5-field cron like `0 7 * * *`; 6- or 7-field cron with leading seconds also works. If the user's local timezone matters, include it as a leading `TZ=Area/City` or `CRON_TZ=Area/City` prefix, for example `TZ=Europe/Vienna 0 7 * * *`. Use household_schedule_list, household_schedule_get, and household_schedule_cancel to inspect or manage scheduled household delivery instead of claiming you changed a schedule without tool confirmation.
 Never claim memory was persisted unless a memory_write or memory_remember tool call returned success in this task.
 For file writes, prefer filesystem_write_text. Never claim a denied tool succeeded.
 Use agent_spawn_subagent only for a tightly bounded, materially useful child task. Any sub-agent receives only the explicit task slice you provide.
@@ -3537,6 +5261,137 @@ fn optional_string_arg<'a>(arguments: &'a Value, key: &str) -> Option<&'a str> {
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
+}
+
+fn normalize_rfc3339_timestamp(value: &str, label: &str) -> Result<String> {
+    DateTime::parse_from_rfc3339(value)
+        .with_context(|| format!("failed to parse {label} as RFC3339"))
+        .map(|timestamp| timestamp.with_timezone(&Utc).to_rfc3339())
+}
+
+fn validate_scheduled_delivery_timing(
+    deliver_at: Option<&str>,
+    window_start_at: Option<&str>,
+    window_end_at: Option<&str>,
+    cron_expr: Option<&str>,
+    default_timezone: Option<&str>,
+) -> Result<()> {
+    let now = DateTime::parse_from_rfc3339(&beaverki_core::now_rfc3339())
+        .context("failed to read current time")?
+        .with_timezone(&Utc);
+
+    if let Some(deliver_at) = deliver_at {
+        let deliver_at = DateTime::parse_from_rfc3339(deliver_at)
+            .with_context(|| format!("failed to parse deliver_at '{deliver_at}'"))?
+            .with_timezone(&Utc);
+        if deliver_at <= now {
+            return Err(anyhow!("deliver_at must be in the future"));
+        }
+        if let Some(window_start_at) = window_start_at {
+            let window_start = DateTime::parse_from_rfc3339(window_start_at)
+                .with_context(|| format!("failed to parse window_start_at '{window_start_at}'"))?
+                .with_timezone(&Utc);
+            if window_start > deliver_at {
+                return Err(anyhow!("window_start_at cannot be after deliver_at"));
+            }
+        }
+    } else if window_start_at.is_some() && cron_expr.is_some() {
+        return Err(anyhow!(
+            "window_start_at is only supported for one-shot scheduled delivery"
+        ));
+    }
+
+    if let Some(window_end_at) = window_end_at {
+        let window_end = DateTime::parse_from_rfc3339(window_end_at)
+            .with_context(|| format!("failed to parse window_end_at '{window_end_at}'"))?
+            .with_timezone(&Utc);
+        if window_end <= now {
+            return Err(anyhow!("window_end_at must be in the future"));
+        }
+        if let Some(deliver_at) = deliver_at {
+            let deliver_at = DateTime::parse_from_rfc3339(deliver_at)
+                .with_context(|| format!("failed to parse deliver_at '{deliver_at}'"))?
+                .with_timezone(&Utc);
+            if window_end < deliver_at {
+                return Err(anyhow!("window_end_at cannot be before deliver_at"));
+            }
+        }
+        if let Some(window_start_at) = window_start_at {
+            let window_start = DateTime::parse_from_rfc3339(window_start_at)
+                .with_context(|| format!("failed to parse window_start_at '{window_start_at}'"))?
+                .with_timezone(&Utc);
+            if window_end < window_start {
+                return Err(anyhow!("window_end_at cannot be before window_start_at"));
+            }
+        }
+    }
+
+    if let Some(cron_expr) = cron_expr {
+        automation::next_run_after(cron_expr, &beaverki_core::now_rfc3339(), default_timezone)?;
+    }
+
+    Ok(())
+}
+
+fn scheduled_delivery_approval_target(
+    delivery_id: Option<&str>,
+    recipient_user_id: &str,
+    message_text: &str,
+    mode: &ScheduledDeliveryMode,
+    window_start_at: Option<&str>,
+    window_end_at: Option<&str>,
+) -> String {
+    match mode {
+        ScheduledDeliveryMode::OneShot { deliver_at } => json!({
+            "delivery_id": delivery_id,
+            "recipient_user_id": recipient_user_id,
+            "message_text": message_text,
+            "mode": "scheduled_once",
+            "deliver_at": deliver_at,
+            "window_start_at": window_start_at,
+            "window_end_at": window_end_at,
+        })
+        .to_string(),
+        ScheduledDeliveryMode::Recurring { cron_expr, enabled } => json!({
+            "delivery_id": delivery_id,
+            "recipient_user_id": recipient_user_id,
+            "message_text": message_text,
+            "mode": "scheduled_recurring",
+            "cron_expr": cron_expr,
+            "enabled": enabled,
+            "window_start_at": window_start_at,
+            "window_end_at": window_end_at,
+        })
+        .to_string(),
+    }
+}
+
+fn scheduled_delivery_rationale_target(mode: &ScheduledDeliveryMode) -> String {
+    match mode {
+        ScheduledDeliveryMode::OneShot { deliver_at } => format!("deliver_at {}", deliver_at),
+        ScheduledDeliveryMode::Recurring { cron_expr, enabled } => {
+            format!("cron {} enabled={}", cron_expr, enabled)
+        }
+    }
+}
+
+fn scheduled_delivery_dedupe_key(
+    task_id: &str,
+    recipient_user_id: &str,
+    message_text: &str,
+    mode: &ScheduledDeliveryMode,
+    window_start_at: Option<&str>,
+    window_end_at: Option<&str>,
+) -> String {
+    format!(
+        "{}:{}:{}:{}:{}:{}",
+        task_id,
+        recipient_user_id,
+        message_text.trim(),
+        scheduled_delivery_rationale_target(mode),
+        window_start_at.unwrap_or(""),
+        window_end_at.unwrap_or(""),
+    )
 }
 
 fn roles_label(role_ids: &[String]) -> String {
@@ -3712,6 +5567,30 @@ mod tests {
             .collect()
     }
 
+    fn test_request(
+        user: &UserRow,
+        roles: &[String],
+        objective: &str,
+        approved_automation_actions: Vec<ApprovedAutomationAction>,
+    ) -> AgentRequest {
+        AgentRequest {
+            owner_user_id: user.user_id.clone(),
+            initiating_identity_id: format!("cli:{}", user.user_id),
+            primary_agent_id: user.primary_agent_id.clone().expect("agent"),
+            assigned_agent_id: user.primary_agent_id.clone().expect("agent"),
+            role_ids: roles.to_vec(),
+            objective: objective.to_owned(),
+            scope: MemoryScope::Private,
+            kind: "interactive".to_owned(),
+            parent_task_id: None,
+            task_context: None,
+            visible_scopes: visible_memory_scopes(roles),
+            memory_mode: AgentMemoryMode::ScopedRetrieval,
+            approved_shell_commands: Vec::new(),
+            approved_automation_actions,
+        }
+    }
+
     async fn create_active_lua_tool(
         db: &Database,
         owner_user_id: &str,
@@ -3872,6 +5751,192 @@ mod tests {
 
         assert_eq!(resumed.task.state, TaskState::Completed.as_str());
         assert_eq!(resumed.task.result_text.as_deref(), Some("finished"));
+    }
+
+    #[tokio::test]
+    async fn scheduled_household_delivery_can_be_created_listed_fetched_and_canceled() {
+        let (db, runner) = test_runner(FakeProvider::new(vec![])).await;
+        let default_user = db.default_user().await.expect("default").expect("user");
+        let roles = db
+            .list_user_roles(&default_user.user_id)
+            .await
+            .expect("roles")
+            .into_iter()
+            .map(|row| row.role_id)
+            .collect::<Vec<_>>();
+        let recipient = db
+            .create_user("Casey", &["adult".to_owned()])
+            .await
+            .expect("create Casey");
+        db.upsert_connector_identity(
+            "discord",
+            "discord-casey",
+            None,
+            &recipient.user_id,
+            "authenticated_message",
+        )
+        .await
+        .expect("map Casey");
+        let task = db
+            .create_task(
+                &default_user.user_id,
+                default_user.primary_agent_id.as_deref().expect("agent"),
+                "Schedule a reminder for Casey",
+                MemoryScope::Private,
+            )
+            .await
+            .expect("task");
+        let deliver_at = normalize_rfc3339_timestamp("2099-01-01T09:00:00Z", "deliver_at")
+            .expect("normalize deliver_at");
+        let target_ref = scheduled_delivery_approval_target(
+            None,
+            &recipient.user_id,
+            "Buy kiwis.",
+            &ScheduledDeliveryMode::OneShot {
+                deliver_at: deliver_at.clone(),
+            },
+            None,
+            None,
+        );
+        let request = test_request(
+            &default_user,
+            &roles,
+            "Schedule a reminder for Casey",
+            vec![ApprovedAutomationAction {
+                action_type: "household_delivery_schedule".to_owned(),
+                target_ref,
+            }],
+        );
+
+        let created = runner
+            .handle_household_schedule_message(
+                &task,
+                &request,
+                json!({
+                    "delivery_id": null,
+                    "recipient": "Casey",
+                    "message": "Buy kiwis.",
+                    "deliver_at": deliver_at,
+                    "cron_expr": null,
+                    "window_start_at": null,
+                    "window_end_at": null,
+                    "enabled": true
+                }),
+            )
+            .await
+            .expect("schedule delivery");
+        let delivery_id = created.payload["delivery_id"]
+            .as_str()
+            .expect("delivery_id")
+            .to_owned();
+        assert_eq!(created.payload["status"], json!("scheduled"));
+        assert_eq!(created.payload["delivery_mode"], json!("scheduled_once"));
+
+        let listed = runner
+            .handle_household_schedule_list(&request)
+            .await
+            .expect("list");
+        assert_eq!(listed.payload["items"].as_array().expect("items").len(), 1);
+
+        let fetched = runner
+            .handle_household_schedule_get(
+                &request,
+                json!({
+                    "delivery_id": delivery_id,
+                }),
+            )
+            .await
+            .expect("get");
+        assert_eq!(fetched.payload["recipient_display_name"], json!("Casey"));
+        assert_eq!(fetched.payload["message"], json!("Buy kiwis."));
+
+        let canceled = runner
+            .handle_household_schedule_cancel(
+                &task,
+                &request,
+                json!({
+                    "delivery_id": fetched.payload["delivery_id"],
+                }),
+            )
+            .await
+            .expect("cancel");
+        assert_eq!(canceled.payload["status"], json!("canceled"));
+        assert_eq!(canceled.payload["scheduled_job_state"], json!("canceled"));
+    }
+
+    #[tokio::test]
+    async fn scheduled_household_delivery_can_target_requester_when_route_exists() {
+        let (db, runner) = test_runner(FakeProvider::new(vec![])).await;
+        let default_user = db.default_user().await.expect("default").expect("user");
+        let roles = db
+            .list_user_roles(&default_user.user_id)
+            .await
+            .expect("roles")
+            .into_iter()
+            .map(|row| row.role_id)
+            .collect::<Vec<_>>();
+        db.upsert_connector_identity(
+            "discord",
+            "discord-alex",
+            None,
+            &default_user.user_id,
+            "authenticated_message",
+        )
+        .await
+        .expect("map self");
+        let task = db
+            .create_task(
+                &default_user.user_id,
+                default_user.primary_agent_id.as_deref().expect("agent"),
+                "Schedule a reminder for myself",
+                MemoryScope::Private,
+            )
+            .await
+            .expect("task");
+        let deliver_at = normalize_rfc3339_timestamp("2099-01-01T09:00:00Z", "deliver_at")
+            .expect("normalize deliver_at");
+        let target_ref = scheduled_delivery_approval_target(
+            None,
+            &default_user.user_id,
+            "Take vitamins.",
+            &ScheduledDeliveryMode::OneShot {
+                deliver_at: deliver_at.clone(),
+            },
+            None,
+            None,
+        );
+        let request = test_request(
+            &default_user,
+            &roles,
+            "Schedule a reminder for myself",
+            vec![ApprovedAutomationAction {
+                action_type: "household_delivery_schedule".to_owned(),
+                target_ref,
+            }],
+        );
+
+        let created = runner
+            .handle_household_schedule_message(
+                &task,
+                &request,
+                json!({
+                    "delivery_id": null,
+                    "recipient": default_user.display_name,
+                    "message": "Take vitamins.",
+                    "deliver_at": deliver_at,
+                    "cron_expr": null,
+                    "window_start_at": null,
+                    "window_end_at": null,
+                    "enabled": true
+                }),
+            )
+            .await
+            .expect("schedule self delivery");
+
+        assert_eq!(created.payload["status"], json!("scheduled"));
+        assert_eq!(created.payload["recipient_user_id"], json!(default_user.user_id));
+        assert_eq!(created.payload["recipient_display_name"], json!(default_user.display_name));
+        assert_eq!(created.payload["message"], json!("Take vitamins."));
     }
 
     #[tokio::test]
@@ -5505,10 +7570,68 @@ mod tests {
         ));
         assert!(prompt.contains("prefer `return function(ctx) ... end`"));
         assert!(prompt.contains("avoid legacy globals like `run()`, `log()`, or `notify()`"));
+        assert!(prompt.contains("Use workflow tools for staged recurring automation"));
+        assert!(prompt.contains("Reuse the same workflow_id when revising a workflow"));
+        assert!(prompt.contains("workflow_run_list"));
+        assert!(prompt.contains("workflow_run_get"));
         assert!(prompt.contains("Use memory_read before updating existing mutable memory"));
         assert!(prompt.contains("Use memory_write for mutable durable scoped state"));
         assert!(prompt.contains("Automatic memory retrieval for the current conversation may be narrower than your role-based memory tool access"));
         assert!(prompt.contains("Use memory_remember only for durable semantic facts"));
+    }
+
+    #[test]
+    fn workflow_write_schema_exposes_stage_model() {
+        let registry = builtin_registry();
+        let schema = tool_definitions(&registry)
+            .into_iter()
+            .find(|definition| definition.name == "workflow_write")
+            .expect("workflow_write definition")
+            .input_schema;
+
+        assert_eq!(schema["properties"]["stages"]["type"], json!("array"));
+        assert_eq!(
+            schema["properties"]["stages"]["items"]["properties"]["kind"]["type"],
+            json!("string")
+        );
+        assert_eq!(
+            schema["properties"]["stages"]["items"]["properties"]["config"]["type"],
+            json!(["string", "null"])
+        );
+    }
+
+    #[test]
+    fn workflow_stage_input_parser_requires_expected_fields() {
+        let stages = workflow_stage_inputs_from_value(&json!([
+            {
+                "kind": "lua_script",
+                "label": "Fetch",
+                "artifact_ref": "script_fetch",
+                "config": "{}"
+            },
+            {
+                "kind": "agent_task",
+                "label": "Draft",
+                "artifact_ref": null,
+                "config": "{\"prompt\":\"Summarize the fetched headline.\"}"
+            }
+        ]))
+        .expect("parse stages");
+
+        assert_eq!(stages.len(), 2);
+        assert_eq!(stages[0].kind, "lua_script");
+        assert_eq!(stages[1].kind, "agent_task");
+
+        let error = workflow_stage_inputs_from_value(&json!([
+            {
+                "kind": "lua_tool",
+                "label": "Missing ref",
+                "artifact_ref": null,
+                "config": "{}"
+            }
+        ]))
+        .expect_err("missing artifact_ref should fail");
+        assert!(error.to_string().contains("requires artifact_ref"));
     }
 
     #[test]

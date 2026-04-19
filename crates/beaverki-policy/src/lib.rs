@@ -56,6 +56,10 @@ pub fn can_send_household_direct_delivery(role_ids: &[String]) -> bool {
         .any(|role| HOUSEHOLD_DIRECT_DELIVERY_ROLES.contains(&role.as_str()))
 }
 
+pub fn can_schedule_household_delivery(role_ids: &[String]) -> bool {
+    can_send_household_direct_delivery(role_ids)
+}
+
 pub fn can_grant_approvals(role_ids: &[String]) -> bool {
     role_ids
         .iter()

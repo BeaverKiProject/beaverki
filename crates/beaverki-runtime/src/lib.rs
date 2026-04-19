@@ -19,13 +19,18 @@ use beaverki_db::{
     ApprovalActionRow, ApprovalActionSet, ApprovalRow, BootstrapState, ConnectorIdentityRow,
     ConversationSessionRow, Database, HouseholdDeliveryRow, IssueApprovalActions, MemoryRow,
     NewConversationSession, NewHouseholdDelivery, NewSchedule, NewScript, NewScriptReview, NewTask,
-    RoleRow, RuntimeHeartbeatRow, RuntimeSessionRow, ScheduleRow, ScriptReviewRow, ScriptRow,
-    TaskEventRow, TaskRow, ToolInvocationRow, UserRoleRow, UserRow,
+    NewWorkflowDefinition, NewWorkflowReview, NewWorkflowRun, NewWorkflowStage, RoleRow,
+    RuntimeHeartbeatRow, RuntimeSessionRow, ScheduleRow, ScriptReviewRow, ScriptRow, TaskEventRow,
+    TaskRow, ToolInvocationRow, UpdateWorkflowDefinition, UserRoleRow, UserRow,
+    WorkflowDefinitionRow, WorkflowReviewRow, WorkflowRunRow, WorkflowStageRow, WorkflowVersionRow,
 };
 use beaverki_memory::MemoryStore;
 use beaverki_models::{ModelProvider, OpenAiProvider};
-use beaverki_policy::{can_grant_approvals, can_write_household_memory, visible_memory_scopes};
-use beaverki_tools::{ToolContext, builtin_registry};
+use beaverki_policy::{
+    can_grant_approvals, can_send_household_direct_delivery, can_write_household_memory,
+    visible_memory_scopes,
+};
+use beaverki_tools::{ToolContext, builtin_registry, validate_json_value_against_schema};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -53,6 +58,8 @@ const SESSION_AUDIENCE_GUEST_ROOM: &str = "guest_room";
 const SESSION_AUDIENCE_SHARED_ROOM: &str = "shared_room";
 const SESSION_AUDIENCE_SCHEDULED_RUN: &str = "scheduled_run";
 const SESSION_LIFECYCLE_REASON_MANUAL_RESET: &str = "manual_reset";
+const WORKFLOW_RUN_TASK_KIND: &str = "workflow_run";
+const WORKFLOW_AGENT_STAGE_TASK_KIND: &str = "workflow_agent_stage";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskInspection {
@@ -66,6 +73,36 @@ pub struct ScriptInspection {
     pub script: ScriptRow,
     pub reviews: Vec<ScriptReviewRow>,
     pub schedules: Vec<ScheduleRow>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowInspection {
+    pub workflow: WorkflowDefinitionRow,
+    pub versions: Vec<WorkflowVersionRow>,
+    pub stages: Vec<WorkflowStageRow>,
+    pub reviews: Vec<WorkflowReviewRow>,
+    pub schedules: Vec<ScheduleRow>,
+    pub runs: Vec<WorkflowRunRow>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowDefinitionInput {
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub stages: Vec<WorkflowStageInput>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowStageInput {
+    pub kind: String,
+    #[serde(default)]
+    pub label: Option<String>,
+    #[serde(default)]
+    pub artifact_ref: Option<String>,
+    #[serde(default)]
+    pub config: Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -163,6 +200,15 @@ impl HouseholdDeliveryDelegate for RuntimeHouseholdDeliveryDelegate {
                 target_ref: &identity.external_user_id,
                 fallback_target_ref: identity.external_channel_id.as_deref(),
                 dedupe_key: request.dedupe_key,
+                initial_status: "dispatching",
+                parent_delivery_id: None,
+                schedule_id: None,
+                scheduled_for_at: None,
+                window_starts_at: None,
+                window_ends_at: None,
+                recurrence_rule: None,
+                scheduled_job_state: None,
+                materialized_task_id: None,
             })
             .await
             .map_err(beaverki_tools::ToolError::Failed)?;
@@ -195,6 +241,8 @@ impl HouseholdDeliveryDelegate for RuntimeHouseholdDeliveryDelegate {
                     self.db
                         .mark_household_delivery_sent(
                             &delivery.delivery_id,
+                            &identity.connector_type,
+                            &identity.identity_id,
                             &sent.target_ref,
                             Some(&sent.message_id),
                         )
@@ -399,6 +447,7 @@ impl Runtime {
         }
         let mut tool_context =
             ToolContext::new(config.runtime.workspace_root.clone(), allowed_roots);
+        tool_context.default_timezone = Some(config.runtime.default_timezone.clone());
         tool_context.browser_interactive_launcher =
             config.integrations.browser.interactive_launcher.clone();
         tool_context.browser_headless_program =
@@ -595,6 +644,12 @@ impl Runtime {
     }
 
     pub async fn execute_task(&self, task: TaskRow) -> Result<AgentResult> {
+        if task.kind == "scheduled_household_delivery" {
+            return self.execute_scheduled_household_delivery_task(task).await;
+        }
+        if task.kind == WORKFLOW_RUN_TASK_KIND {
+            return self.execute_workflow_run_task(task).await;
+        }
         if task.kind == "scheduled_lua" || task.kind == "lua_script" {
             return self.execute_lua_task(task).await;
         }
@@ -1042,6 +1097,284 @@ impl Runtime {
             .ok_or_else(|| anyhow!("script '{}' disappeared after disable", script.script_id))
     }
 
+    pub async fn create_workflow_definition(
+        &self,
+        user_id: Option<&str>,
+        workflow_id: Option<&str>,
+        definition: WorkflowDefinitionInput,
+        created_from_task_id: Option<&str>,
+        intended_behavior_summary: &str,
+    ) -> Result<WorkflowInspection> {
+        let user = self.resolve_user(user_id).await?;
+        validate_workflow_definition_input(&definition)?;
+        let stages = definition
+            .stages
+            .iter()
+            .map(|stage| NewWorkflowStage {
+                stage_id: None,
+                stage_kind: stage.kind.as_str(),
+                stage_label: stage.label.as_deref(),
+                artifact_ref: stage.artifact_ref.as_deref(),
+                stage_config_json: stage.config.clone(),
+            })
+            .collect::<Vec<_>>();
+        let workflow = if let Some(workflow_id) = workflow_id
+            && self
+                .db
+                .fetch_workflow_definition_for_owner(&user.user_id, workflow_id)
+                .await?
+                .is_some()
+        {
+            self.db
+                .update_workflow_definition_contents(
+                    UpdateWorkflowDefinition {
+                        workflow_id,
+                        owner_user_id: &user.user_id,
+                        name: &definition.name,
+                        description: definition.description.as_deref(),
+                        created_from_task_id,
+                        status: "draft",
+                        safety_status: "pending",
+                        safety_summary: Some("Awaiting workflow safety review."),
+                    },
+                    &stages,
+                )
+                .await?
+        } else {
+            self.db
+                .create_workflow_definition(
+                    NewWorkflowDefinition {
+                        workflow_id,
+                        owner_user_id: &user.user_id,
+                        name: &definition.name,
+                        description: definition.description.as_deref(),
+                        status: "draft",
+                        created_from_task_id,
+                        safety_status: "pending",
+                        safety_summary: Some("Awaiting workflow safety review."),
+                    },
+                    &stages,
+                )
+                .await?
+        };
+        self.db
+            .record_audit_event(
+                "user",
+                &user.user_id,
+                "workflow_written",
+                json!({
+                    "workflow_id": workflow.workflow_id,
+                    "created_from_task_id": created_from_task_id,
+                    "stage_count": definition.stages.len(),
+                    "current_version_number": workflow.current_version_number,
+                }),
+            )
+            .await?;
+        let _ = self
+            .review_workflow_definition(
+                Some(&user.user_id),
+                &workflow.workflow_id,
+                intended_behavior_summary,
+            )
+            .await?;
+        self.inspect_workflow_definition(Some(&user.user_id), &workflow.workflow_id)
+            .await
+    }
+
+    pub async fn review_workflow_definition(
+        &self,
+        user_id: Option<&str>,
+        workflow_id: &str,
+        intended_behavior_summary: &str,
+    ) -> Result<WorkflowReviewRow> {
+        let user = self.resolve_user(user_id).await?;
+        let workflow = self
+            .db
+            .fetch_workflow_definition_for_owner(&user.user_id, workflow_id)
+            .await?
+            .ok_or_else(|| anyhow!("workflow '{workflow_id}' not found"))?;
+        let stages = self.db.list_workflow_stages(&workflow.workflow_id).await?;
+        let definition_json = workflow_definition_json(&workflow, &stages)?;
+        let review = automation::review_workflow_definition(
+            &self.provider,
+            &workflow.workflow_id,
+            workflow.created_from_task_id.as_deref(),
+            &user.user_id,
+            &definition_json,
+            intended_behavior_summary,
+        )
+        .await?;
+        let application =
+            automation::apply_script_review(&review, &workflow.status, Some(&workflow.status));
+        self.db
+            .update_workflow_definition_safety(
+                &workflow.workflow_id,
+                &application.safety_status,
+                &review.summary,
+                Some(&application.resulting_status),
+            )
+            .await?;
+        let review_row = self
+            .db
+            .create_workflow_review(NewWorkflowReview {
+                workflow_id: &workflow.workflow_id,
+                version_number: workflow.current_version_number,
+                reviewer_agent_id: automation::SAFETY_AGENT_ID,
+                review_type: "workflow_definition",
+                verdict: &review.verdict,
+                risk_level: &review.risk_level,
+                findings_json: review.as_findings_json(),
+                summary_text: &review.summary,
+                reviewed_artifact_text: &definition_json.to_string(),
+            })
+            .await?;
+        self.db
+            .record_audit_event(
+                "safety_agent",
+                automation::SAFETY_AGENT_ID,
+                "workflow_reviewed",
+                json!({
+                    "workflow_id": workflow.workflow_id,
+                    "owner_user_id": user.user_id,
+                    "verdict": review.verdict,
+                    "risk_level": review.risk_level,
+                    "summary": review.summary,
+                }),
+            )
+            .await?;
+        Ok(review_row)
+    }
+
+    pub async fn list_workflow_definitions(
+        &self,
+        user_id: Option<&str>,
+    ) -> Result<Vec<WorkflowDefinitionRow>> {
+        let user = self.resolve_user(user_id).await?;
+        self.db
+            .list_workflow_definitions_for_owner(&user.user_id)
+            .await
+    }
+
+    pub async fn inspect_workflow_definition(
+        &self,
+        user_id: Option<&str>,
+        workflow_id: &str,
+    ) -> Result<WorkflowInspection> {
+        let user = self.resolve_user(user_id).await?;
+        let workflow = self
+            .db
+            .fetch_workflow_definition_for_owner(&user.user_id, workflow_id)
+            .await?
+            .ok_or_else(|| anyhow!("workflow '{workflow_id}' not found"))?;
+        let versions = self.db.list_workflow_versions(&workflow.workflow_id).await?;
+        let stages = self.db.list_workflow_stages(&workflow.workflow_id).await?;
+        let reviews = self.db.list_workflow_reviews(&workflow.workflow_id).await?;
+        let schedules = self
+            .db
+            .list_schedules_for_owner(&user.user_id)
+            .await?
+            .into_iter()
+            .filter(|row| row.target_type == "workflow" && row.target_id == workflow.workflow_id)
+            .collect();
+        let runs = self.db.list_workflow_runs_for_workflow(&workflow.workflow_id).await?;
+        Ok(WorkflowInspection {
+            workflow,
+            versions,
+            stages,
+            reviews,
+            schedules,
+            runs,
+        })
+    }
+
+    pub async fn activate_workflow_definition(
+        &self,
+        user_id: Option<&str>,
+        workflow_id: &str,
+    ) -> Result<WorkflowDefinitionRow> {
+        let user = self.resolve_user(user_id).await?;
+        let workflow = self
+            .db
+            .fetch_workflow_definition_for_owner(&user.user_id, workflow_id)
+            .await?
+            .ok_or_else(|| anyhow!("workflow '{workflow_id}' not found"))?;
+        if workflow.safety_status != "approved" {
+            bail!(
+                "workflow '{}' cannot be activated until workflow safety review is approved",
+                workflow.workflow_id
+            );
+        }
+        let stages = self.db.list_workflow_stages(&workflow.workflow_id).await?;
+        self.validate_workflow_stage_references(&workflow, &stages).await?;
+        self.db
+            .update_workflow_definition_status(&workflow.workflow_id, "active")
+            .await?;
+        self.db
+            .record_audit_event(
+                "user",
+                &user.user_id,
+                "workflow_activated",
+                json!({ "workflow_id": workflow.workflow_id }),
+            )
+            .await?;
+        self.db
+            .fetch_workflow_definition_for_owner(&user.user_id, &workflow.workflow_id)
+            .await?
+            .ok_or_else(|| anyhow!("workflow '{}' disappeared after activation", workflow.workflow_id))
+    }
+
+    pub async fn disable_workflow_definition(
+        &self,
+        user_id: Option<&str>,
+        workflow_id: &str,
+    ) -> Result<WorkflowDefinitionRow> {
+        let user = self.resolve_user(user_id).await?;
+        let workflow = self
+            .db
+            .fetch_workflow_definition_for_owner(&user.user_id, workflow_id)
+            .await?
+            .ok_or_else(|| anyhow!("workflow '{workflow_id}' not found"))?;
+        self.db
+            .update_workflow_definition_status(&workflow.workflow_id, "disabled")
+            .await?;
+        self.db
+            .record_audit_event(
+                "user",
+                &user.user_id,
+                "workflow_disabled",
+                json!({ "workflow_id": workflow.workflow_id }),
+            )
+            .await?;
+        self.db
+            .fetch_workflow_definition_for_owner(&user.user_id, &workflow.workflow_id)
+            .await?
+            .ok_or_else(|| anyhow!("workflow '{}' disappeared after disable", workflow.workflow_id))
+    }
+
+    pub async fn replay_workflow_definition(
+        &self,
+        user_id: Option<&str>,
+        workflow_id: &str,
+    ) -> Result<TaskRow> {
+        let user = self.resolve_user(user_id).await?;
+        let workflow = self
+            .db
+            .fetch_workflow_definition_for_owner(&user.user_id, workflow_id)
+            .await?
+            .ok_or_else(|| anyhow!("workflow '{workflow_id}' not found"))?;
+        let primary_agent_id = self.primary_agent_id_for_owner(&user.user_id).await?;
+        let session = self.create_cron_run_session(&workflow.workflow_id).await?;
+        self.start_workflow_run(
+            &workflow,
+            format!("workflow:{}", workflow.workflow_id),
+            None,
+            &primary_agent_id,
+            Some(&session.session_id),
+            None,
+        )
+        .await
+    }
+
     pub async fn create_schedule(
         &self,
         user_id: Option<&str>,
@@ -1050,26 +1383,87 @@ impl Runtime {
         cron_expr: &str,
         enabled: bool,
     ) -> Result<ScheduleRow> {
+        self.create_schedule_for_target(
+            user_id,
+            schedule_id,
+            "lua_script",
+            script_id,
+            cron_expr,
+            enabled,
+        )
+        .await
+    }
+
+    pub async fn create_workflow_schedule(
+        &self,
+        user_id: Option<&str>,
+        schedule_id: Option<&str>,
+        workflow_id: &str,
+        cron_expr: &str,
+        enabled: bool,
+    ) -> Result<ScheduleRow> {
+        self.create_schedule_for_target(
+            user_id,
+            schedule_id,
+            "workflow",
+            workflow_id,
+            cron_expr,
+            enabled,
+        )
+        .await
+    }
+
+    async fn create_schedule_for_target(
+        &self,
+        user_id: Option<&str>,
+        schedule_id: Option<&str>,
+        target_type: &str,
+        target_id: &str,
+        cron_expr: &str,
+        enabled: bool,
+    ) -> Result<ScheduleRow> {
         let user = self.resolve_user(user_id).await?;
-        let script = self
-            .db
-            .fetch_script_for_owner(&user.user_id, script_id)
-            .await?
-            .ok_or_else(|| anyhow!("script '{script_id}' not found"))?;
-        if script.status != "active" {
-            bail!(
-                "script '{}' must be active before scheduling",
-                script.script_id
-            );
+        match target_type {
+            "lua_script" => {
+                let script = self
+                    .db
+                    .fetch_script_for_owner(&user.user_id, target_id)
+                    .await?
+                    .ok_or_else(|| anyhow!("script '{target_id}' not found"))?;
+                if script.status != "active" {
+                    bail!(
+                        "script '{}' must be active before scheduling",
+                        script.script_id
+                    );
+                }
+            }
+            "workflow" => {
+                let workflow = self
+                    .db
+                    .fetch_workflow_definition_for_owner(&user.user_id, target_id)
+                    .await?
+                    .ok_or_else(|| anyhow!("workflow '{target_id}' not found"))?;
+                if workflow.status != "active" || workflow.safety_status != "approved" {
+                    bail!(
+                        "workflow '{}' must be active and approved before scheduling",
+                        workflow.workflow_id
+                    );
+                }
+            }
+            other => bail!("unsupported schedule target type '{other}'"),
         }
-        let next_run_at = automation::next_run_after(cron_expr, &now_rfc3339())?;
+        let next_run_at = automation::next_run_after(
+            cron_expr,
+            &now_rfc3339(),
+            Some(self.config.runtime.default_timezone.as_str()),
+        )?;
         let schedule = self
             .db
             .create_schedule(NewSchedule {
                 schedule_id,
                 owner_user_id: &user.user_id,
-                target_type: "lua_script",
-                target_id: &script.script_id,
+                target_type,
+                target_id,
                 cron_expr,
                 enabled,
                 next_run_at: &next_run_at,
@@ -1082,7 +1476,8 @@ impl Runtime {
                 "schedule_created",
                 json!({
                     "schedule_id": schedule.schedule_id,
-                    "script_id": script.script_id,
+                    "target_type": target_type,
+                    "target_id": target_id,
                     "cron_expr": cron_expr,
                     "enabled": enabled,
                 }),
@@ -1109,7 +1504,11 @@ impl Runtime {
             .await?
             .ok_or_else(|| anyhow!("schedule '{schedule_id}' not found"))?;
         let next_run_at = if enabled {
-            automation::next_run_after(&schedule.cron_expr, &now_rfc3339())?
+            automation::next_run_after(
+                &schedule.cron_expr,
+                &now_rfc3339(),
+                Some(self.config.runtime.default_timezone.as_str()),
+            )?
         } else {
             schedule.next_run_at.clone()
         };
@@ -1152,73 +1551,11 @@ impl Runtime {
         let due = self.db.list_due_schedules(&now).await?;
         let mut tasks = Vec::new();
         for schedule in due {
-            let next_run_at = automation::next_run_after(&schedule.cron_expr, &now)?;
-            let Some(script) = self.db.fetch_script(&schedule.target_id).await? else {
-                self.db
-                    .update_schedule_state(
-                        &schedule.schedule_id,
-                        automation::schedule_enabled(&schedule),
-                        &next_run_at,
-                        Some(&now),
-                    )
-                    .await?;
-                self.db
-                    .record_audit_event(
-                        "runtime",
-                        &self.config.runtime.instance_id,
-                        "schedule_skipped",
-                        json!({
-                            "schedule_id": schedule.schedule_id,
-                            "target_id": schedule.target_id,
-                            "reason": "script_missing",
-                            "next_run_at": next_run_at,
-                        }),
-                    )
-                    .await?;
-                continue;
-            };
-            if script.status != "active" || script.safety_status != "approved" {
-                let reason = if script.status != "active" {
-                    "script_not_active"
-                } else {
-                    "script_not_approved"
-                };
-                self.db
-                    .update_schedule_state(
-                        &schedule.schedule_id,
-                        automation::schedule_enabled(&schedule),
-                        &next_run_at,
-                        Some(&now),
-                    )
-                    .await?;
-                self.db
-                    .record_audit_event(
-                        "runtime",
-                        &self.config.runtime.instance_id,
-                        "schedule_skipped",
-                        json!({
-                            "schedule_id": schedule.schedule_id,
-                            "script_id": script.script_id,
-                            "reason": reason,
-                            "script_status": script.status,
-                            "safety_status": script.safety_status,
-                            "next_run_at": next_run_at,
-                        }),
-                    )
-                    .await?;
-                continue;
-            }
-            let primary_agent_id = self
-                .primary_agent_id_for_owner(&schedule.owner_user_id)
-                .await?;
-            let initiating_identity_id = format!("schedule:{}", schedule.schedule_id);
-            let objective = format!("Run Lua automation {}", script.script_id);
-            let task_context = json!({
-                "script_id": script.script_id,
-                "schedule_id": schedule.schedule_id,
-            })
-            .to_string();
-            let session = self.create_cron_run_session(&schedule.schedule_id).await?;
+            let next_run_at = automation::next_run_after(
+                &schedule.cron_expr,
+                &now,
+                Some(self.config.runtime.default_timezone.as_str()),
+            )?;
             self.db
                 .update_schedule_state(
                     &schedule.schedule_id,
@@ -1227,38 +1564,1086 @@ impl Runtime {
                     Some(&now),
                 )
                 .await?;
-            let task = self
-                .db
-                .create_task_with_params(NewTask {
-                    owner_user_id: &schedule.owner_user_id,
-                    initiating_identity_id: &initiating_identity_id,
-                    primary_agent_id: &primary_agent_id,
-                    assigned_agent_id: &primary_agent_id,
-                    parent_task_id: None,
-                    session_id: Some(&session.session_id),
-                    kind: "scheduled_lua",
-                    objective: &objective,
-                    context_summary: Some(&task_context),
-                    scope: MemoryScope::Private,
-                    wake_at: None,
-                })
-                .await?;
+            match schedule.target_type.as_str() {
+                "lua_script" => {
+                    let Some(script) = self.db.fetch_script(&schedule.target_id).await? else {
+                        self.db
+                            .record_audit_event(
+                                "runtime",
+                                &self.config.runtime.instance_id,
+                                "schedule_skipped",
+                                json!({
+                                    "schedule_id": schedule.schedule_id,
+                                    "target_id": schedule.target_id,
+                                    "reason": "script_missing",
+                                    "next_run_at": next_run_at,
+                                }),
+                            )
+                            .await?;
+                        continue;
+                    };
+                    if script.status != "active" || script.safety_status != "approved" {
+                        let reason = if script.status != "active" {
+                            "script_not_active"
+                        } else {
+                            "script_not_approved"
+                        };
+                        self.db
+                            .record_audit_event(
+                                "runtime",
+                                &self.config.runtime.instance_id,
+                                "schedule_skipped",
+                                json!({
+                                    "schedule_id": schedule.schedule_id,
+                                    "script_id": script.script_id,
+                                    "reason": reason,
+                                    "script_status": script.status,
+                                    "safety_status": script.safety_status,
+                                    "next_run_at": next_run_at,
+                                }),
+                            )
+                            .await?;
+                        continue;
+                    }
+                    let primary_agent_id = self
+                        .primary_agent_id_for_owner(&schedule.owner_user_id)
+                        .await?;
+                    let initiating_identity_id = format!("schedule:{}", schedule.schedule_id);
+                    let objective = format!("Run Lua automation {}", script.script_id);
+                    let task_context = json!({
+                        "script_id": script.script_id,
+                        "schedule_id": schedule.schedule_id,
+                    })
+                    .to_string();
+                    let session = self.create_cron_run_session(&schedule.schedule_id).await?;
+                    let task = self
+                        .db
+                        .create_task_with_params(NewTask {
+                            owner_user_id: &schedule.owner_user_id,
+                            initiating_identity_id: &initiating_identity_id,
+                            primary_agent_id: &primary_agent_id,
+                            assigned_agent_id: &primary_agent_id,
+                            parent_task_id: None,
+                            session_id: Some(&session.session_id),
+                            kind: "scheduled_lua",
+                            objective: &objective,
+                            context_summary: Some(&task_context),
+                            scope: MemoryScope::Private,
+                            wake_at: None,
+                        })
+                        .await?;
+                    self.db
+                        .record_audit_event(
+                            "runtime",
+                            &self.config.runtime.instance_id,
+                            "schedule_triggered",
+                            json!({
+                                "schedule_id": schedule.schedule_id,
+                                "task_id": task.task_id,
+                                "script_id": script.script_id,
+                                "next_run_at": next_run_at,
+                            }),
+                        )
+                        .await?;
+                    tasks.push(task);
+                }
+                "household_delivery" => {
+                    let Some(template) = self
+                        .db
+                        .fetch_household_delivery(&schedule.target_id)
+                        .await?
+                    else {
+                        self.db
+                            .record_audit_event(
+                                "runtime",
+                                &self.config.runtime.instance_id,
+                                "schedule_skipped",
+                                json!({
+                                    "schedule_id": schedule.schedule_id,
+                                    "target_id": schedule.target_id,
+                                    "reason": "delivery_template_missing",
+                                    "next_run_at": next_run_at,
+                                }),
+                            )
+                            .await?;
+                        continue;
+                    };
+                    if template.status == "canceled" {
+                        self.db
+                            .record_audit_event(
+                                "runtime",
+                                &self.config.runtime.instance_id,
+                                "schedule_skipped",
+                                json!({
+                                    "schedule_id": schedule.schedule_id,
+                                    "delivery_id": template.delivery_id,
+                                    "reason": "delivery_canceled",
+                                    "next_run_at": next_run_at,
+                                }),
+                            )
+                            .await?;
+                        continue;
+                    }
+                    let occurrence_dedupe_key =
+                        format!("schedule:{}:{}", schedule.schedule_id, schedule.next_run_at);
+                    let occurrence = self
+                        .db
+                        .create_or_reuse_household_delivery(NewHouseholdDelivery {
+                            task_id: &template.task_id,
+                            requester_user_id: &template.requester_user_id,
+                            requester_identity_id: &template.requester_identity_id,
+                            recipient_user_id: &template.recipient_user_id,
+                            message_text: &template.message_text,
+                            delivery_mode: "scheduled_occurrence",
+                            connector_type: &template.connector_type,
+                            connector_identity_id: &template.connector_identity_id,
+                            target_ref: &template.target_ref,
+                            fallback_target_ref: template.fallback_target_ref.as_deref(),
+                            dedupe_key: &occurrence_dedupe_key,
+                            initial_status: "scheduled",
+                            parent_delivery_id: Some(&template.delivery_id),
+                            schedule_id: Some(&schedule.schedule_id),
+                            scheduled_for_at: Some(&schedule.next_run_at),
+                            window_starts_at: template.window_starts_at.as_deref(),
+                            window_ends_at: template.window_ends_at.as_deref(),
+                            recurrence_rule: Some(&schedule.cron_expr),
+                            scheduled_job_state: Some("scheduled"),
+                            materialized_task_id: None,
+                        })
+                        .await?;
+                    let objective = format!(
+                        "Deliver scheduled household message to {}",
+                        template.recipient_user_id
+                    );
+                    let task_context = json!({
+                        "delivery_id": occurrence.delivery_id,
+                        "schedule_id": schedule.schedule_id,
+                    })
+                    .to_string();
+                    if let Some(existing_task_id) = occurrence.materialized_task_id.as_deref() {
+                        if let Some(existing_task) = self.db.fetch_task(existing_task_id).await? {
+                            tasks.push(existing_task);
+                            continue;
+                        }
+                    }
+                    let primary_agent_id = self
+                        .primary_agent_id_for_owner(&schedule.owner_user_id)
+                        .await?;
+                    let task = self
+                        .db
+                        .create_task_with_params(NewTask {
+                            owner_user_id: &schedule.owner_user_id,
+                            initiating_identity_id: &template.requester_identity_id,
+                            primary_agent_id: &primary_agent_id,
+                            assigned_agent_id: &primary_agent_id,
+                            parent_task_id: None,
+                            session_id: None,
+                            kind: "scheduled_household_delivery",
+                            objective: &objective,
+                            context_summary: Some(&task_context),
+                            scope: MemoryScope::Private,
+                            wake_at: None,
+                        })
+                        .await?;
+                    self.db
+                        .mark_household_delivery_materialized(
+                            &occurrence.delivery_id,
+                            &task.task_id,
+                        )
+                        .await?;
+                    self.db
+                        .record_audit_event(
+                            "runtime",
+                            &self.config.runtime.instance_id,
+                            "schedule_triggered",
+                            json!({
+                                "schedule_id": schedule.schedule_id,
+                                "task_id": task.task_id,
+                                "delivery_id": occurrence.delivery_id,
+                                "template_delivery_id": template.delivery_id,
+                                "next_run_at": next_run_at,
+                            }),
+                        )
+                        .await?;
+                    tasks.push(task);
+                }
+                "workflow" => {
+                    let Some(workflow) = self
+                        .db
+                        .fetch_workflow_definition(&schedule.target_id)
+                        .await?
+                    else {
+                        self.db
+                            .record_audit_event(
+                                "runtime",
+                                &self.config.runtime.instance_id,
+                                "schedule_skipped",
+                                json!({
+                                    "schedule_id": schedule.schedule_id,
+                                    "target_id": schedule.target_id,
+                                    "reason": "workflow_missing",
+                                    "next_run_at": next_run_at,
+                                }),
+                            )
+                            .await?;
+                        continue;
+                    };
+                    if workflow.status != "active" || workflow.safety_status != "approved" {
+                        let reason = if workflow.status != "active" {
+                            "workflow_not_active"
+                        } else {
+                            "workflow_not_approved"
+                        };
+                        self.db
+                            .record_audit_event(
+                                "runtime",
+                                &self.config.runtime.instance_id,
+                                "schedule_skipped",
+                                json!({
+                                    "schedule_id": schedule.schedule_id,
+                                    "workflow_id": workflow.workflow_id,
+                                    "reason": reason,
+                                    "workflow_status": workflow.status,
+                                    "safety_status": workflow.safety_status,
+                                    "next_run_at": next_run_at,
+                                }),
+                            )
+                            .await?;
+                        continue;
+                    }
+                    let stages = self.db.list_workflow_stages(&workflow.workflow_id).await?;
+                    if let Err(error) = self.validate_workflow_stage_references(&workflow, &stages).await {
+                        self.db
+                            .record_audit_event(
+                                "runtime",
+                                &self.config.runtime.instance_id,
+                                "schedule_skipped",
+                                json!({
+                                    "schedule_id": schedule.schedule_id,
+                                    "workflow_id": workflow.workflow_id,
+                                    "reason": "workflow_reference_invalid",
+                                    "error": error.to_string(),
+                                    "next_run_at": next_run_at,
+                                }),
+                            )
+                            .await?;
+                        continue;
+                    }
+                    let primary_agent_id = self
+                        .primary_agent_id_for_owner(&schedule.owner_user_id)
+                        .await?;
+                    let session = self.create_cron_run_session(&schedule.schedule_id).await?;
+                    let task = self
+                        .start_workflow_run(
+                            &workflow,
+                            format!("schedule:{}", schedule.schedule_id),
+                            Some(&schedule.schedule_id),
+                            &primary_agent_id,
+                            Some(&session.session_id),
+                            None,
+                        )
+                        .await?;
+                    self.db
+                        .record_audit_event(
+                            "runtime",
+                            &self.config.runtime.instance_id,
+                            "schedule_triggered",
+                            json!({
+                                "schedule_id": schedule.schedule_id,
+                                "task_id": task.task_id,
+                                "workflow_id": workflow.workflow_id,
+                                "next_run_at": next_run_at,
+                            }),
+                        )
+                        .await?;
+                    tasks.push(task);
+                }
+                other => {
+                    self.db
+                        .record_audit_event(
+                            "runtime",
+                            &self.config.runtime.instance_id,
+                            "schedule_skipped",
+                            json!({
+                                "schedule_id": schedule.schedule_id,
+                                "target_type": other,
+                                "reason": "unsupported_target_type",
+                                "next_run_at": next_run_at,
+                            }),
+                        )
+                        .await?;
+                }
+            }
+        }
+        Ok(tasks)
+    }
+
+    async fn execute_scheduled_household_delivery_task(
+        &self,
+        task: TaskRow,
+    ) -> Result<AgentResult> {
+        self.db.clear_task_result(&task.task_id).await?;
+        self.db
+            .update_task_state(&task.task_id, TaskState::Running)
+            .await?;
+        self.db
+            .append_task_event(
+                &task.task_id,
+                "household_delivery_task_started",
+                "runtime",
+                &self.config.runtime.instance_id,
+                json!({ "objective": task.objective }),
+            )
+            .await?;
+
+        let context: Value = task
+            .context_summary
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()
+            .context("failed to parse scheduled household delivery task context")?
+            .unwrap_or_else(|| json!({}));
+        let delivery_id = context
+            .get("delivery_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                anyhow!(
+                    "scheduled household delivery task '{}' is missing delivery_id context",
+                    task.task_id
+                )
+            })?;
+        let Some(delivery) = self.db.fetch_household_delivery(delivery_id).await? else {
             self.db
-                .record_audit_event(
+                .fail_task(&task.task_id, "scheduled household delivery is missing")
+                .await?;
+            let failed = self
+                .db
+                .fetch_task_for_owner(&task.owner_user_id, &task.task_id)
+                .await?
+                .ok_or_else(|| anyhow!("scheduled task '{}' disappeared", task.task_id))?;
+            return Ok(AgentResult { task: failed });
+        };
+
+        if delivery.status == "sent" {
+            self.db
+                .complete_task(
+                    &task.task_id,
+                    "scheduled household delivery was already sent",
+                )
+                .await?;
+            let completed = self
+                .db
+                .fetch_task_for_owner(&task.owner_user_id, &task.task_id)
+                .await?
+                .ok_or_else(|| anyhow!("scheduled task '{}' disappeared", task.task_id))?;
+            return Ok(AgentResult { task: completed });
+        }
+        if delivery.status == "canceled" {
+            self.db
+                .complete_task(
+                    &task.task_id,
+                    "scheduled household delivery was canceled before execution",
+                )
+                .await?;
+            let completed = self
+                .db
+                .fetch_task_for_owner(&task.owner_user_id, &task.task_id)
+                .await?
+                .ok_or_else(|| anyhow!("scheduled task '{}' disappeared", task.task_id))?;
+            return Ok(AgentResult { task: completed });
+        }
+        if let Some(window_ends_at) = delivery.window_ends_at.as_deref() {
+            let now = DateTime::parse_from_rfc3339(&now_rfc3339())?.with_timezone(&Utc);
+            let window_end = DateTime::parse_from_rfc3339(window_ends_at)?.with_timezone(&Utc);
+            if now > window_end {
+                let reason = format!(
+                    "scheduled household delivery window expired at {}",
+                    window_ends_at
+                );
+                self.db
+                    .mark_household_delivery_failed(&delivery.delivery_id, &reason)
+                    .await?;
+                self.db.fail_task(&task.task_id, &reason).await?;
+                let failed = self
+                    .db
+                    .fetch_task_for_owner(&task.owner_user_id, &task.task_id)
+                    .await?
+                    .ok_or_else(|| anyhow!("scheduled task '{}' disappeared", task.task_id))?;
+                return Ok(AgentResult { task: failed });
+            }
+        }
+
+        let requester = match self.db.fetch_user(&delivery.requester_user_id).await? {
+            Some(user) => user,
+            None => {
+                let reason = format!(
+                    "requester '{}' no longer exists for scheduled household delivery",
+                    delivery.requester_user_id
+                );
+                self.db
+                    .mark_household_delivery_failed(&delivery.delivery_id, &reason)
+                    .await?;
+                self.db.fail_task(&task.task_id, &reason).await?;
+                let failed = self
+                    .db
+                    .fetch_task_for_owner(&task.owner_user_id, &task.task_id)
+                    .await?
+                    .ok_or_else(|| anyhow!("scheduled task '{}' disappeared", task.task_id))?;
+                return Ok(AgentResult { task: failed });
+            }
+        };
+        let requester_roles = self
+            .db
+            .list_user_roles(&requester.user_id)
+            .await?
+            .into_iter()
+            .map(|row| row.role_id)
+            .collect::<Vec<_>>();
+        if !can_send_household_direct_delivery(&requester_roles) {
+            let reason = format!(
+                "requester '{}' is no longer allowed to send household delivery",
+                requester.user_id
+            );
+            self.db
+                .mark_household_delivery_failed(&delivery.delivery_id, &reason)
+                .await?;
+            self.db.fail_task(&task.task_id, &reason).await?;
+            let failed = self
+                .db
+                .fetch_task_for_owner(&task.owner_user_id, &task.task_id)
+                .await?
+                .ok_or_else(|| anyhow!("scheduled task '{}' disappeared", task.task_id))?;
+            return Ok(AgentResult { task: failed });
+        }
+
+        let recipient = match self.db.fetch_user(&delivery.recipient_user_id).await? {
+            Some(user) => user,
+            None => {
+                let reason = format!(
+                    "recipient '{}' no longer exists for household delivery",
+                    delivery.recipient_user_id
+                );
+                self.db
+                    .mark_household_delivery_failed(&delivery.delivery_id, &reason)
+                    .await?;
+                self.db.fail_task(&task.task_id, &reason).await?;
+                let failed = self
+                    .db
+                    .fetch_task_for_owner(&task.owner_user_id, &task.task_id)
+                    .await?
+                    .ok_or_else(|| anyhow!("scheduled task '{}' disappeared", task.task_id))?;
+                return Ok(AgentResult { task: failed });
+            }
+        };
+        let delegate = RuntimeHouseholdDeliveryDelegate {
+            db: self.db.clone(),
+            runtime_actor_id: self.config.runtime.instance_id.clone(),
+            discord_bot_token: self.discord_bot_token.clone(),
+        };
+        let identity = match delegate
+            .select_household_delivery_identity(&recipient.user_id)
+            .await
+        {
+            Ok(identity) => identity,
+            Err(error) => {
+                let reason = match error {
+                    beaverki_tools::ToolError::Denied { message, .. } => message,
+                    beaverki_tools::ToolError::Failed(error) => error.to_string(),
+                };
+                self.db
+                    .mark_household_delivery_failed(&delivery.delivery_id, &reason)
+                    .await?;
+                self.db.fail_task(&task.task_id, &reason).await?;
+                let failed = self
+                    .db
+                    .fetch_task_for_owner(&task.owner_user_id, &task.task_id)
+                    .await?
+                    .ok_or_else(|| anyhow!("scheduled task '{}' disappeared", task.task_id))?;
+                return Ok(AgentResult { task: failed });
+            }
+        };
+
+        match delegate
+            .send_household_delivery(&delivery, &identity, &requester)
+            .await
+        {
+            Ok(sent) => {
+                self.db
+                    .mark_household_delivery_sent(
+                        &delivery.delivery_id,
+                        &identity.connector_type,
+                        &identity.identity_id,
+                        &sent.target_ref,
+                        Some(&sent.message_id),
+                    )
+                    .await?;
+                self.db
+                    .append_task_event(
+                        &task.task_id,
+                        "household_delivery_sent",
+                        "runtime",
+                        &self.config.runtime.instance_id,
+                        json!({
+                            "delivery_id": delivery.delivery_id,
+                            "requester_user_id": requester.user_id,
+                            "requester_identity_id": delivery.requester_identity_id,
+                            "recipient_user_id": recipient.user_id,
+                            "recipient_display_name": recipient.display_name,
+                            "connector_type": identity.connector_type,
+                            "connector_identity_id": identity.identity_id,
+                            "target_kind": sent.target_kind,
+                            "target_ref": sent.target_ref,
+                            "schedule_id": delivery.schedule_id,
+                        }),
+                    )
+                    .await?;
+                self.db
+                    .record_audit_event(
+                        "runtime",
+                        &self.config.runtime.instance_id,
+                        "household_delivery_sent",
+                        json!({
+                            "delivery_id": delivery.delivery_id,
+                            "task_id": task.task_id,
+                            "requester_user_id": requester.user_id,
+                            "requester_identity_id": delivery.requester_identity_id,
+                            "requester_display_name": requester.display_name,
+                            "recipient_user_id": recipient.user_id,
+                            "recipient_display_name": recipient.display_name,
+                            "connector_type": identity.connector_type,
+                            "connector_identity_id": identity.identity_id,
+                            "target_kind": sent.target_kind,
+                            "target_ref": sent.target_ref,
+                            "schedule_id": delivery.schedule_id,
+                        }),
+                    )
+                    .await?;
+                self.db
+                    .complete_task(
+                        &task.task_id,
+                        &format!(
+                            "Delivered scheduled household message to {}.",
+                            recipient.display_name
+                        ),
+                    )
+                    .await?;
+            }
+            Err(error) => {
+                let reason = error.to_string();
+                self.db
+                    .mark_household_delivery_failed(&delivery.delivery_id, &reason)
+                    .await?;
+                self.db
+                    .append_task_event(
+                        &task.task_id,
+                        "household_delivery_failed",
+                        "runtime",
+                        &self.config.runtime.instance_id,
+                        json!({
+                            "delivery_id": delivery.delivery_id,
+                            "requester_user_id": requester.user_id,
+                            "recipient_user_id": recipient.user_id,
+                            "connector_type": identity.connector_type,
+                            "connector_identity_id": identity.identity_id,
+                            "schedule_id": delivery.schedule_id,
+                            "error": reason,
+                        }),
+                    )
+                    .await?;
+                self.db
+                    .record_audit_event(
+                        "runtime",
+                        &self.config.runtime.instance_id,
+                        "household_delivery_failed",
+                        json!({
+                            "delivery_id": delivery.delivery_id,
+                            "task_id": task.task_id,
+                            "requester_user_id": requester.user_id,
+                            "recipient_user_id": recipient.user_id,
+                            "connector_type": identity.connector_type,
+                            "connector_identity_id": identity.identity_id,
+                            "schedule_id": delivery.schedule_id,
+                            "error": reason,
+                        }),
+                    )
+                    .await?;
+                self.db.fail_task(&task.task_id, &reason).await?;
+            }
+        }
+
+        let task = self
+            .db
+            .fetch_task_for_owner(&task.owner_user_id, &task.task_id)
+            .await?
+            .ok_or_else(|| {
+                anyhow!(
+                    "scheduled task '{}' disappeared after execution",
+                    task.task_id
+                )
+            })?;
+        Ok(AgentResult { task })
+    }
+
+    async fn execute_workflow_run_task(&self, task: TaskRow) -> Result<AgentResult> {
+        self.db.clear_task_result(&task.task_id).await?;
+        self.db
+            .update_task_state(&task.task_id, TaskState::Running)
+            .await?;
+        self.db
+            .append_task_event(
+                &task.task_id,
+                "workflow_run_started",
+                "runtime",
+                &self.config.runtime.instance_id,
+                json!({ "objective": task.objective }),
+            )
+            .await?;
+
+        let context: Value = task
+            .context_summary
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()
+            .context("failed to parse workflow task context")?
+            .unwrap_or_else(|| json!({}));
+        let workflow_run_id = context
+            .get("workflow_run_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("workflow task '{}' is missing workflow_run_id context", task.task_id))?;
+        let mut run = self
+            .db
+            .fetch_workflow_run(workflow_run_id)
+            .await?
+            .ok_or_else(|| anyhow!("workflow run '{}' not found", workflow_run_id))?;
+        let workflow = self
+            .db
+            .fetch_workflow_definition(&run.workflow_id)
+            .await?
+            .ok_or_else(|| anyhow!("workflow '{}' not found", run.workflow_id))?;
+        let stages = self.db.list_workflow_stages(&workflow.workflow_id).await?;
+        let mut artifacts = parse_json_field(&run.artifacts_json, "workflow run artifacts")?;
+
+        loop {
+            let stage_index = run.current_stage_index as usize;
+            if stage_index >= stages.len() {
+                let result_text = workflow_run_result_text(&artifacts);
+                self.db
+                    .update_workflow_run(
+                        &run.workflow_run_id,
+                        "completed",
+                        run.current_stage_index,
+                        &artifacts,
+                        None,
+                        None,
+                        None,
+                        run.retry_count,
+                        true,
+                    )
+                    .await?;
+                self.db.complete_task(&task.task_id, &result_text).await?;
+                self.db
+                    .append_task_event(
+                        &task.task_id,
+                        "workflow_run_completed",
+                        "runtime",
+                        &self.config.runtime.instance_id,
+                        json!({
+                            "workflow_run_id": run.workflow_run_id,
+                            "workflow_id": workflow.workflow_id,
+                            "stage_count": stages.len(),
+                        }),
+                    )
+                    .await?;
+                self.db
+                    .record_audit_event(
+                        "runtime",
+                        &self.config.runtime.instance_id,
+                        "workflow_run_completed",
+                        json!({
+                            "workflow_run_id": run.workflow_run_id,
+                            "workflow_id": workflow.workflow_id,
+                            "task_id": task.task_id,
+                        }),
+                    )
+                    .await?;
+                let task = self
+                    .db
+                    .fetch_task_for_owner(&task.owner_user_id, &task.task_id)
+                    .await?
+                    .ok_or_else(|| anyhow!("workflow task '{}' disappeared after completion", task.task_id))?;
+                return Ok(AgentResult { task });
+            }
+
+            let stage = &stages[stage_index];
+            let stage_config = parse_json_field(&stage.stage_config_json, "workflow stage config")?;
+            self.db
+                .append_task_event(
+                    &task.task_id,
+                    "workflow_stage_started",
                     "runtime",
                     &self.config.runtime.instance_id,
-                    "schedule_triggered",
                     json!({
-                        "schedule_id": schedule.schedule_id,
-                        "task_id": task.task_id,
-                        "script_id": script.script_id,
-                        "next_run_at": next_run_at,
+                        "workflow_run_id": run.workflow_run_id,
+                        "stage_id": stage.stage_id,
+                        "stage_index": stage.stage_index,
+                        "stage_kind": stage.stage_kind,
                     }),
                 )
                 .await?;
-            tasks.push(task);
+
+            match stage.stage_kind.as_str() {
+                "lua_script" => {
+                    let Some(script_id) = stage.artifact_ref.as_deref() else {
+                        return self
+                            .fail_workflow_run(
+                                &task,
+                                &run,
+                                &artifacts,
+                                "workflow stage is missing a script reference",
+                            )
+                            .await;
+                    };
+                    let Some(script) = self.db.fetch_script(script_id).await? else {
+                        return self
+                            .fail_workflow_run(
+                                &task,
+                                &run,
+                                &artifacts,
+                                &format!("workflow script '{}' not found", script_id),
+                            )
+                            .await;
+                    };
+                    let capability_profile =
+                        parse_json_field(&script.capability_profile_json, "script capability profile")?;
+                    let input_json = json!({
+                        "workflow_run_id": run.workflow_run_id,
+                        "workflow_id": workflow.workflow_id,
+                        "stage_id": stage.stage_id,
+                        "stage_index": stage.stage_index,
+                        "last_result": artifacts.get("last_result").cloned().unwrap_or(Value::Null),
+                        "artifacts": artifacts,
+                        "config": stage_config,
+                    });
+                    match automation::execute_lua_script(automation::LuaExecutionInput {
+                        db: self.db.clone(),
+                        owner_user_id: task.owner_user_id.clone(),
+                        task_id: task.task_id.clone(),
+                        script_id: script.script_id.clone(),
+                        source_text: script.source_text.clone(),
+                        input_json: Some(input_json),
+                        capability_profile,
+                        working_dir: self.config.runtime.workspace_root.clone(),
+                        allowed_roots: self.default_allowed_roots(),
+                        browser_interactive_launcher: self
+                            .config
+                            .integrations
+                            .browser
+                            .interactive_launcher
+                            .clone(),
+                        browser_headless_program: self.config.integrations.browser.headless_browser.clone(),
+                        browser_headless_args: self.config.integrations.browser.headless_args.clone(),
+                    })
+                    .await
+                    {
+                        Ok(execution) => {
+                            self.record_workflow_lua_side_effects(&task, &execution.logs, &execution.notifications)
+                                .await?;
+                            if let Some(wake_at) = execution.deferred_until.as_deref() {
+                                return self
+                                    .defer_workflow_run(
+                                        &task,
+                                        &run,
+                                        &artifacts,
+                                        wake_at,
+                                        &format!(
+                                            "Workflow deferred by Lua stage {} until {}",
+                                            stage.stage_index, wake_at
+                                        ),
+                                    )
+                                    .await;
+                            }
+                            apply_stage_result(&mut artifacts, stage, execution.result_json, json!({ "result_text": execution.result_text }));
+                        }
+                        Err(error) => {
+                            let reason = error.to_string();
+                            return self.fail_workflow_run(&task, &run, &artifacts, &reason).await;
+                        }
+                    }
+                }
+                "lua_tool" => {
+                    let Some(tool_id) = stage.artifact_ref.as_deref() else {
+                        return self
+                            .fail_workflow_run(
+                                &task,
+                                &run,
+                                &artifacts,
+                                "workflow stage is missing a Lua tool reference",
+                            )
+                            .await;
+                    };
+                    let Some(tool) = self
+                        .db
+                        .fetch_lua_tool_for_owner(&task.owner_user_id, tool_id)
+                        .await?
+                    else {
+                        return self
+                            .fail_workflow_run(
+                                &task,
+                                &run,
+                                &artifacts,
+                                &format!("workflow Lua tool '{}' not found", tool_id),
+                            )
+                            .await;
+                    };
+                    let input_schema = parse_json_field(&tool.input_schema_json, "Lua tool input schema")?;
+                    let output_schema =
+                        parse_json_field(&tool.output_schema_json, "Lua tool output schema")?;
+                    let capability_profile = parse_json_field(
+                        &tool.capability_profile_json,
+                        "Lua tool capability profile",
+                    )?;
+                    let input_json = json!({
+                        "workflow_run_id": run.workflow_run_id,
+                        "workflow_id": workflow.workflow_id,
+                        "stage_id": stage.stage_id,
+                        "stage_index": stage.stage_index,
+                        "last_result": artifacts.get("last_result").cloned().unwrap_or(Value::Null),
+                        "artifacts": artifacts,
+                        "config": stage_config,
+                    });
+                    if let Err(error) = validate_json_value_against_schema(&input_json, &input_schema)
+                    {
+                        return self
+                            .fail_workflow_run(
+                                &task,
+                                &run,
+                                &artifacts,
+                                &format!("workflow Lua tool '{}' rejected input: {}", tool_id, error),
+                            )
+                            .await;
+                    }
+                    match automation::execute_lua_script(automation::LuaExecutionInput {
+                        db: self.db.clone(),
+                        owner_user_id: task.owner_user_id.clone(),
+                        task_id: task.task_id.clone(),
+                        script_id: tool.tool_id.clone(),
+                        source_text: tool.source_text.clone(),
+                        input_json: Some(input_json),
+                        capability_profile,
+                        working_dir: self.config.runtime.workspace_root.clone(),
+                        allowed_roots: self.default_allowed_roots(),
+                        browser_interactive_launcher: self
+                            .config
+                            .integrations
+                            .browser
+                            .interactive_launcher
+                            .clone(),
+                        browser_headless_program: self.config.integrations.browser.headless_browser.clone(),
+                        browser_headless_args: self.config.integrations.browser.headless_args.clone(),
+                    })
+                    .await
+                    {
+                        Ok(execution) => {
+                            if execution.deferred_until.is_some() {
+                                return self
+                                    .fail_workflow_run(
+                                        &task,
+                                        &run,
+                                        &artifacts,
+                                        &format!("workflow Lua tool '{}' attempted to defer execution", tool_id),
+                                    )
+                                    .await;
+                            }
+                            if let Err(error) =
+                                validate_json_value_against_schema(&execution.result_json, &output_schema)
+                            {
+                                return self
+                                    .fail_workflow_run(
+                                        &task,
+                                        &run,
+                                        &artifacts,
+                                        &format!(
+                                            "workflow Lua tool '{}' returned invalid output: {}",
+                                            tool_id, error
+                                        ),
+                                    )
+                                    .await;
+                            }
+                            self.record_workflow_lua_side_effects(&task, &execution.logs, &execution.notifications)
+                                .await?;
+                            apply_stage_result(&mut artifacts, stage, execution.result_json, json!({ "result_text": execution.result_text }));
+                        }
+                        Err(error) => {
+                            let reason = error.to_string();
+                            return self.fail_workflow_run(&task, &run, &artifacts, &reason).await;
+                        }
+                    }
+                }
+                "agent_task" => {
+                    let objective = stage_config
+                        .get("prompt")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .ok_or_else(|| anyhow!("agent_task stage requires config.prompt"))?;
+                    let child_context = json!({
+                        "workflow_run_id": run.workflow_run_id,
+                        "workflow_id": workflow.workflow_id,
+                        "stage_id": stage.stage_id,
+                        "stage_index": stage.stage_index,
+                        "last_result": artifacts.get("last_result").cloned().unwrap_or(Value::Null),
+                        "artifacts": artifacts,
+                        "contract": stage_config,
+                    })
+                    .to_string();
+                    let child_task = self
+                        .db
+                        .create_task_with_params(NewTask {
+                            owner_user_id: &task.owner_user_id,
+                            initiating_identity_id: &run.initiating_identity_id,
+                            primary_agent_id: &task.primary_agent_id,
+                            assigned_agent_id: &task.assigned_agent_id,
+                            parent_task_id: Some(&task.task_id),
+                            session_id: task.session_id.as_deref(),
+                            kind: WORKFLOW_AGENT_STAGE_TASK_KIND,
+                            objective,
+                            context_summary: Some(&child_context),
+                            scope: MemoryScope::Private,
+                            wake_at: None,
+                        })
+                        .await?;
+                    let request = AgentRequest {
+                        owner_user_id: task.owner_user_id.clone(),
+                        initiating_identity_id: run.initiating_identity_id.clone(),
+                        primary_agent_id: task.primary_agent_id.clone(),
+                        assigned_agent_id: task.assigned_agent_id.clone(),
+                        role_ids: self.user_role_ids(&task.owner_user_id).await?,
+                        objective: objective.to_owned(),
+                        scope: MemoryScope::Private,
+                        kind: WORKFLOW_AGENT_STAGE_TASK_KIND.to_owned(),
+                        parent_task_id: Some(task.task_id.clone()),
+                        task_context: Some(child_context),
+                        visible_scopes: Vec::new(),
+                        memory_mode: AgentMemoryMode::TaskSliceOnly,
+                        approved_shell_commands: Vec::new(),
+                        approved_automation_actions: Vec::new(),
+                    };
+                    let child_result = self.runner.resume_task(child_task.clone(), request).await?;
+                    if child_result.task.state != TaskState::Completed.as_str() {
+                        return self
+                            .fail_workflow_run(
+                                &task,
+                                &run,
+                                &artifacts,
+                                &format!(
+                                    "workflow agent stage {} left the approved envelope with task state {}",
+                                    stage.stage_index, child_result.task.state
+                                ),
+                            )
+                            .await;
+                    }
+                    apply_stage_result(
+                        &mut artifacts,
+                        stage,
+                        json!({
+                            "child_task_id": child_result.task.task_id,
+                            "result_text": child_result.task.result_text,
+                        }),
+                        json!({ "child_task_id": child_result.task.task_id }),
+                    );
+                }
+                "user_notify" => {
+                    let message = stage_config
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned)
+                        .unwrap_or_else(|| workflow_run_result_text(&artifacts));
+                    let dedupe_key = format!(
+                        "workflow_notify:{}:{}:{}",
+                        run.workflow_run_id, stage.stage_index, task.task_id
+                    );
+                    let delivery = self
+                        .db
+                        .create_or_reuse_household_delivery(NewHouseholdDelivery {
+                            task_id: &task.task_id,
+                            requester_user_id: &task.owner_user_id,
+                            requester_identity_id: &run.initiating_identity_id,
+                            recipient_user_id: &task.owner_user_id,
+                            message_text: &message,
+                            delivery_mode: "workflow_notify",
+                            connector_type: "workflow",
+                            connector_identity_id: &run.initiating_identity_id,
+                            target_ref: &task.owner_user_id,
+                            fallback_target_ref: None,
+                            dedupe_key: &dedupe_key,
+                            initial_status: "scheduled",
+                            parent_delivery_id: None,
+                            schedule_id: run.schedule_id.as_deref(),
+                            scheduled_for_at: None,
+                            window_starts_at: None,
+                            window_ends_at: None,
+                            recurrence_rule: None,
+                            scheduled_job_state: Some("workflow_notify"),
+                            materialized_task_id: None,
+                        })
+                        .await?;
+                    self.db
+                        .mark_household_delivery_sent(
+                            &delivery.delivery_id,
+                            "workflow",
+                            &run.initiating_identity_id,
+                            &task.owner_user_id,
+                            None,
+                        )
+                        .await?;
+                    apply_stage_result(
+                        &mut artifacts,
+                        stage,
+                        json!(message),
+                        json!({ "delivery_id": delivery.delivery_id }),
+                    );
+                }
+                other => {
+                    return self
+                        .fail_workflow_run(
+                            &task,
+                            &run,
+                            &artifacts,
+                            &format!("unsupported workflow stage kind '{other}'"),
+                        )
+                        .await;
+                }
+            }
+
+            run.current_stage_index += 1;
+            self.db
+                .update_workflow_run(
+                    &run.workflow_run_id,
+                    "running",
+                    run.current_stage_index,
+                    &artifacts,
+                    None,
+                    None,
+                    None,
+                    run.retry_count,
+                    false,
+                )
+                .await?;
+            self.db
+                .append_task_event(
+                    &task.task_id,
+                    "workflow_stage_completed",
+                    "runtime",
+                    &self.config.runtime.instance_id,
+                    json!({
+                        "workflow_run_id": run.workflow_run_id,
+                        "stage_id": stage.stage_id,
+                        "stage_index": stage.stage_index,
+                        "stage_kind": stage.stage_kind,
+                    }),
+                )
+                .await?;
         }
-        Ok(tasks)
     }
 
     async fn execute_lua_task(&self, task: TaskRow) -> Result<AgentResult> {
@@ -2016,7 +3401,8 @@ impl Runtime {
         approved_shell_commands: Vec<String>,
     ) -> Result<AgentRequest> {
         let role_ids = self.user_role_ids(owner_user_id).await?;
-        let memory_mode = if task.kind == "subagent" {
+        let memory_mode = if task.kind == "subagent" || task.kind == WORKFLOW_AGENT_STAGE_TASK_KIND
+        {
             AgentMemoryMode::TaskSliceOnly
         } else {
             AgentMemoryMode::ScopedRetrieval
@@ -2071,6 +3457,281 @@ impl Runtime {
         })
     }
 
+    async fn validate_workflow_stage_references(
+        &self,
+        workflow: &WorkflowDefinitionRow,
+        stages: &[WorkflowStageRow],
+    ) -> Result<()> {
+        if stages.is_empty() {
+            bail!("workflow '{}' must contain at least one stage", workflow.workflow_id);
+        }
+        for stage in stages {
+            match stage.stage_kind.as_str() {
+                "lua_script" => {
+                    let script_id = stage
+                        .artifact_ref
+                        .as_deref()
+                        .ok_or_else(|| anyhow!("workflow stage '{}' is missing script_id", stage.stage_id))?;
+                    let script = self
+                        .db
+                        .fetch_script_for_owner(&workflow.owner_user_id, script_id)
+                        .await?
+                        .ok_or_else(|| anyhow!("workflow stage references missing script '{}'", script_id))?;
+                    if script.status != "active" || script.safety_status != "approved" {
+                        bail!(
+                            "workflow script '{}' must be active and approved",
+                            script.script_id
+                        );
+                    }
+                }
+                "lua_tool" => {
+                    let tool_id = stage
+                        .artifact_ref
+                        .as_deref()
+                        .ok_or_else(|| anyhow!("workflow stage '{}' is missing tool_id", stage.stage_id))?;
+                    let tool = self
+                        .db
+                        .fetch_lua_tool_for_owner(&workflow.owner_user_id, tool_id)
+                        .await?
+                        .ok_or_else(|| anyhow!("workflow stage references missing Lua tool '{}'", tool_id))?;
+                    if tool.status != "active" || tool.safety_status != "approved" {
+                        bail!("workflow Lua tool '{}' must be active and approved", tool.tool_id);
+                    }
+                }
+                "agent_task" => {
+                    let config = parse_json_field(&stage.stage_config_json, "workflow stage config")?;
+                    if config
+                        .get("prompt")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .is_none()
+                    {
+                        bail!("workflow agent stage '{}' requires config.prompt", stage.stage_id);
+                    }
+                }
+                "user_notify" => {}
+                other => bail!("unsupported workflow stage kind '{other}'"),
+            }
+        }
+        Ok(())
+    }
+
+    async fn start_workflow_run(
+        &self,
+        workflow: &WorkflowDefinitionRow,
+        initiating_identity_id: String,
+        schedule_id: Option<&str>,
+        primary_agent_id: &str,
+        session_id: Option<&str>,
+        wake_at: Option<&str>,
+    ) -> Result<TaskRow> {
+        let started_at = now_rfc3339();
+        let run = self
+            .db
+            .create_workflow_run(NewWorkflowRun {
+                workflow_run_id: None,
+                workflow_id: &workflow.workflow_id,
+                owner_user_id: &workflow.owner_user_id,
+                initiating_identity_id: &initiating_identity_id,
+                schedule_id,
+                source_task_id: None,
+                state: if wake_at.is_some() { "waiting" } else { "running" },
+                current_stage_index: 0,
+                artifacts_json: json!({
+                    "workflow_id": workflow.workflow_id,
+                    "workflow_name": workflow.name,
+                    "stages": {},
+                    "last_result": Value::Null,
+                }),
+                wake_at,
+                block_reason: None,
+                last_error: None,
+                retry_count: 0,
+                started_at: &started_at,
+            })
+            .await?;
+        let task_context = json!({
+            "workflow_run_id": run.workflow_run_id,
+            "workflow_id": workflow.workflow_id,
+            "schedule_id": schedule_id,
+        })
+        .to_string();
+        let task = self
+            .db
+            .create_task_with_params(NewTask {
+                owner_user_id: &workflow.owner_user_id,
+                initiating_identity_id: &initiating_identity_id,
+                primary_agent_id,
+                assigned_agent_id: primary_agent_id,
+                parent_task_id: None,
+                session_id,
+                kind: WORKFLOW_RUN_TASK_KIND,
+                objective: &format!("Run workflow {}", workflow.name),
+                context_summary: Some(&task_context),
+                scope: MemoryScope::Private,
+                wake_at,
+            })
+            .await?;
+        self.db
+            .record_audit_event(
+                "runtime",
+                &self.config.runtime.instance_id,
+                "workflow_run_created",
+                json!({
+                    "workflow_run_id": run.workflow_run_id,
+                    "workflow_id": workflow.workflow_id,
+                    "task_id": task.task_id,
+                    "schedule_id": schedule_id,
+                    "wake_at": wake_at,
+                }),
+            )
+            .await?;
+        Ok(task)
+    }
+
+    async fn record_workflow_lua_side_effects(
+        &self,
+        task: &TaskRow,
+        logs: &[String],
+        notifications: &[String],
+    ) -> Result<()> {
+        for log_line in logs {
+            self.db
+                .append_task_event(
+                    &task.task_id,
+                    "lua_log",
+                    "tool",
+                    "lua",
+                    json!({ "message": log_line }),
+                )
+                .await?;
+        }
+        for notification in notifications {
+            self.db
+                .append_task_event(
+                    &task.task_id,
+                    "lua_notify_user",
+                    "tool",
+                    "lua",
+                    json!({ "message": notification }),
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn defer_workflow_run(
+        &self,
+        task: &TaskRow,
+        run: &WorkflowRunRow,
+        artifacts: &Value,
+        wake_at: &str,
+        result_text: &str,
+    ) -> Result<AgentResult> {
+        self.db
+            .update_workflow_run(
+                &run.workflow_run_id,
+                "waiting",
+                run.current_stage_index,
+                artifacts,
+                Some(wake_at),
+                None,
+                None,
+                run.retry_count,
+                false,
+            )
+            .await?;
+        self.db
+            .create_task_with_params(NewTask {
+                owner_user_id: &task.owner_user_id,
+                initiating_identity_id: &task.initiating_identity_id,
+                primary_agent_id: &task.primary_agent_id,
+                assigned_agent_id: &task.assigned_agent_id,
+                parent_task_id: Some(&task.task_id),
+                session_id: task.session_id.as_deref(),
+                kind: WORKFLOW_RUN_TASK_KIND,
+                objective: &task.objective,
+                context_summary: task.context_summary.as_deref(),
+                scope: MemoryScope::Private,
+                wake_at: Some(wake_at),
+            })
+            .await?;
+        self.db.complete_task(&task.task_id, result_text).await?;
+        self.db
+            .append_task_event(
+                &task.task_id,
+                "workflow_run_deferred",
+                "runtime",
+                &self.config.runtime.instance_id,
+                json!({
+                    "workflow_run_id": run.workflow_run_id,
+                    "wake_at": wake_at,
+                }),
+            )
+            .await?;
+        let task = self
+            .db
+            .fetch_task_for_owner(&task.owner_user_id, &task.task_id)
+            .await?
+            .ok_or_else(|| anyhow!("workflow task '{}' disappeared after defer", task.task_id))?;
+        Ok(AgentResult { task })
+    }
+
+    async fn fail_workflow_run(
+        &self,
+        task: &TaskRow,
+        run: &WorkflowRunRow,
+        artifacts: &Value,
+        reason: &str,
+    ) -> Result<AgentResult> {
+        self.db
+            .update_workflow_run(
+                &run.workflow_run_id,
+                "blocked",
+                run.current_stage_index,
+                artifacts,
+                None,
+                Some(reason),
+                Some(reason),
+                run.retry_count + 1,
+                false,
+            )
+            .await?;
+        self.db.fail_task(&task.task_id, reason).await?;
+        self.db
+            .append_task_event(
+                &task.task_id,
+                "workflow_run_blocked",
+                "runtime",
+                &self.config.runtime.instance_id,
+                json!({
+                    "workflow_run_id": run.workflow_run_id,
+                    "reason": reason,
+                }),
+            )
+            .await?;
+        self.db
+            .record_audit_event(
+                "runtime",
+                &self.config.runtime.instance_id,
+                "workflow_run_blocked",
+                json!({
+                    "workflow_run_id": run.workflow_run_id,
+                    "workflow_id": run.workflow_id,
+                    "task_id": task.task_id,
+                    "reason": reason,
+                }),
+            )
+            .await?;
+        let task = self
+            .db
+            .fetch_task_for_owner(&task.owner_user_id, &task.task_id)
+            .await?
+            .ok_or_else(|| anyhow!("workflow task '{}' disappeared after failure", task.task_id))?;
+        Ok(AgentResult { task })
+    }
+
     async fn user_role_ids(&self, user_id: &str) -> Result<Vec<String>> {
         Ok(self
             .db
@@ -2097,6 +3758,130 @@ impl Runtime {
             allowed_roots.push(self.config.runtime.data_dir.clone());
         }
         allowed_roots
+    }
+}
+
+fn parse_json_field(raw: &str, label: &str) -> Result<Value> {
+    serde_json::from_str(raw).with_context(|| format!("failed to parse {label}"))
+}
+
+fn validate_workflow_definition_input(definition: &WorkflowDefinitionInput) -> Result<()> {
+    if definition.name.trim().is_empty() {
+        bail!("workflow name cannot be empty");
+    }
+    if definition.stages.is_empty() {
+        bail!("workflow must include at least one stage");
+    }
+    for stage in &definition.stages {
+        match stage.kind.as_str() {
+            "lua_script" | "lua_tool" => {
+                if stage
+                    .artifact_ref
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .is_none()
+                {
+                    bail!("workflow stage '{}' requires artifact_ref", stage.kind);
+                }
+            }
+            "agent_task" => {
+                if stage
+                    .config
+                    .get("prompt")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .is_none()
+                {
+                    bail!("agent_task stage requires config.prompt");
+                }
+            }
+            "user_notify" => {}
+            other => bail!("unsupported workflow stage kind '{other}'"),
+        }
+    }
+    Ok(())
+}
+
+fn workflow_definition_json(
+    workflow: &WorkflowDefinitionRow,
+    stages: &[WorkflowStageRow],
+) -> Result<Value> {
+    Ok(json!({
+        "workflow_id": workflow.workflow_id,
+        "owner_user_id": workflow.owner_user_id,
+        "name": workflow.name,
+        "description": workflow.description,
+        "status": workflow.status,
+        "safety_status": workflow.safety_status,
+        "current_version_number": workflow.current_version_number,
+        "stages": stages
+            .iter()
+            .map(|stage| {
+                Ok(json!({
+                    "stage_id": stage.stage_id,
+                    "version_number": stage.version_number,
+                    "stage_index": stage.stage_index,
+                    "stage_kind": stage.stage_kind,
+                    "stage_label": stage.stage_label,
+                    "artifact_ref": stage.artifact_ref,
+                    "config": parse_json_field(&stage.stage_config_json, "workflow stage config")?,
+                }))
+            })
+            .collect::<Result<Vec<_>>>()?,
+    }))
+}
+
+fn apply_stage_result(
+    artifacts: &mut Value,
+    stage: &WorkflowStageRow,
+    result: Value,
+    metadata: Value,
+) {
+    if !artifacts.is_object() {
+        *artifacts = json!({});
+    }
+    let artifact_object = artifacts.as_object_mut().expect("artifacts object");
+    let stages = artifact_object
+        .entry("stages".to_owned())
+        .or_insert_with(|| json!({}));
+    if !stages.is_object() {
+        *stages = json!({});
+    }
+    stages
+        .as_object_mut()
+        .expect("stages object")
+        .insert(
+            stage.stage_index.to_string(),
+            json!({
+                "stage_id": stage.stage_id,
+                "stage_kind": stage.stage_kind,
+                "result": result.clone(),
+                "metadata": metadata,
+            }),
+        );
+    artifact_object.insert("last_result".to_owned(), result);
+    artifact_object.insert("last_stage_id".to_owned(), json!(stage.stage_id));
+    artifact_object.insert("last_stage_index".to_owned(), json!(stage.stage_index));
+}
+
+fn workflow_run_result_text(artifacts: &Value) -> String {
+    match artifacts.get("last_result") {
+        Some(Value::String(text)) => text.clone(),
+        Some(Value::Object(map)) => {
+            if let Some(Value::String(text)) = map.get("result_text") {
+                return text.clone();
+            }
+            if let Some(Value::String(text)) = map.get("message") {
+                return text.clone();
+            }
+            serde_json::to_string_pretty(&Value::Object(map.clone()))
+                .unwrap_or_else(|_| "Workflow completed.".to_owned())
+        }
+        Some(value) => serde_json::to_string_pretty(value)
+            .unwrap_or_else(|_| "Workflow completed.".to_owned()),
+        None => "Workflow completed.".to_owned(),
     }
 }
 
@@ -3536,7 +5321,7 @@ fn connector_type_from_events(events: &[TaskEventRow]) -> Option<String> {
 mod tests {
     use std::collections::VecDeque;
     use std::future::pending;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, OnceLock};
 
     use anyhow::Result;
     use async_trait::async_trait;
@@ -3548,6 +5333,15 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+
+    static DIRECT_SEND_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    fn direct_send_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        DIRECT_SEND_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("direct send test lock")
+    }
 
     #[derive(Clone)]
     struct FakeProvider {
@@ -4459,7 +6253,12 @@ end"#,
             .expect("execute next")
             .expect("task");
         assert_eq!(result.task.kind, "scheduled_lua");
-        assert_eq!(result.task.state, TaskState::Completed.as_str());
+        if result.task.state != TaskState::Completed.as_str() {
+            panic!(
+                "workflow task state={} result={:?}",
+                result.task.state, result.task.result_text
+            );
+        }
         assert_eq!(result.task.result_text.as_deref(), Some("scheduled ok"));
 
         let inspection = runtime
@@ -4635,6 +6434,272 @@ end"#,
     }
 
     #[tokio::test]
+    async fn scheduled_workflow_pipeline_executes_all_stages_and_notifies_user() {
+        let (_tempdir, runtime) = test_runtime(vec![ModelTurnResponse {
+            output_items: vec![json!({
+                "type": "message",
+                "content": [{ "type": "output_text", "text": "Morning digest ready: ORF headline summary." }]
+            })],
+            tool_calls: vec![],
+            output_text: "Morning digest ready: ORF headline summary.".to_owned(),
+            usage: None,
+        }])
+        .await;
+        let db = runtime.db.clone();
+        let default_user = runtime.default_user.clone();
+        db.create_script(NewScript {
+            script_id: Some("script_workflow_fetch"),
+            owner_user_id: &default_user.user_id,
+            kind: "lua",
+            status: "active",
+            source_text: r#"return function(ctx)
+    if ctx.input.last_result == nil then
+        return "ORF headline"
+    end
+    return ctx.input.last_result
+end"#,
+            capability_profile_json: json!({}),
+            created_from_task_id: None,
+            safety_status: "approved",
+            safety_summary: Some("approved"),
+        })
+        .await
+        .expect("script");
+        db.create_lua_tool(beaverki_db::NewLuaTool {
+            tool_id: Some("lua_tool_digest_summary"),
+            owner_user_id: &default_user.user_id,
+            description: "Digest summarizer",
+            source_text: r#"return function(ctx)
+    local headline = tostring(ctx.input.last_result)
+    return { digest = headline .. " summary" }
+end"#,
+            input_schema_json: json!({
+                "type": "object",
+                "required": ["workflow_run_id", "workflow_id", "stage_id", "stage_index", "last_result", "artifacts", "config"],
+                "properties": {
+                    "workflow_run_id": { "type": "string" },
+                    "workflow_id": { "type": "string" },
+                    "stage_id": { "type": "string" },
+                    "stage_index": { "type": "integer" },
+                    "last_result": {},
+                    "artifacts": { "type": "object" },
+                    "config": { "type": "object" }
+                }
+            }),
+            output_schema_json: json!({
+                "type": "object",
+                "required": ["digest"],
+                "properties": {
+                    "digest": { "type": "string" }
+                }
+            }),
+            capability_profile_json: json!({}),
+            status: "active",
+            created_from_task_id: None,
+            safety_status: "approved",
+            safety_summary: Some("approved"),
+        })
+        .await
+        .expect("tool");
+        db.create_workflow_definition(
+            NewWorkflowDefinition {
+                workflow_id: Some("workflow_news_digest"),
+                owner_user_id: &default_user.user_id,
+                name: "Morning digest",
+                description: Some("Fetch, summarize, and notify."),
+                status: "active",
+                created_from_task_id: None,
+                safety_status: "approved",
+                safety_summary: Some("approved"),
+            },
+            &[
+                NewWorkflowStage {
+                    stage_id: Some("workflow_stage_fetch"),
+                    stage_kind: "lua_script",
+                    stage_label: Some("Fetch headlines"),
+                    artifact_ref: Some("script_workflow_fetch"),
+                    stage_config_json: json!({}),
+                },
+                NewWorkflowStage {
+                    stage_id: Some("workflow_stage_digest"),
+                    stage_kind: "lua_tool",
+                    stage_label: Some("Summarize"),
+                    artifact_ref: Some("lua_tool_digest_summary"),
+                    stage_config_json: json!({}),
+                },
+                NewWorkflowStage {
+                    stage_id: Some("workflow_stage_agent"),
+                    stage_kind: "agent_task",
+                    stage_label: Some("Write digest"),
+                    artifact_ref: None,
+                    stage_config_json: json!({
+                        "prompt": "Write a one-line digest using the workflow artifacts."
+                    }),
+                },
+                NewWorkflowStage {
+                    stage_id: Some("workflow_stage_notify"),
+                    stage_kind: "user_notify",
+                    stage_label: Some("Notify"),
+                    artifact_ref: None,
+                    stage_config_json: json!({}),
+                },
+            ],
+        )
+        .await
+        .expect("workflow");
+        db.create_schedule(NewSchedule {
+            schedule_id: Some("sched_workflow_digest"),
+            owner_user_id: &default_user.user_id,
+            target_type: "workflow",
+            target_id: "workflow_news_digest",
+            cron_expr: "0/1 * * * * * *",
+            enabled: true,
+            next_run_at: &now_rfc3339(),
+        })
+        .await
+        .expect("schedule");
+
+        let result = runtime
+            .execute_next_runnable_task()
+            .await
+            .expect("execute next")
+            .expect("task");
+        assert_eq!(result.task.kind, WORKFLOW_RUN_TASK_KIND);
+        if result.task.state != TaskState::Completed.as_str() {
+            panic!(
+                "workflow task state={} result={:?}",
+                result.task.state, result.task.result_text
+            );
+        }
+        assert_eq!(
+            result.task.result_text.as_deref(),
+            Some("Morning digest ready: ORF headline summary.")
+        );
+
+        let inspection = runtime
+            .inspect_task(None, &result.task.task_id)
+            .await
+            .expect("inspection");
+        assert!(
+            inspection
+                .events
+                .iter()
+                .any(|event| event.event_type == "workflow_stage_completed")
+        );
+
+        let workflow_runs = db
+            .list_workflow_runs_for_workflow("workflow_news_digest")
+            .await
+            .expect("workflow runs");
+        assert_eq!(workflow_runs.len(), 1);
+        assert_eq!(workflow_runs[0].state, "completed");
+
+        let deliveries = db
+            .list_household_deliveries_for_task(&result.task.task_id)
+            .await
+            .expect("deliveries");
+        assert_eq!(deliveries.len(), 1);
+        assert_eq!(deliveries[0].delivery_mode, "workflow_notify");
+        assert_eq!(deliveries[0].status, "sent");
+    }
+
+    #[tokio::test]
+    async fn workflow_rewrite_creates_new_version_and_keeps_history() {
+        let (_tempdir, runtime) = test_runtime(vec![
+            ModelTurnResponse {
+                output_items: vec![json!({
+                    "type": "message",
+                    "content": [{
+                        "type": "output_text",
+                        "text": "{\"verdict\":\"approved\",\"risk_level\":\"low\",\"findings\":[],\"required_changes\":[],\"summary\":\"approved\"}"
+                    }]
+                })],
+                tool_calls: vec![],
+                output_text: "{\"verdict\":\"approved\",\"risk_level\":\"low\",\"findings\":[],\"required_changes\":[],\"summary\":\"approved\"}".to_owned(),
+                usage: None,
+            },
+            ModelTurnResponse {
+                output_items: vec![json!({
+                    "type": "message",
+                    "content": [{
+                        "type": "output_text",
+                        "text": "{\"verdict\":\"approved\",\"risk_level\":\"low\",\"findings\":[],\"required_changes\":[],\"summary\":\"approved\"}"
+                    }]
+                })],
+                tool_calls: vec![],
+                output_text: "{\"verdict\":\"approved\",\"risk_level\":\"low\",\"findings\":[],\"required_changes\":[],\"summary\":\"approved\"}".to_owned(),
+                usage: None,
+            },
+        ])
+        .await;
+
+        let first = runtime
+            .create_workflow_definition(
+                None,
+                Some("workflow_versioned"),
+                WorkflowDefinitionInput {
+                    name: "Versioned workflow".to_owned(),
+                    description: Some("v1".to_owned()),
+                    stages: vec![WorkflowStageInput {
+                        kind: "user_notify".to_owned(),
+                        label: Some("Notify".to_owned()),
+                        artifact_ref: None,
+                        config: json!({ "message": "v1" }),
+                    }],
+                },
+                None,
+                "Create the first version.",
+            )
+            .await
+            .expect("create v1");
+        assert_eq!(first.workflow.current_version_number, 1);
+
+        let second = runtime
+            .create_workflow_definition(
+                None,
+                Some("workflow_versioned"),
+                WorkflowDefinitionInput {
+                    name: "Versioned workflow".to_owned(),
+                    description: Some("v2".to_owned()),
+                    stages: vec![
+                        WorkflowStageInput {
+                            kind: "user_notify".to_owned(),
+                            label: Some("Notify".to_owned()),
+                            artifact_ref: None,
+                            config: json!({ "message": "v2" }),
+                        },
+                        WorkflowStageInput {
+                            kind: "agent_task".to_owned(),
+                            label: Some("Agent".to_owned()),
+                            artifact_ref: None,
+                            config: json!({ "prompt": "Inspect the workflow output." }),
+                        },
+                    ],
+                },
+                None,
+                "Create the second version.",
+            )
+            .await
+            .expect("create v2");
+        assert_eq!(second.workflow.current_version_number, 2);
+        assert_eq!(second.versions.len(), 2);
+        assert_eq!(second.stages.len(), 2);
+
+        let v1_stages = runtime
+            .db
+            .list_workflow_stages_for_version("workflow_versioned", 1)
+            .await
+            .expect("v1 stages");
+        assert_eq!(v1_stages.len(), 1);
+        let v2_stages = runtime
+            .db
+            .list_workflow_stages_for_version("workflow_versioned", 2)
+            .await
+            .expect("v2 stages");
+        assert_eq!(v2_stages.len(), 2);
+    }
+
+    #[tokio::test]
     async fn automation_lifecycle_emits_auditable_event_chain() {
         let (_tempdir, runtime) = test_runtime(vec![ModelTurnResponse {
             output_items: vec![json!({
@@ -4805,6 +6870,7 @@ end"#,
 
     #[tokio::test]
     async fn household_direct_delivery_sends_once_and_persists_audit_state() {
+        let _direct_send_guard = direct_send_test_guard();
         let (_tempdir, runtime) = test_runtime_with_discord_token(
             vec![
                 ModelTurnResponse {
@@ -4937,6 +7003,401 @@ end"#,
         assert!(calls[0].contains("recipient=discord-casey"));
         assert!(calls[0].contains("Household message from Alex"));
         assert!(calls[0].contains("Dinner is ready."));
+    }
+
+    #[tokio::test]
+    async fn scheduled_household_delivery_pauses_for_approval_and_executes_later() {
+        let _direct_send_guard = direct_send_test_guard();
+        let (_tempdir, runtime) = test_runtime_with_discord_token(
+            vec![
+                ModelTurnResponse {
+                    output_items: vec![json!({
+                        "type": "function_call",
+                        "call_id": "call_1",
+                        "name": "household_schedule_message",
+                        "arguments": "{\"delivery_id\":null,\"recipient\":\"Casey\",\"message\":\"Buy kiwis.\",\"deliver_at\":\"2099-01-01T09:00:00Z\",\"cron_expr\":null,\"window_start_at\":null,\"window_end_at\":null,\"enabled\":true}"
+                    })],
+                    tool_calls: vec![beaverki_models::ModelToolCall {
+                        call_id: "call_1".to_owned(),
+                        name: "household_schedule_message".to_owned(),
+                        arguments: json!({
+                            "delivery_id": Value::Null,
+                            "recipient": "Casey",
+                            "message": "Buy kiwis.",
+                            "deliver_at": "2099-01-01T09:00:00Z",
+                            "cron_expr": Value::Null,
+                            "window_start_at": Value::Null,
+                            "window_end_at": Value::Null,
+                            "enabled": true
+                        }),
+                    }],
+                    output_text: String::new(),
+                    usage: None,
+                },
+                ModelTurnResponse {
+                    output_items: vec![json!({
+                        "type": "function_call",
+                        "call_id": "call_2",
+                        "name": "household_schedule_message",
+                        "arguments": "{\"delivery_id\":null,\"recipient\":\"Casey\",\"message\":\"Buy kiwis.\",\"deliver_at\":\"2099-01-01T09:00:00Z\",\"cron_expr\":null,\"window_start_at\":null,\"window_end_at\":null,\"enabled\":true}"
+                    })],
+                    tool_calls: vec![beaverki_models::ModelToolCall {
+                        call_id: "call_2".to_owned(),
+                        name: "household_schedule_message".to_owned(),
+                        arguments: json!({
+                            "delivery_id": Value::Null,
+                            "recipient": "Casey",
+                            "message": "Buy kiwis.",
+                            "deliver_at": "2099-01-01T09:00:00Z",
+                            "cron_expr": Value::Null,
+                            "window_start_at": Value::Null,
+                            "window_end_at": Value::Null,
+                            "enabled": true
+                        }),
+                    }],
+                    output_text: String::new(),
+                    usage: None,
+                },
+                ModelTurnResponse {
+                    output_items: vec![json!({
+                        "type": "message",
+                        "content": [{ "type": "output_text", "text": "I scheduled that reminder for Casey." }]
+                    })],
+                    tool_calls: vec![],
+                    output_text: "I scheduled that reminder for Casey.".to_owned(),
+                    usage: None,
+                },
+            ],
+            Some("discord-token".to_owned()),
+        )
+        .await;
+        let recipient = runtime
+            .create_user("Casey", &[String::from("adult")])
+            .await
+            .expect("create Casey");
+        runtime
+            .db
+            .upsert_connector_identity(
+                "discord",
+                "discord-casey",
+                None,
+                &recipient.user_id,
+                "authenticated_message",
+            )
+            .await
+            .expect("map Casey");
+
+        let first = runtime
+            .run_objective(
+                None,
+                "Remind Casey to buy kiwis tomorrow morning.",
+                MemoryScope::Private,
+            )
+            .await
+            .expect("first run");
+        assert_eq!(first.task.state, TaskState::WaitingApproval.as_str());
+
+        let approval = runtime
+            .list_approvals(None, Some("pending"))
+            .await
+            .expect("approvals")
+            .into_iter()
+            .next()
+            .expect("approval");
+        let resumed = runtime
+            .resolve_approval(None, &approval.approval_id, true)
+            .await
+            .expect("approve");
+        assert_eq!(resumed.state, TaskState::Completed.as_str());
+
+        let deliveries = runtime
+            .db
+            .list_scheduled_household_deliveries_for_requester(&runtime.default_user.user_id)
+            .await
+            .expect("scheduled deliveries");
+        assert_eq!(deliveries.len(), 1);
+        let delivery = &deliveries[0];
+        assert_eq!(delivery.delivery_mode, "scheduled_once");
+        let scheduled_task_id = delivery
+            .materialized_task_id
+            .as_deref()
+            .expect("scheduled task id");
+
+        runtime
+            .db
+            .update_task_wake_at(scheduled_task_id, Some(&now_rfc3339()))
+            .await
+            .expect("wake task");
+        let direct_send_calls = Arc::new(Mutex::new(Vec::new()));
+        discord::set_test_direct_send_capture(Some(Arc::clone(&direct_send_calls)));
+
+        let executed = runtime
+            .execute_next_runnable_task()
+            .await
+            .expect("execute next")
+            .expect("scheduled task");
+
+        discord::set_test_direct_send_capture(None);
+
+        assert_eq!(executed.task.state, TaskState::Completed.as_str());
+        let sent = runtime
+            .db
+            .fetch_household_delivery(&delivery.delivery_id)
+            .await
+            .expect("fetch delivery")
+            .expect("delivery");
+        assert_eq!(sent.status, "sent");
+        assert_eq!(sent.recipient_user_id, recipient.user_id);
+
+        let calls = direct_send_calls.lock().expect("captured sends");
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].contains("Buy kiwis."));
+    }
+
+    #[tokio::test]
+    async fn scheduled_household_delivery_can_send_to_requester_when_route_exists() {
+        let _direct_send_guard = direct_send_test_guard();
+        let (_tempdir, runtime) = test_runtime_with_discord_token(
+            vec![
+                ModelTurnResponse {
+                    output_items: vec![json!({
+                        "type": "function_call",
+                        "call_id": "call_1",
+                        "name": "household_schedule_message",
+                        "arguments": "{\"delivery_id\":null,\"recipient\":\"Alex\",\"message\":\"Take vitamins.\",\"deliver_at\":\"2099-01-01T09:00:00Z\",\"cron_expr\":null,\"window_start_at\":null,\"window_end_at\":null,\"enabled\":true}"
+                    })],
+                    tool_calls: vec![beaverki_models::ModelToolCall {
+                        call_id: "call_1".to_owned(),
+                        name: "household_schedule_message".to_owned(),
+                        arguments: json!({
+                            "delivery_id": Value::Null,
+                            "recipient": "Alex",
+                            "message": "Take vitamins.",
+                            "deliver_at": "2099-01-01T09:00:00Z",
+                            "cron_expr": Value::Null,
+                            "window_start_at": Value::Null,
+                            "window_end_at": Value::Null,
+                            "enabled": true
+                        }),
+                    }],
+                    output_text: String::new(),
+                    usage: None,
+                },
+                ModelTurnResponse {
+                    output_items: vec![json!({
+                        "type": "function_call",
+                        "call_id": "call_2",
+                        "name": "household_schedule_message",
+                        "arguments": "{\"delivery_id\":null,\"recipient\":\"Alex\",\"message\":\"Take vitamins.\",\"deliver_at\":\"2099-01-01T09:00:00Z\",\"cron_expr\":null,\"window_start_at\":null,\"window_end_at\":null,\"enabled\":true}"
+                    })],
+                    tool_calls: vec![beaverki_models::ModelToolCall {
+                        call_id: "call_2".to_owned(),
+                        name: "household_schedule_message".to_owned(),
+                        arguments: json!({
+                            "delivery_id": Value::Null,
+                            "recipient": "Alex",
+                            "message": "Take vitamins.",
+                            "deliver_at": "2099-01-01T09:00:00Z",
+                            "cron_expr": Value::Null,
+                            "window_start_at": Value::Null,
+                            "window_end_at": Value::Null,
+                            "enabled": true
+                        }),
+                    }],
+                    output_text: String::new(),
+                    usage: None,
+                },
+                ModelTurnResponse {
+                    output_items: vec![json!({
+                        "type": "message",
+                        "content": [{ "type": "output_text", "text": "I scheduled that reminder for you." }]
+                    })],
+                    tool_calls: vec![],
+                    output_text: "I scheduled that reminder for you.".to_owned(),
+                    usage: None,
+                },
+            ],
+            Some("discord-token".to_owned()),
+        )
+        .await;
+        runtime
+            .db
+            .upsert_connector_identity(
+                "discord",
+                "discord-alex",
+                None,
+                &runtime.default_user.user_id,
+                "authenticated_message",
+            )
+            .await
+            .expect("map Alex");
+
+        let first = runtime
+            .run_objective(
+                None,
+                "Remind me to take vitamins tomorrow morning.",
+                MemoryScope::Private,
+            )
+            .await
+            .expect("first run");
+        assert_eq!(first.task.state, TaskState::WaitingApproval.as_str());
+
+        let approval = runtime
+            .list_approvals(None, Some("pending"))
+            .await
+            .expect("approvals")
+            .into_iter()
+            .next()
+            .expect("approval");
+        let resumed = runtime
+            .resolve_approval(None, &approval.approval_id, true)
+            .await
+            .expect("approve");
+        assert_eq!(resumed.state, TaskState::Completed.as_str());
+
+        let deliveries = runtime
+            .db
+            .list_scheduled_household_deliveries_for_requester(&runtime.default_user.user_id)
+            .await
+            .expect("scheduled deliveries");
+        assert_eq!(deliveries.len(), 1);
+        let delivery = &deliveries[0];
+        let scheduled_task_id = delivery
+            .materialized_task_id
+            .as_deref()
+            .expect("scheduled task id");
+
+        runtime
+            .db
+            .update_task_wake_at(scheduled_task_id, Some(&now_rfc3339()))
+            .await
+            .expect("wake task");
+        let direct_send_calls = Arc::new(Mutex::new(Vec::new()));
+        discord::set_test_direct_send_capture(Some(Arc::clone(&direct_send_calls)));
+
+        let executed = runtime
+            .execute_next_runnable_task()
+            .await
+            .expect("execute next")
+            .expect("scheduled task");
+
+        discord::set_test_direct_send_capture(None);
+
+        assert_eq!(executed.task.state, TaskState::Completed.as_str());
+        let sent = runtime
+            .db
+            .fetch_household_delivery(&delivery.delivery_id)
+            .await
+            .expect("fetch delivery")
+            .expect("delivery");
+        assert_eq!(sent.status, "sent");
+        assert_eq!(sent.recipient_user_id, runtime.default_user.user_id);
+
+        let calls = direct_send_calls.lock().expect("captured sends");
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].contains("recipient=discord-alex"));
+        assert!(calls[0].contains("Take vitamins."));
+    }
+
+    #[tokio::test]
+    async fn recurring_household_delivery_revalidates_requester_roles_at_send_time() {
+        let _direct_send_guard = direct_send_test_guard();
+        let (_tempdir, runtime) =
+            test_runtime_with_discord_token(vec![], Some("discord-token".to_owned())).await;
+        let requester = runtime
+            .create_user("Sam", &[String::from("child")])
+            .await
+            .expect("create requester");
+        let recipient = runtime
+            .create_user("Casey", &[String::from("adult")])
+            .await
+            .expect("create recipient");
+        runtime
+            .db
+            .upsert_connector_identity(
+                "discord",
+                "discord-casey",
+                None,
+                &recipient.user_id,
+                "authenticated_message",
+            )
+            .await
+            .expect("map Casey");
+        let template = runtime
+            .db
+            .create_or_reuse_household_delivery(NewHouseholdDelivery {
+                task_id: "task_seed",
+                requester_user_id: &requester.user_id,
+                requester_identity_id: "cli:sam",
+                recipient_user_id: &recipient.user_id,
+                message_text: "This should be blocked later.",
+                delivery_mode: "scheduled_recurring",
+                connector_type: "discord",
+                connector_identity_id: "discord-casey",
+                target_ref: "discord-casey",
+                fallback_target_ref: None,
+                dedupe_key: "schedule-template",
+                initial_status: "scheduled",
+                parent_delivery_id: None,
+                schedule_id: None,
+                scheduled_for_at: None,
+                window_starts_at: None,
+                window_ends_at: None,
+                recurrence_rule: Some("0/5 * * * * * *"),
+                scheduled_job_state: Some("scheduled"),
+                materialized_task_id: None,
+            })
+            .await
+            .expect("template");
+        let scheduled_for = now_rfc3339();
+        runtime
+            .db
+            .create_schedule(NewSchedule {
+                schedule_id: Some("sched_household_blocked"),
+                owner_user_id: &requester.user_id,
+                target_type: "household_delivery",
+                target_id: &template.delivery_id,
+                cron_expr: "0/5 * * * * * *",
+                enabled: true,
+                next_run_at: &scheduled_for,
+            })
+            .await
+            .expect("schedule");
+        let direct_send_calls = Arc::new(Mutex::new(Vec::new()));
+        discord::set_test_direct_send_capture(Some(Arc::clone(&direct_send_calls)));
+
+        let tasks = runtime
+            .materialize_due_schedules()
+            .await
+            .expect("materialize");
+        assert_eq!(tasks.len(), 1);
+        let result = runtime
+            .execute_task(tasks[0].clone())
+            .await
+            .expect("execute scheduled task");
+
+        discord::set_test_direct_send_capture(None);
+
+        assert_eq!(result.task.state, TaskState::Failed.as_str());
+        let occurrence = runtime
+            .db
+            .fetch_household_delivery_by_dedupe_key(&format!(
+                "schedule:{}:{}",
+                "sched_household_blocked", scheduled_for,
+            ))
+            .await
+            .expect("occurrence")
+            .expect("occurrence row");
+        assert_eq!(occurrence.status, "failed");
+        assert!(
+            occurrence
+                .failure_reason
+                .as_deref()
+                .expect("failure reason")
+                .contains("no longer allowed")
+        );
+        let calls = direct_send_calls.lock().expect("captured sends");
+        assert!(calls.is_empty());
     }
 
     #[tokio::test]

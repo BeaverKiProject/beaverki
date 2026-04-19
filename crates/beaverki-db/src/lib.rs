@@ -594,6 +594,19 @@ impl Database {
         Ok(())
     }
 
+    pub async fn update_task_wake_at(&self, task_id: &str, wake_at: Option<&str>) -> Result<()> {
+        let timestamp = now_rfc3339();
+        sqlx::query("UPDATE tasks SET wake_at = ?, updated_at = ? WHERE task_id = ?")
+            .bind(wake_at)
+            .bind(&timestamp)
+            .bind(task_id)
+            .execute(&self.pool)
+            .await
+            .context("failed to update task wake_at")?;
+        self.touch_session_for_task(task_id, &timestamp).await?;
+        Ok(())
+    }
+
     pub async fn set_task_waiting_approval(&self, task_id: &str, message: &str) -> Result<()> {
         let timestamp = now_rfc3339();
         sqlx::query(
@@ -2022,6 +2035,539 @@ impl Database {
         Ok(rows)
     }
 
+    pub async fn create_workflow_definition(
+        &self,
+        input: NewWorkflowDefinition<'_>,
+        stages: &[NewWorkflowStage<'_>],
+    ) -> Result<WorkflowDefinitionRow> {
+        let workflow_id = input
+            .workflow_id
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| new_prefixed_id("workflow"));
+        let timestamp = now_rfc3339();
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .context("failed to start workflow definition transaction")?;
+
+        sqlx::query(
+            "INSERT INTO workflow_definitions
+             (workflow_id, owner_user_id, name, description, status, created_from_task_id, safety_status, safety_summary, current_version_number, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)",
+        )
+        .bind(&workflow_id)
+        .bind(input.owner_user_id)
+        .bind(input.name)
+        .bind(input.description)
+        .bind(input.status)
+        .bind(input.created_from_task_id)
+        .bind(input.safety_status)
+        .bind(input.safety_summary)
+        .bind(&timestamp)
+        .bind(&timestamp)
+        .execute(&mut *tx)
+        .await
+        .context("failed to create workflow definition")?;
+
+        let version_id = new_prefixed_id("workflow_version");
+        sqlx::query(
+            "INSERT INTO workflow_versions
+             (version_id, workflow_id, version_number, name, description, created_from_task_id, created_at)
+             VALUES (?, ?, 1, ?, ?, ?, ?)",
+        )
+        .bind(&version_id)
+        .bind(&workflow_id)
+        .bind(input.name)
+        .bind(input.description)
+        .bind(input.created_from_task_id)
+        .bind(&timestamp)
+        .execute(&mut *tx)
+        .await
+        .context("failed to create workflow version")?;
+
+        for (index, stage) in stages.iter().enumerate() {
+            let stage_id = stage
+                .stage_id
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| new_prefixed_id("workflow_stage"));
+            sqlx::query(
+                "INSERT INTO workflow_stages
+                 (stage_id, workflow_id, version_number, stage_index, stage_kind, stage_label, artifact_ref, stage_config_json, created_at, updated_at)
+                 VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&stage_id)
+            .bind(&workflow_id)
+            .bind(index as i64)
+            .bind(stage.stage_kind)
+            .bind(stage.stage_label)
+            .bind(stage.artifact_ref)
+            .bind(stage.stage_config_json.to_string())
+            .bind(&timestamp)
+            .bind(&timestamp)
+            .execute(&mut *tx)
+            .await
+            .context("failed to create workflow stage")?;
+            let stage_version_id = new_prefixed_id("workflow_stage_version");
+            sqlx::query(
+                "INSERT INTO workflow_stage_versions
+                 (stage_version_id, workflow_id, version_number, stage_index, stage_kind, stage_label, artifact_ref, stage_config_json, created_at)
+                 VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&stage_version_id)
+            .bind(&workflow_id)
+            .bind(index as i64)
+            .bind(stage.stage_kind)
+            .bind(stage.stage_label)
+            .bind(stage.artifact_ref)
+            .bind(stage.stage_config_json.to_string())
+            .bind(&timestamp)
+            .execute(&mut *tx)
+            .await
+            .context("failed to create workflow stage version")?;
+        }
+
+        tx.commit()
+            .await
+            .context("failed to commit workflow definition transaction")?;
+
+        self.fetch_workflow_definition_for_owner(input.owner_user_id, &workflow_id)
+            .await?
+            .context("workflow definition missing after insert")
+    }
+
+    pub async fn update_workflow_definition_contents(
+        &self,
+        input: UpdateWorkflowDefinition<'_>,
+        stages: &[NewWorkflowStage<'_>],
+    ) -> Result<WorkflowDefinitionRow> {
+        let existing = self
+            .fetch_workflow_definition_for_owner(input.owner_user_id, input.workflow_id)
+            .await?
+            .ok_or_else(|| anyhow!("workflow '{}' not found", input.workflow_id))?;
+        let next_version_number = existing.current_version_number + 1;
+        let timestamp = now_rfc3339();
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .context("failed to start workflow update transaction")?;
+
+        sqlx::query(
+            "UPDATE workflow_definitions
+             SET name = ?, description = ?, created_from_task_id = ?, status = ?, safety_status = ?, safety_summary = ?, current_version_number = ?, updated_at = ?
+             WHERE workflow_id = ? AND owner_user_id = ?",
+        )
+        .bind(input.name)
+        .bind(input.description)
+        .bind(input.created_from_task_id)
+        .bind(input.status)
+        .bind(input.safety_status)
+        .bind(input.safety_summary)
+        .bind(next_version_number)
+        .bind(&timestamp)
+        .bind(input.workflow_id)
+        .bind(input.owner_user_id)
+        .execute(&mut *tx)
+        .await
+        .context("failed to update workflow definition")?;
+
+        let version_id = new_prefixed_id("workflow_version");
+        sqlx::query(
+            "INSERT INTO workflow_versions
+             (version_id, workflow_id, version_number, name, description, created_from_task_id, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&version_id)
+        .bind(input.workflow_id)
+        .bind(next_version_number)
+        .bind(input.name)
+        .bind(input.description)
+        .bind(input.created_from_task_id)
+        .bind(&timestamp)
+        .execute(&mut *tx)
+        .await
+        .context("failed to create workflow version")?;
+
+        sqlx::query("DELETE FROM workflow_stages WHERE workflow_id = ?")
+            .bind(input.workflow_id)
+            .execute(&mut *tx)
+            .await
+            .context("failed to clear current workflow stages")?;
+
+        for (index, stage) in stages.iter().enumerate() {
+            let stage_id = stage
+                .stage_id
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| new_prefixed_id("workflow_stage"));
+            sqlx::query(
+                "INSERT INTO workflow_stages
+                 (stage_id, workflow_id, version_number, stage_index, stage_kind, stage_label, artifact_ref, stage_config_json, created_at, updated_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&stage_id)
+            .bind(input.workflow_id)
+            .bind(next_version_number)
+            .bind(index as i64)
+            .bind(stage.stage_kind)
+            .bind(stage.stage_label)
+            .bind(stage.artifact_ref)
+            .bind(stage.stage_config_json.to_string())
+            .bind(&timestamp)
+            .bind(&timestamp)
+            .execute(&mut *tx)
+            .await
+            .context("failed to create current workflow stage")?;
+            let stage_version_id = new_prefixed_id("workflow_stage_version");
+            sqlx::query(
+                "INSERT INTO workflow_stage_versions
+                 (stage_version_id, workflow_id, version_number, stage_index, stage_kind, stage_label, artifact_ref, stage_config_json, created_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&stage_version_id)
+            .bind(input.workflow_id)
+            .bind(next_version_number)
+            .bind(index as i64)
+            .bind(stage.stage_kind)
+            .bind(stage.stage_label)
+            .bind(stage.artifact_ref)
+            .bind(stage.stage_config_json.to_string())
+            .bind(&timestamp)
+            .execute(&mut *tx)
+            .await
+            .context("failed to create workflow stage history")?;
+        }
+
+        tx.commit()
+            .await
+            .context("failed to commit workflow update transaction")?;
+
+        self.fetch_workflow_definition_for_owner(input.owner_user_id, input.workflow_id)
+            .await?
+            .context("workflow definition missing after update")
+    }
+
+    pub async fn fetch_workflow_definition_for_owner(
+        &self,
+        owner_user_id: &str,
+        workflow_id: &str,
+    ) -> Result<Option<WorkflowDefinitionRow>> {
+        let row = sqlx::query_as::<_, WorkflowDefinitionRow>(
+            "SELECT workflow_id, owner_user_id, name, description, status, created_from_task_id, safety_status, safety_summary, current_version_number, created_at, updated_at
+             FROM workflow_definitions
+             WHERE owner_user_id = ? AND workflow_id = ?",
+        )
+        .bind(owner_user_id)
+        .bind(workflow_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to fetch workflow definition")?;
+        Ok(row)
+    }
+
+    pub async fn fetch_workflow_definition(
+        &self,
+        workflow_id: &str,
+    ) -> Result<Option<WorkflowDefinitionRow>> {
+        let row = sqlx::query_as::<_, WorkflowDefinitionRow>(
+            "SELECT workflow_id, owner_user_id, name, description, status, created_from_task_id, safety_status, safety_summary, current_version_number, created_at, updated_at
+             FROM workflow_definitions
+             WHERE workflow_id = ?",
+        )
+        .bind(workflow_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to fetch workflow definition")?;
+        Ok(row)
+    }
+
+    pub async fn list_workflow_definitions_for_owner(
+        &self,
+        owner_user_id: &str,
+    ) -> Result<Vec<WorkflowDefinitionRow>> {
+        let rows = sqlx::query_as::<_, WorkflowDefinitionRow>(
+            "SELECT workflow_id, owner_user_id, name, description, status, created_from_task_id, safety_status, safety_summary, current_version_number, created_at, updated_at
+             FROM workflow_definitions
+             WHERE owner_user_id = ?
+             ORDER BY created_at DESC",
+        )
+        .bind(owner_user_id)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list workflow definitions")?;
+        Ok(rows)
+    }
+
+    pub async fn list_workflow_stages(
+        &self,
+        workflow_id: &str,
+    ) -> Result<Vec<WorkflowStageRow>> {
+        let rows = sqlx::query_as::<_, WorkflowStageRow>(
+            "SELECT stage_id, workflow_id, version_number, stage_index, stage_kind, stage_label, artifact_ref, stage_config_json, created_at, updated_at
+             FROM workflow_stages
+             WHERE workflow_id = ?
+             ORDER BY stage_index ASC",
+        )
+        .bind(workflow_id)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list workflow stages")?;
+        Ok(rows)
+    }
+
+    pub async fn list_workflow_stages_for_version(
+        &self,
+        workflow_id: &str,
+        version_number: i64,
+    ) -> Result<Vec<WorkflowStageRow>> {
+        let current_version_number = self
+            .fetch_workflow_definition(workflow_id)
+            .await?
+            .ok_or_else(|| anyhow!("workflow '{workflow_id}' not found"))?
+            .current_version_number;
+        if version_number == current_version_number {
+            return self.list_workflow_stages(workflow_id).await;
+        }
+        let rows = sqlx::query_as::<_, WorkflowStageRow>(
+            "SELECT stage_version_id AS stage_id, workflow_id, version_number, stage_index, stage_kind, stage_label, artifact_ref, stage_config_json, created_at, created_at AS updated_at
+             FROM workflow_stage_versions
+             WHERE workflow_id = ?
+               AND version_number = ?
+             ORDER BY stage_index ASC",
+        )
+        .bind(workflow_id)
+        .bind(version_number)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list workflow stages for version")?;
+        Ok(rows)
+    }
+
+    pub async fn list_workflow_versions(
+        &self,
+        workflow_id: &str,
+    ) -> Result<Vec<WorkflowVersionRow>> {
+        let rows = sqlx::query_as::<_, WorkflowVersionRow>(
+            "SELECT version_id, workflow_id, version_number, name, description, created_from_task_id, created_at
+             FROM workflow_versions
+             WHERE workflow_id = ?
+             ORDER BY version_number DESC",
+        )
+        .bind(workflow_id)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list workflow versions")?;
+        Ok(rows)
+    }
+
+    pub async fn update_workflow_definition_status(
+        &self,
+        workflow_id: &str,
+        status: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE workflow_definitions
+             SET status = ?, updated_at = ?
+             WHERE workflow_id = ?",
+        )
+        .bind(status)
+        .bind(now_rfc3339())
+        .bind(workflow_id)
+        .execute(&self.pool)
+        .await
+        .context("failed to update workflow definition status")?;
+        Ok(())
+    }
+
+    pub async fn update_workflow_definition_safety(
+        &self,
+        workflow_id: &str,
+        safety_status: &str,
+        safety_summary: &str,
+        status: Option<&str>,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE workflow_definitions
+             SET safety_status = ?, safety_summary = ?, status = COALESCE(?, status), updated_at = ?
+             WHERE workflow_id = ?",
+        )
+        .bind(safety_status)
+        .bind(safety_summary)
+        .bind(status)
+        .bind(now_rfc3339())
+        .bind(workflow_id)
+        .execute(&self.pool)
+        .await
+        .context("failed to update workflow definition safety")?;
+        Ok(())
+    }
+
+    pub async fn create_workflow_review(
+        &self,
+        input: NewWorkflowReview<'_>,
+    ) -> Result<WorkflowReviewRow> {
+        let review_id = new_prefixed_id("review");
+        let timestamp = now_rfc3339();
+        sqlx::query(
+            "INSERT INTO workflow_reviews
+             (review_id, workflow_id, version_number, reviewer_agent_id, review_type, verdict, risk_level, findings_json, summary_text, reviewed_artifact_text, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&review_id)
+        .bind(input.workflow_id)
+        .bind(input.version_number)
+        .bind(input.reviewer_agent_id)
+        .bind(input.review_type)
+        .bind(input.verdict)
+        .bind(input.risk_level)
+        .bind(input.findings_json.to_string())
+        .bind(input.summary_text)
+        .bind(input.reviewed_artifact_text)
+        .bind(&timestamp)
+        .execute(&self.pool)
+        .await
+        .context("failed to create workflow review")?;
+
+        self.list_workflow_reviews(input.workflow_id)
+            .await?
+            .into_iter()
+            .find(|row| row.review_id == review_id)
+            .ok_or_else(|| anyhow!("workflow review missing after insert"))
+    }
+
+    pub async fn list_workflow_reviews(&self, workflow_id: &str) -> Result<Vec<WorkflowReviewRow>> {
+        let rows = sqlx::query_as::<_, WorkflowReviewRow>(
+            "SELECT review_id, workflow_id, version_number, reviewer_agent_id, review_type, verdict, risk_level, findings_json, summary_text, reviewed_artifact_text, created_at
+             FROM workflow_reviews
+             WHERE workflow_id = ?
+             ORDER BY created_at DESC",
+        )
+        .bind(workflow_id)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list workflow reviews")?;
+        Ok(rows)
+    }
+
+    pub async fn create_workflow_run(&self, input: NewWorkflowRun<'_>) -> Result<WorkflowRunRow> {
+        let workflow_run_id = input
+            .workflow_run_id
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| new_prefixed_id("workflow_run"));
+        let timestamp = now_rfc3339();
+        sqlx::query(
+            "INSERT INTO workflow_runs
+             (workflow_run_id, workflow_id, owner_user_id, initiating_identity_id, schedule_id, source_task_id, state, current_stage_index, artifacts_json, wake_at, block_reason, last_error, retry_count, started_at, completed_at, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)",
+        )
+        .bind(&workflow_run_id)
+        .bind(input.workflow_id)
+        .bind(input.owner_user_id)
+        .bind(input.initiating_identity_id)
+        .bind(input.schedule_id)
+        .bind(input.source_task_id)
+        .bind(input.state)
+        .bind(input.current_stage_index)
+        .bind(input.artifacts_json.to_string())
+        .bind(input.wake_at)
+        .bind(input.block_reason)
+        .bind(input.last_error)
+        .bind(input.retry_count)
+        .bind(input.started_at)
+        .bind(&timestamp)
+        .bind(&timestamp)
+        .execute(&self.pool)
+        .await
+        .context("failed to create workflow run")?;
+
+        self.fetch_workflow_run(&workflow_run_id)
+            .await?
+            .ok_or_else(|| anyhow!("workflow run missing after insert"))
+    }
+
+    pub async fn fetch_workflow_run(&self, workflow_run_id: &str) -> Result<Option<WorkflowRunRow>> {
+        let row = sqlx::query_as::<_, WorkflowRunRow>(
+            "SELECT workflow_run_id, workflow_id, owner_user_id, initiating_identity_id, schedule_id, source_task_id, state, current_stage_index, artifacts_json, wake_at, block_reason, last_error, retry_count, started_at, completed_at, created_at, updated_at
+             FROM workflow_runs
+             WHERE workflow_run_id = ?",
+        )
+        .bind(workflow_run_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to fetch workflow run")?;
+        Ok(row)
+    }
+
+    pub async fn list_workflow_runs_for_workflow(
+        &self,
+        workflow_id: &str,
+    ) -> Result<Vec<WorkflowRunRow>> {
+        let rows = sqlx::query_as::<_, WorkflowRunRow>(
+            "SELECT workflow_run_id, workflow_id, owner_user_id, initiating_identity_id, schedule_id, source_task_id, state, current_stage_index, artifacts_json, wake_at, block_reason, last_error, retry_count, started_at, completed_at, created_at, updated_at
+             FROM workflow_runs
+             WHERE workflow_id = ?
+             ORDER BY created_at DESC",
+        )
+        .bind(workflow_id)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list workflow runs")?;
+        Ok(rows)
+    }
+
+    pub async fn fetch_workflow_run_for_owner(
+        &self,
+        owner_user_id: &str,
+        workflow_run_id: &str,
+    ) -> Result<Option<WorkflowRunRow>> {
+        let row = sqlx::query_as::<_, WorkflowRunRow>(
+            "SELECT workflow_run_id, workflow_id, owner_user_id, initiating_identity_id, schedule_id, source_task_id, state, current_stage_index, artifacts_json, wake_at, block_reason, last_error, retry_count, started_at, completed_at, created_at, updated_at
+             FROM workflow_runs
+             WHERE owner_user_id = ?
+               AND workflow_run_id = ?",
+        )
+        .bind(owner_user_id)
+        .bind(workflow_run_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to fetch workflow run for owner")?;
+        Ok(row)
+    }
+
+    pub async fn update_workflow_run(
+        &self,
+        workflow_run_id: &str,
+        state: &str,
+        current_stage_index: i64,
+        artifacts_json: &Value,
+        wake_at: Option<&str>,
+        block_reason: Option<&str>,
+        last_error: Option<&str>,
+        retry_count: i64,
+        completed: bool,
+    ) -> Result<()> {
+        let completed_at = if completed { Some(now_rfc3339()) } else { None };
+        sqlx::query(
+            "UPDATE workflow_runs
+             SET state = ?, current_stage_index = ?, artifacts_json = ?, wake_at = ?, block_reason = ?, last_error = ?, retry_count = ?, completed_at = COALESCE(?, completed_at), updated_at = ?
+             WHERE workflow_run_id = ?",
+        )
+        .bind(state)
+        .bind(current_stage_index)
+        .bind(artifacts_json.to_string())
+        .bind(wake_at)
+        .bind(block_reason)
+        .bind(last_error)
+        .bind(retry_count)
+        .bind(completed_at.as_deref())
+        .bind(now_rfc3339())
+        .bind(workflow_run_id)
+        .execute(&self.pool)
+        .await
+        .context("failed to update workflow run")?;
+        Ok(())
+    }
+
     pub async fn create_schedule(&self, input: NewSchedule<'_>) -> Result<ScheduleRow> {
         let schedule_id = input
             .schedule_id
@@ -2323,8 +2869,8 @@ impl Database {
         let timestamp = now_rfc3339();
         sqlx::query(
             "INSERT INTO household_deliveries
-             (delivery_id, task_id, requester_user_id, requester_identity_id, recipient_user_id, message_text, delivery_mode, connector_type, connector_identity_id, target_ref, fallback_target_ref, dedupe_key, status, failure_reason, external_message_id, delivered_at, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'dispatching', NULL, NULL, NULL, ?, ?)",
+             (delivery_id, task_id, requester_user_id, requester_identity_id, recipient_user_id, message_text, delivery_mode, connector_type, connector_identity_id, target_ref, fallback_target_ref, dedupe_key, status, failure_reason, external_message_id, delivered_at, parent_delivery_id, schedule_id, scheduled_for_at, window_starts_at, window_ends_at, recurrence_rule, scheduled_job_state, materialized_task_id, completed_at, canceled_at, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)",
         )
         .bind(&delivery_id)
         .bind(input.task_id)
@@ -2338,6 +2884,15 @@ impl Database {
         .bind(input.target_ref)
         .bind(input.fallback_target_ref)
         .bind(input.dedupe_key)
+        .bind(input.initial_status)
+        .bind(input.parent_delivery_id)
+        .bind(input.schedule_id)
+        .bind(input.scheduled_for_at)
+        .bind(input.window_starts_at)
+        .bind(input.window_ends_at)
+        .bind(input.recurrence_rule)
+        .bind(input.scheduled_job_state)
+        .bind(input.materialized_task_id)
         .bind(&timestamp)
         .bind(&timestamp)
         .execute(&self.pool)
@@ -2354,7 +2909,7 @@ impl Database {
         delivery_id: &str,
     ) -> Result<Option<HouseholdDeliveryRow>> {
         let row = sqlx::query_as::<_, HouseholdDeliveryRow>(
-            "SELECT delivery_id, task_id, requester_user_id, requester_identity_id, recipient_user_id, message_text, delivery_mode, connector_type, connector_identity_id, target_ref, fallback_target_ref, dedupe_key, status, failure_reason, external_message_id, delivered_at, created_at, updated_at
+            "SELECT delivery_id, task_id, requester_user_id, requester_identity_id, recipient_user_id, message_text, delivery_mode, connector_type, connector_identity_id, target_ref, fallback_target_ref, dedupe_key, status, failure_reason, external_message_id, delivered_at, parent_delivery_id, schedule_id, scheduled_for_at, window_starts_at, window_ends_at, recurrence_rule, scheduled_job_state, materialized_task_id, completed_at, canceled_at, created_at, updated_at
              FROM household_deliveries
              WHERE delivery_id = ?",
         )
@@ -2370,7 +2925,7 @@ impl Database {
         dedupe_key: &str,
     ) -> Result<Option<HouseholdDeliveryRow>> {
         let row = sqlx::query_as::<_, HouseholdDeliveryRow>(
-            "SELECT delivery_id, task_id, requester_user_id, requester_identity_id, recipient_user_id, message_text, delivery_mode, connector_type, connector_identity_id, target_ref, fallback_target_ref, dedupe_key, status, failure_reason, external_message_id, delivered_at, created_at, updated_at
+            "SELECT delivery_id, task_id, requester_user_id, requester_identity_id, recipient_user_id, message_text, delivery_mode, connector_type, connector_identity_id, target_ref, fallback_target_ref, dedupe_key, status, failure_reason, external_message_id, delivered_at, parent_delivery_id, schedule_id, scheduled_for_at, window_starts_at, window_ends_at, recurrence_rule, scheduled_job_state, materialized_task_id, completed_at, canceled_at, created_at, updated_at
              FROM household_deliveries
              WHERE dedupe_key = ?",
         )
@@ -2386,7 +2941,7 @@ impl Database {
         task_id: &str,
     ) -> Result<Vec<HouseholdDeliveryRow>> {
         let rows = sqlx::query_as::<_, HouseholdDeliveryRow>(
-            "SELECT delivery_id, task_id, requester_user_id, requester_identity_id, recipient_user_id, message_text, delivery_mode, connector_type, connector_identity_id, target_ref, fallback_target_ref, dedupe_key, status, failure_reason, external_message_id, delivered_at, created_at, updated_at
+            "SELECT delivery_id, task_id, requester_user_id, requester_identity_id, recipient_user_id, message_text, delivery_mode, connector_type, connector_identity_id, target_ref, fallback_target_ref, dedupe_key, status, failure_reason, external_message_id, delivered_at, parent_delivery_id, schedule_id, scheduled_for_at, window_starts_at, window_ends_at, recurrence_rule, scheduled_job_state, materialized_task_id, completed_at, canceled_at, created_at, updated_at
              FROM household_deliveries
              WHERE task_id = ?
              ORDER BY created_at ASC",
@@ -2398,20 +2953,65 @@ impl Database {
         Ok(rows)
     }
 
+    pub async fn fetch_scheduled_household_delivery_for_requester(
+        &self,
+        requester_user_id: &str,
+        delivery_id: &str,
+    ) -> Result<Option<HouseholdDeliveryRow>> {
+        let row = sqlx::query_as::<_, HouseholdDeliveryRow>(
+            "SELECT delivery_id, task_id, requester_user_id, requester_identity_id, recipient_user_id, message_text, delivery_mode, connector_type, connector_identity_id, target_ref, fallback_target_ref, dedupe_key, status, failure_reason, external_message_id, delivered_at, parent_delivery_id, schedule_id, scheduled_for_at, window_starts_at, window_ends_at, recurrence_rule, scheduled_job_state, materialized_task_id, completed_at, canceled_at, created_at, updated_at
+             FROM household_deliveries
+             WHERE requester_user_id = ?
+               AND delivery_id = ?
+               AND parent_delivery_id IS NULL
+               AND delivery_mode != 'immediate'",
+        )
+        .bind(requester_user_id)
+        .bind(delivery_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to fetch scheduled household delivery")?;
+        Ok(row)
+    }
+
+    pub async fn list_scheduled_household_deliveries_for_requester(
+        &self,
+        requester_user_id: &str,
+    ) -> Result<Vec<HouseholdDeliveryRow>> {
+        let rows = sqlx::query_as::<_, HouseholdDeliveryRow>(
+            "SELECT delivery_id, task_id, requester_user_id, requester_identity_id, recipient_user_id, message_text, delivery_mode, connector_type, connector_identity_id, target_ref, fallback_target_ref, dedupe_key, status, failure_reason, external_message_id, delivered_at, parent_delivery_id, schedule_id, scheduled_for_at, window_starts_at, window_ends_at, recurrence_rule, scheduled_job_state, materialized_task_id, completed_at, canceled_at, created_at, updated_at
+             FROM household_deliveries
+             WHERE requester_user_id = ?
+               AND parent_delivery_id IS NULL
+               AND delivery_mode != 'immediate'
+             ORDER BY created_at DESC",
+        )
+        .bind(requester_user_id)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list scheduled household deliveries")?;
+        Ok(rows)
+    }
+
     pub async fn mark_household_delivery_sent(
         &self,
         delivery_id: &str,
+        connector_type: &str,
+        connector_identity_id: &str,
         target_ref: &str,
         external_message_id: Option<&str>,
     ) -> Result<()> {
         let timestamp = now_rfc3339();
         sqlx::query(
             "UPDATE household_deliveries
-             SET status = 'sent', target_ref = ?, external_message_id = ?, delivered_at = ?, failure_reason = NULL, updated_at = ?
+             SET status = 'sent', connector_type = ?, connector_identity_id = ?, target_ref = ?, external_message_id = ?, delivered_at = ?, failure_reason = NULL, scheduled_job_state = 'completed', completed_at = ?, updated_at = ?
              WHERE delivery_id = ?",
         )
+        .bind(connector_type)
+        .bind(connector_identity_id)
         .bind(target_ref)
         .bind(external_message_id)
+        .bind(&timestamp)
         .bind(&timestamp)
         .bind(&timestamp)
         .bind(delivery_id)
@@ -2426,17 +3026,97 @@ impl Database {
         delivery_id: &str,
         reason: &str,
     ) -> Result<()> {
+        let timestamp = now_rfc3339();
         sqlx::query(
             "UPDATE household_deliveries
-             SET status = 'failed', failure_reason = ?, updated_at = ?
+             SET status = 'failed', failure_reason = ?, scheduled_job_state = 'failed', completed_at = ?, updated_at = ?
              WHERE delivery_id = ?",
         )
         .bind(reason)
-        .bind(now_rfc3339())
+        .bind(&timestamp)
+        .bind(&timestamp)
         .bind(delivery_id)
         .execute(&self.pool)
         .await
         .context("failed to mark household delivery failed")?;
+        Ok(())
+    }
+
+    pub async fn mark_household_delivery_materialized(
+        &self,
+        delivery_id: &str,
+        materialized_task_id: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE household_deliveries
+             SET materialized_task_id = ?, scheduled_job_state = 'materialized', updated_at = ?
+             WHERE delivery_id = ?",
+        )
+        .bind(materialized_task_id)
+        .bind(now_rfc3339())
+        .bind(delivery_id)
+        .execute(&self.pool)
+        .await
+        .context("failed to mark household delivery materialized")?;
+        Ok(())
+    }
+
+    pub async fn update_household_delivery_schedule(
+        &self,
+        delivery_id: &str,
+        recipient_user_id: &str,
+        message_text: &str,
+        connector_type: &str,
+        connector_identity_id: &str,
+        target_ref: &str,
+        fallback_target_ref: Option<&str>,
+        schedule_id: Option<&str>,
+        scheduled_for_at: Option<&str>,
+        window_starts_at: Option<&str>,
+        window_ends_at: Option<&str>,
+        recurrence_rule: Option<&str>,
+        scheduled_job_state: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE household_deliveries
+             SET recipient_user_id = ?, message_text = ?, connector_type = ?, connector_identity_id = ?, target_ref = ?, fallback_target_ref = ?, schedule_id = ?, scheduled_for_at = ?, window_starts_at = ?, window_ends_at = ?, recurrence_rule = ?, scheduled_job_state = ?, failure_reason = NULL, canceled_at = NULL, updated_at = ?
+             WHERE delivery_id = ?",
+        )
+        .bind(recipient_user_id)
+        .bind(message_text)
+        .bind(connector_type)
+        .bind(connector_identity_id)
+        .bind(target_ref)
+        .bind(fallback_target_ref)
+        .bind(schedule_id)
+        .bind(scheduled_for_at)
+        .bind(window_starts_at)
+        .bind(window_ends_at)
+        .bind(recurrence_rule)
+        .bind(scheduled_job_state)
+        .bind(now_rfc3339())
+        .bind(delivery_id)
+        .execute(&self.pool)
+        .await
+        .context("failed to update scheduled household delivery")?;
+        Ok(())
+    }
+
+    pub async fn cancel_household_delivery(&self, delivery_id: &str, reason: &str) -> Result<()> {
+        let timestamp = now_rfc3339();
+        sqlx::query(
+            "UPDATE household_deliveries
+             SET status = 'canceled', failure_reason = ?, scheduled_job_state = 'canceled', canceled_at = ?, completed_at = ?, updated_at = ?
+             WHERE delivery_id = ?",
+        )
+        .bind(reason)
+        .bind(&timestamp)
+        .bind(&timestamp)
+        .bind(&timestamp)
+        .bind(delivery_id)
+        .execute(&self.pool)
+        .await
+        .context("failed to cancel household delivery")?;
         Ok(())
     }
 
@@ -2724,6 +3404,15 @@ pub struct NewHouseholdDelivery<'a> {
     pub target_ref: &'a str,
     pub fallback_target_ref: Option<&'a str>,
     pub dedupe_key: &'a str,
+    pub initial_status: &'a str,
+    pub parent_delivery_id: Option<&'a str>,
+    pub schedule_id: Option<&'a str>,
+    pub scheduled_for_at: Option<&'a str>,
+    pub window_starts_at: Option<&'a str>,
+    pub window_ends_at: Option<&'a str>,
+    pub recurrence_rule: Option<&'a str>,
+    pub scheduled_job_state: Option<&'a str>,
+    pub materialized_task_id: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2795,6 +3484,70 @@ pub struct NewSchedule<'a> {
     pub cron_expr: &'a str,
     pub enabled: bool,
     pub next_run_at: &'a str,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewWorkflowDefinition<'a> {
+    pub workflow_id: Option<&'a str>,
+    pub owner_user_id: &'a str,
+    pub name: &'a str,
+    pub description: Option<&'a str>,
+    pub status: &'a str,
+    pub created_from_task_id: Option<&'a str>,
+    pub safety_status: &'a str,
+    pub safety_summary: Option<&'a str>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewWorkflowStage<'a> {
+    pub stage_id: Option<&'a str>,
+    pub stage_kind: &'a str,
+    pub stage_label: Option<&'a str>,
+    pub artifact_ref: Option<&'a str>,
+    pub stage_config_json: Value,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewWorkflowReview<'a> {
+    pub workflow_id: &'a str,
+    pub version_number: i64,
+    pub reviewer_agent_id: &'a str,
+    pub review_type: &'a str,
+    pub verdict: &'a str,
+    pub risk_level: &'a str,
+    pub findings_json: Value,
+    pub summary_text: &'a str,
+    pub reviewed_artifact_text: &'a str,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewWorkflowRun<'a> {
+    pub workflow_run_id: Option<&'a str>,
+    pub workflow_id: &'a str,
+    pub owner_user_id: &'a str,
+    pub initiating_identity_id: &'a str,
+    pub schedule_id: Option<&'a str>,
+    pub source_task_id: Option<&'a str>,
+    pub state: &'a str,
+    pub current_stage_index: i64,
+    pub artifacts_json: Value,
+    pub wake_at: Option<&'a str>,
+    pub block_reason: Option<&'a str>,
+    pub last_error: Option<&'a str>,
+    pub retry_count: i64,
+    pub started_at: &'a str,
+}
+
+#[derive(Debug, Clone)]
+pub struct UpdateWorkflowDefinition<'a> {
+    pub workflow_id: &'a str,
+    pub owner_user_id: &'a str,
+    pub name: &'a str,
+    pub description: Option<&'a str>,
+    pub created_from_task_id: Option<&'a str>,
+    pub status: &'a str,
+    pub safety_status: &'a str,
+    pub safety_summary: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
@@ -3030,6 +3783,82 @@ pub struct LuaToolReviewRow {
 }
 
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct WorkflowDefinitionRow {
+    pub workflow_id: String,
+    pub owner_user_id: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub status: String,
+    pub created_from_task_id: Option<String>,
+    pub safety_status: String,
+    pub safety_summary: Option<String>,
+    pub current_version_number: i64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct WorkflowStageRow {
+    pub stage_id: String,
+    pub workflow_id: String,
+    pub version_number: i64,
+    pub stage_index: i64,
+    pub stage_kind: String,
+    pub stage_label: Option<String>,
+    pub artifact_ref: Option<String>,
+    pub stage_config_json: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct WorkflowReviewRow {
+    pub review_id: String,
+    pub workflow_id: String,
+    pub version_number: i64,
+    pub reviewer_agent_id: String,
+    pub review_type: String,
+    pub verdict: String,
+    pub risk_level: String,
+    pub findings_json: String,
+    pub summary_text: String,
+    pub reviewed_artifact_text: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct WorkflowVersionRow {
+    pub version_id: String,
+    pub workflow_id: String,
+    pub version_number: i64,
+    pub name: String,
+    pub description: Option<String>,
+    pub created_from_task_id: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct WorkflowRunRow {
+    pub workflow_run_id: String,
+    pub workflow_id: String,
+    pub owner_user_id: String,
+    pub initiating_identity_id: String,
+    pub schedule_id: Option<String>,
+    pub source_task_id: Option<String>,
+    pub state: String,
+    pub current_stage_index: i64,
+    pub artifacts_json: String,
+    pub wake_at: Option<String>,
+    pub block_reason: Option<String>,
+    pub last_error: Option<String>,
+    pub retry_count: i64,
+    pub started_at: String,
+    pub completed_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
 pub struct ScheduleRow {
     pub schedule_id: String,
     pub owner_user_id: String,
@@ -3073,6 +3902,16 @@ pub struct HouseholdDeliveryRow {
     pub failure_reason: Option<String>,
     pub external_message_id: Option<String>,
     pub delivered_at: Option<String>,
+    pub parent_delivery_id: Option<String>,
+    pub schedule_id: Option<String>,
+    pub scheduled_for_at: Option<String>,
+    pub window_starts_at: Option<String>,
+    pub window_ends_at: Option<String>,
+    pub recurrence_rule: Option<String>,
+    pub scheduled_job_state: Option<String>,
+    pub materialized_task_id: Option<String>,
+    pub completed_at: Option<String>,
+    pub canceled_at: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
