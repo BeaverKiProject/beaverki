@@ -1322,6 +1322,7 @@ mod tests {
     #[tokio::test]
     async fn interactive_browser_uses_configured_launcher() {
         use std::os::unix::fs::PermissionsExt;
+        use tokio::time::{Duration, sleep};
 
         let tempdir = tempfile::tempdir().expect("tempdir");
         let launcher_path = tempdir.path().join("launcher.sh");
@@ -1358,6 +1359,22 @@ mod tests {
             .expect("browser output");
 
         assert_eq!(output.payload["mode"], "interactive");
+        assert_eq!(
+            output.payload["launcher"],
+            launcher_path.display().to_string()
+        );
+
+        for _ in 0..50 {
+            if output_path.exists() {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+
+        assert_eq!(
+            fs::read_to_string(&output_path).expect("launcher output"),
+            "https://example.com"
+        );
     }
 
     #[cfg(unix)]
