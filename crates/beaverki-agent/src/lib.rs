@@ -705,6 +705,15 @@ impl PrimaryAgentRunner {
                         }),
                     )
                     .await?;
+                info!(
+                    task_id = %task.task_id,
+                    owner_user_id = %request.owner_user_id,
+                    approval_id = %approval.approval_id,
+                    tool_name = %tool_name,
+                    command = %command,
+                    risk = %risk.as_str(),
+                    "shell command approval requested"
+                );
                 let waiting = self
                     .db
                     .fetch_task_for_owner(&request.owner_user_id, &task.task_id)
@@ -720,6 +729,15 @@ impl PrimaryAgentRunner {
                 roles_label(&request.role_ids),
                 risk.as_str(),
                 command
+            );
+            warn!(
+                task_id = %task.task_id,
+                owner_user_id = %request.owner_user_id,
+                tool_name = %tool_name,
+                command = %command,
+                risk = %risk.as_str(),
+                roles = %roles_label(&request.role_ids),
+                "shell command approval request denied because the user roles are not eligible"
             );
             return self
                 .fail_task_terminal(
@@ -799,6 +817,15 @@ impl PrimaryAgentRunner {
                         }),
                     )
                     .await?;
+                info!(
+                    task_id = %task.task_id,
+                    owner_user_id = %request.owner_user_id,
+                    approval_id = %approval.approval_id,
+                    tool_name = %tool_name,
+                    action_type = %action_type,
+                    target_ref = %target_ref,
+                    "automation approval requested"
+                );
                 let waiting = self
                     .db
                     .fetch_task_for_owner(&request.owner_user_id, &task.task_id)
@@ -814,6 +841,15 @@ impl PrimaryAgentRunner {
                 roles_label(&request.role_ids),
                 action_type,
                 target_ref
+            );
+            warn!(
+                task_id = %task.task_id,
+                owner_user_id = %request.owner_user_id,
+                tool_name = %tool_name,
+                action_type = %action_type,
+                target_ref = %target_ref,
+                roles = %roles_label(&request.role_ids),
+                "automation approval request denied because the user roles are not eligible"
             );
             return self
                 .fail_task_terminal(
@@ -2653,6 +2689,15 @@ impl PrimaryAgentRunner {
             .get("enabled")
             .and_then(Value::as_bool)
             .unwrap_or(true);
+        info!(
+            task_id = %task.task_id,
+            owner_user_id = %request.owner_user_id,
+            script_id = %script_id,
+            schedule_id = %schedule_id,
+            cron_expr = %cron_expr,
+            enabled,
+            "processing Lua script schedule request"
+        );
         let script = self
             .db
             .fetch_script_for_owner(&request.owner_user_id, script_id)
@@ -2660,6 +2705,14 @@ impl PrimaryAgentRunner {
             .map_err(ToolError::Failed)?
             .ok_or_else(|| ToolError::Failed(anyhow!("script '{script_id}' not found")))?;
         if script.safety_status != "approved" || script.status != "active" {
+            warn!(
+                task_id = %task.task_id,
+                owner_user_id = %request.owner_user_id,
+                script_id = %script.script_id,
+                script_status = %script.status,
+                safety_status = %script.safety_status,
+                "rejecting Lua script schedule request because the script is not active and approved"
+            );
             return Err(ToolError::Failed(anyhow!(
                 "script '{}' must be active and safety-approved before it can be scheduled",
                 script.script_id
@@ -2701,6 +2754,16 @@ impl PrimaryAgentRunner {
             })
             .await
             .map_err(ToolError::Failed)?;
+        info!(
+            task_id = %task.task_id,
+            owner_user_id = %request.owner_user_id,
+            script_id = %script.script_id,
+            schedule_id = %schedule.schedule_id,
+            cron_expr = %schedule.cron_expr,
+            enabled = schedule.enabled != 0,
+            next_run_at = %schedule.next_run_at,
+            "Lua script schedule stored"
+        );
         self.db
             .record_audit_event(
                 "agent",
@@ -3380,6 +3443,15 @@ impl PrimaryAgentRunner {
             .get("enabled")
             .and_then(Value::as_bool)
             .unwrap_or(true);
+        info!(
+            task_id = %task.task_id,
+            owner_user_id = %request.owner_user_id,
+            workflow_id = %workflow_id,
+            schedule_id = %schedule_id,
+            cron_expr = %cron_expr,
+            enabled,
+            "processing workflow schedule request"
+        );
         let workflow = self
             .db
             .fetch_workflow_definition_for_owner(&request.owner_user_id, workflow_id)
@@ -3387,6 +3459,14 @@ impl PrimaryAgentRunner {
             .map_err(ToolError::Failed)?
             .ok_or_else(|| ToolError::Failed(anyhow!("workflow '{workflow_id}' not found")))?;
         if workflow.safety_status != "approved" || workflow.status != "active" {
+            warn!(
+                task_id = %task.task_id,
+                owner_user_id = %request.owner_user_id,
+                workflow_id = %workflow.workflow_id,
+                workflow_status = %workflow.status,
+                safety_status = %workflow.safety_status,
+                "rejecting workflow schedule request because the workflow is not active and approved"
+            );
             return Err(ToolError::Failed(anyhow!(
                 "workflow '{}' must be active and safety-approved before it can be scheduled",
                 workflow.workflow_id
@@ -3411,6 +3491,16 @@ impl PrimaryAgentRunner {
             })
             .await
             .map_err(ToolError::Failed)?;
+        info!(
+            task_id = %task.task_id,
+            owner_user_id = %request.owner_user_id,
+            workflow_id = %workflow.workflow_id,
+            schedule_id = %schedule.schedule_id,
+            cron_expr = %schedule.cron_expr,
+            enabled = schedule.enabled != 0,
+            next_run_at = %schedule.next_run_at,
+            "workflow schedule stored"
+        );
         self.db
             .record_audit_event(
                 "agent",
