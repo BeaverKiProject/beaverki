@@ -11,6 +11,7 @@ The current Discord integration lets BeaverKi:
 - accept allowlisted server messages when they start with the configured command prefix or a direct mention of the bot
 - route each Discord identity to a BeaverKi household user
 - send task replies back into the same Discord conversation
+- send direct household messages to another mapped household member when an allowed user asks BeaverKi to notify them now
 - keep short-lived working indicators active while a task is still running
 - route risky approval actions through Discord, with DM-only approval by default
 
@@ -180,6 +181,30 @@ Example DM:
 ```text
 Summarize the latest task activity for my account.
 ```
+
+### Direct household delivery
+
+If the sender has an allowed household role and the recipient has a mapped Discord identity, BeaverKi can send an immediate direct household message on the sender's behalf.
+
+Typical request examples:
+
+```text
+Tell Casey dinner is ready.
+```
+
+```text
+Please let Casey know I am on my way home now.
+```
+
+Current delivery behavior:
+
+- BeaverKi resolves the named recipient against active mapped household users
+- the send is policy-gated, so untrusted roles are denied rather than silently delivering cross-user messages
+- Discord delivery is DM-first and falls back to the recipient's mapped channel when DM creation is unavailable
+- delivery is persisted and deduplicated so a retry or restart does not send the same immediate message twice
+- audit and task events record who requested the delivery, who received it, and which route was used
+
+If BeaverKi cannot resolve the recipient uniquely or the recipient has no mapped delivery route, it should deny the request and explain why rather than guessing.
 
 ### Shared server channels
 

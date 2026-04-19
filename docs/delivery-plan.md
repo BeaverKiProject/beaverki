@@ -387,43 +387,137 @@ Exit criteria:
 - Lua-defined tools remain constrained to Rust-controlled capabilities and fail closed on disallowed operations
 - schema validation, safety review, and auditability work end to end for both storage modes
 
-## 3.11 M5 Household Delivery And Reminders
+## 3.10.1 M4.9 Scheduled Workflow Pipelines
 
 Goal:
 
-Add first-class targeted household reminders and notifications so one user's agent can understand a request, schedule the follow-up work, and deliver it to another mapped household user through the right channel.
+Extend the scheduler from single-target Lua execution into reviewed durable workflow pipelines so cron and reminder features can combine multiple Lua stages with later bounded agent interaction.
 
 Status:
 
 - proposed after M4.8
 
+Why this stage exists:
+
+- the current runtime already has durable schedules, reviewed Lua scripts, Lua-defined tools, fresh cron-run sessions, and agent execution, but those pieces are not yet composable under one scheduled run
+- today a due schedule materializes only a `lua_script` target and the follow-up path is limited to another deferred Lua run rather than an explicit workflow handoff
+- many useful reminders, digests, maintenance tasks, and coordination flows need a scripted preparation phase before an agent interprets results or decides the next action
+
 Implementation notes:
 
-- reminder creation should capture both the requesting user and the intended recipient user as distinct identities
-- natural-language requests such as "remind my girlfriend to buy kiwis when she goes to the shop this afternoon" should be normalized into structured reminder state with message, timing window, and delivery policy
-- one-shot deferred reminders should reuse the durable scheduling and wake-up machinery rather than introducing a separate best-effort timer path
-- delivery should be connector-agnostic, using the recipient's mapped connector identity or configured local fallback channel
-- cross-user delivery must remain policy-gated and auditable so BeaverKi can explain who asked for the reminder, who received it, and why the delivery was allowed
-- reminders should deduplicate delivery across restart and retry paths so a missed wake-up replay does not spam the recipient
+- keep the current single-script schedule path as the simple baseline, but make `target_type` genuinely extensible by supporting workflow targets in the runtime
+- add a reviewed workflow definition model with ordered stages so the runtime, not an opaque Lua script chain, owns stage boundaries, state handoff, retries, and auditability
+- initial stage kinds should be `lua_script`, `lua_tool`, `agent_task`, and `user_notify`
+- workflow runs should persist owner identity, initiating identity, triggering schedule, current stage, stage outputs, carried artifacts, wake-up state, and fail-closed block reasons across restart
+- agent stages should receive an explicit bounded task slice built from prior workflow outputs rather than inheriting broad hidden context, and should support a stored stage-specific prompt contract plus allowed tool or Lua-artifact references
+- changing a workflow definition should go through blocking safety review and activation gating even when the referenced Lua artifacts were already reviewed individually
+- scheduled workflow runs should not enter interactive approval waits; if the workflow and its referenced stages are approved and active, the run should execute autonomously, and if a stage exceeds that approved envelope at runtime the run should fail closed or block with audit visibility
+- workflow-level user notification should be a first-class stage so a scheduled run can actually surface its result to a human; that delivery stage should align with and later reuse the M5 household-delivery routing and persistence foundation rather than creating a second notification subsystem
+- later reminder and scheduled-delivery work should build on this workflow foundation instead of adding a second bespoke cron orchestration path
+
+Out of scope:
+
+- unrestricted arbitrary workflow graphs or general-purpose branching languages in the first slice
+- opaque script-to-script dispatch where the runtime cannot see stage boundaries
+- connector-specific scheduled UX beyond what is needed to prove the runtime workflow foundation; the first `user_notify` slice may stay minimal as long as it is aligned with the later M5 delivery model
 
 Stories:
 
-- `M5-001` Add persistent reminder records that distinguish requester identity, recipient user, payload, delivery target, timing metadata, and lifecycle state.
-- `M5-002` Implement agent-facing reminder creation flows that can turn natural-language household coordination requests into structured deferred delivery work.
-- `M5-003` Extend the scheduler and wake-up pipeline to materialize one-shot reminder deliveries in addition to recurring Lua schedules.
-- `M5-004` Add connector-agnostic targeted delivery routing that resolves the recipient's preferred mapped identity and fallback channel at send time.
-- `M5-005` Enforce RBAC and policy checks for cross-user reminder creation and delivery, including denial cases for untrusted roles or unmapped recipients.
-- `M5-006` Add audit coverage and end-to-end tests for reminder creation, restart-safe delivery, deduplication, and recipient-versus-requester attribution.
+- `M4.9-001` Add persistent workflow-definition storage with ownership, ordered stages, review metadata, activation state, and originating task linkage.
+- `M4.9-002` Extend schedule materialization so `target_type=workflow` creates durable workflow-run state instead of assuming every due schedule maps directly to one Lua script task.
+- `M4.9-003` Implement initial workflow stages for reviewed Lua script execution, reviewed Lua-defined tool execution, bounded agent-task handoff with explicit task-slice construction and output capture, and a minimal connector-agnostic `user_notify` stage for surfacing workflow results.
+- `M4.9-004` Persist workflow-run progression, defer or wake-up behavior, retry state, fail-closed block reasons, and per-stage artifacts so scheduled pipelines survive restart without losing where they were.
+- `M4.9-005` Add CLI and agent-facing workflow creation, activation, scheduling, inspection, and replay flows so staged automation becomes operable rather than an internal-only runtime abstraction.
+- `M4.9-006` Add safety-review coverage, RBAC enforcement, audit events, and end-to-end tests for workflow activation, autonomous scheduled execution inside the approved envelope, fail-closed behavior when a stage exceeds that envelope, result delivery through `user_notify`, and compatibility with existing single-script schedules.
 
 Exit criteria:
 
-- the workflow is a natural part of the agent's understanding so a user can ask their agent to create a reminder for another household member without needing to know about connectors, channels, or technical details
-- an agent can create a deferred reminder addressed to another mapped household user
-- the reminder survives restart and is delivered once through the selected connector or fallback path
-- cross-user reminder delivery is policy-gated and fully auditable
-- natural-language reminder requests are normalized into structured scheduled work rather than handled as ad hoc connector replies
+- a scheduled trigger can run one or more reviewed Lua stages and then hand off to a bounded agent stage within one durable auditable pipeline
+- simple existing single-script schedules still work without forced migration
+- each stage has explicit input or output state, retry behavior, and audit visibility
+- scheduled workflow runs execute autonomously once the workflow and its referenced parts are approved, and they fail closed rather than pausing for fresh approval
+- a workflow can surface its result to a user through a first-class notification or delivery stage that can later converge with the M5 delivery foundation
+- later reminder and recurring household-delivery work can reuse the same workflow-run machinery instead of introducing a separate scheduled orchestration model
 
-## 3.12 Post-V1
+## 3.11 M5 Household Direct Delivery
+
+Goal:
+
+Add first-class immediate household delivery so one user's agent can send a message directly to another mapped household user through the right channels.
+
+Status:
+
+- implemented in the repository
+
+Implementation notes:
+
+- the agent should have a clear direct-delivery capability for requests such as "tell Alice dinner is ready" so immediate household coordination is a normal conversational behavior rather than a scheduled-work workaround
+- direct delivery should capture both the requesting user and the intended recipient user as distinct identities
+- delivery should be connector-agnostic, using the recipient's mapped connector identity or configured local fallback channel
+- recipient resolution should fail safely for ambiguous names, unmapped users, or disallowed cross-user routes, prompting correct agent responses
+- cross-user direct delivery must remain policy-gated and auditable so BeaverKi can explain who asked for the message, who received it, and why the delivery was allowed
+- direct-send retries should deduplicate across restart and retry paths so a recovered send does not spam the recipient
+- this milestone should establish the base household-delivery data model and routing abstractions that deferred reminders and recurring delivery will later reuse
+- the current implementation adds durable `household_deliveries` rows, an agent-facing `household_send_message` tool, runtime-backed immediate delivery, and Discord DM-first routing with fallback to the recipient's mapped channel when DM creation is unavailable
+- the current policy slice allows direct household delivery for `owner`, `adult`, and `service` roles and denies untrusted roles such as `child`
+
+Stories:
+
+- `M5-001` Add persistent household-delivery records that distinguish requester identity, recipient user, payload, delivery mode, delivery target, and lifecycle state for immediate cross-user sends.
+- `M5-002` Implement agent-facing direct household messaging flows that can turn natural-language requests into an immediate targeted delivery to another allowed household user.
+- `M5-003` Add connector-agnostic targeted delivery routing that resolves the recipient's preferred mapped identity and fallback channel at send time.
+- `M5-004` Enforce RBAC and policy checks for direct cross-user delivery, including denial cases for untrusted roles, ambiguous recipients, or unmapped recipients.
+- `M5-005` Add audit coverage and end-to-end tests for direct send delivery, retry-safe deduplication, routing decisions, and recipient-versus-requester attribution.
+
+Exit criteria:
+
+- the workflow is a natural part of the agent's understanding so a user can ask their agent to notify another household member now without needing to know about connectors, channels, or technical details
+- the agent can send an immediate direct message to another allowed mapped household user without routing it through a reminder or cron abstraction
+- the direct delivery survives retry or restart and is delivered once through the selected connector or fallback path
+- cross-user direct delivery is policy-gated and fully auditable
+- the runtime has a reusable household-delivery foundation that later deferred reminder and schedule work can build on
+
+## 3.12 M5.5 Household Reminders And Scheduled Delivery
+
+Goal:
+
+Build first-class deferred and recurring household delivery on top of the direct-delivery foundation so the agent can reliably create, manage, and explain reminders and cron-style scheduled messaging.
+
+Status:
+
+- proposed after M5
+
+Implementation notes:
+
+- reminder and cron functionality should be promoted from a runtime capability into explicit agent-usable product behavior, with first-class tool flows for creating, listing, inspecting, updating, and cancelling scheduled deliveries
+- reminder and cron functionality should build on the scheduled workflow pipeline foundation from `M4.9` rather than introducing a reminder-only orchestration path
+- reminder creation should capture both the requesting user and the intended recipient user as distinct identities and extend the delivery model with timing, recurrence, and scheduled-job lifecycle state
+- natural-language requests such as "remind my girlfriend to buy kiwis when she goes to the shop this afternoon" should be normalized into structured scheduled delivery intent with message, timing window or recurrence, and delivery policy
+- one-shot deferred reminders and recurring household delivery schedules should reuse the same durable scheduling and wake-up machinery rather than splitting reminder logic from cron-like execution paths
+- scheduled delivery should expose enough structured state back to the agent that it can confirm what was scheduled, explain when it will fire, and repair or replace stale schedules instead of silently failing to use the reminder or cron subsystem
+- deferred delivery should remain connector-agnostic and should re-evaluate routing against the recipient's mapped identity or fallback channel at send time when appropriate
+- reminder and scheduled-delivery execution should deduplicate across restart and retry paths so a missed wake-up replay does not spam the recipient
+- policy checks should cover both schedule creation time and eventual delivery time so BeaverKi can fail closed if roles, mappings, or trust boundaries change before send
+
+Stories:
+
+- `M5.5-001` Extend household-delivery records with timing metadata, recurrence rules, delivery windows, scheduled-job state, and completion or failure tracking for deferred sends.
+- `M5.5-002` Implement agent-facing reminder and scheduling flows that can turn natural-language household coordination requests into structured deferred delivery work, including enough tool feedback that the agent can reliably use reminder or cron-style scheduling in normal conversation.
+- `M5.5-003` Add agent-facing schedule management flows to list, inspect, update, and cancel pending reminder or recurring household delivery jobs so scheduling becomes a usable control surface rather than a write-only backend mechanism.
+- `M5.5-004` Extend the scheduler and wake-up pipeline to materialize one-shot reminder deliveries and recurring household delivery jobs alongside recurring Lua schedules, with shared persistence, retry, and recovery semantics.
+- `M5.5-005` Enforce RBAC and policy checks for reminder creation, recurring delivery, and send-time revalidation, including denial cases when recipients become unmapped or disallowed before execution.
+- `M5.5-006` Add audit coverage and end-to-end tests for reminder creation, recurring schedule management, restart-safe delivery, deduplication, agent-visible schedule confirmation, and recipient-versus-requester attribution.
+
+Exit criteria:
+
+- the workflow is a natural part of the agent's understanding so a user can ask their agent to schedule a later reminder or recurring household delivery without needing to know about connectors, channels, cron syntax, or technical details
+- an agent can create, inspect, update, and cancel deferred reminders or recurring household delivery schedules addressed to another mapped household user
+- reminder and cron-style delivery paths are reliable enough that the agent can confirm what was scheduled, when it will fire, and whether it later succeeded
+- deferred delivery survives restart and is delivered once through the selected connector or fallback path
+- cross-user deferred delivery is policy-gated and fully auditable
+- natural-language reminder and scheduling requests are normalized into structured scheduled work rather than handled as ad hoc connector replies
+
+## 3.13 Post-V1
 
 Candidate follow-up work:
 

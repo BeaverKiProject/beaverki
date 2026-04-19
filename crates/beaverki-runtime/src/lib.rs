@@ -4,7 +4,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
-use beaverki_agent::{AgentMemoryMode, AgentRequest, AgentResult, PrimaryAgentRunner};
+use async_trait::async_trait;
+use beaverki_agent::{
+    AgentMemoryMode, AgentRequest, AgentResult, HouseholdDeliveryDelegate,
+    HouseholdDeliveryOutcome, HouseholdDeliveryRequest, PrimaryAgentRunner,
+};
 use beaverki_automation as automation;
 use beaverki_config::{
     DiscordChannelMode, LoadedConfig, SecretStore, SessionLifecycleAction, SessionLifecyclePolicy,
@@ -13,10 +17,10 @@ use beaverki_config::{
 use beaverki_core::{MemoryKind, MemoryScope, TaskState, now_rfc3339};
 use beaverki_db::{
     ApprovalActionRow, ApprovalActionSet, ApprovalRow, BootstrapState, ConnectorIdentityRow,
-    ConversationSessionRow, Database, IssueApprovalActions, MemoryRow, NewConversationSession,
-    NewSchedule, NewScript, NewScriptReview, NewTask, RoleRow, RuntimeHeartbeatRow,
-    RuntimeSessionRow, ScheduleRow, ScriptReviewRow, ScriptRow, TaskEventRow, TaskRow,
-    ToolInvocationRow, UserRoleRow, UserRow,
+    ConversationSessionRow, Database, HouseholdDeliveryRow, IssueApprovalActions, MemoryRow,
+    NewConversationSession, NewHouseholdDelivery, NewSchedule, NewScript, NewScriptReview,
+    NewTask, RoleRow, RuntimeHeartbeatRow, RuntimeSessionRow, ScheduleRow, ScriptReviewRow,
+    ScriptRow, TaskEventRow, TaskRow, ToolInvocationRow, UserRoleRow, UserRow,
 };
 use beaverki_memory::MemoryStore;
 use beaverki_models::{ModelProvider, OpenAiProvider};
@@ -103,6 +107,260 @@ pub struct Runtime {
     discord_bot_token: Option<String>,
 }
 
+#[derive(Clone)]
+struct RuntimeHouseholdDeliveryDelegate {
+    db: Database,
+    runtime_actor_id: String,
+    discord_bot_token: Option<String>,
+}
+
+#[async_trait]
+impl HouseholdDeliveryDelegate for RuntimeHouseholdDeliveryDelegate {
+    async fn deliver_immediate_household_message(
+        &self,
+        request: HouseholdDeliveryRequest<'_>,
+    ) -> std::result::Result<HouseholdDeliveryOutcome, beaverki_tools::ToolError> {
+        let requester = self
+            .db
+            .fetch_user(request.requester_user_id)
+            .await
+            .map_err(beaverki_tools::ToolError::Failed)?
+            .ok_or_else(|| {
+                beaverki_tools::ToolError::Failed(anyhow!(
+                    "requester '{}' not found for household delivery",
+                    request.requester_user_id
+                ))
+            })?;
+        let recipient = self
+            .db
+            .fetch_user(request.recipient_user_id)
+            .await
+            .map_err(beaverki_tools::ToolError::Failed)?
+            .ok_or_else(|| {
+                beaverki_tools::ToolError::Denied {
+                    message: format!(
+                        "recipient '{}' no longer exists for household delivery",
+                        request.recipient_user_id
+                    ),
+                    detail: json!({
+                        "recipient_user_id": request.recipient_user_id,
+                    }),
+                }
+            })?;
+
+        let identity = self
+            .select_household_delivery_identity(&recipient.user_id)
+            .await?;
+        let delivery = self
+            .db
+            .create_or_reuse_household_delivery(NewHouseholdDelivery {
+                task_id: request.task_id,
+                requester_user_id: request.requester_user_id,
+                requester_identity_id: request.requester_identity_id,
+                recipient_user_id: request.recipient_user_id,
+                message_text: request.message_text,
+                delivery_mode: "immediate",
+                connector_type: &identity.connector_type,
+                connector_identity_id: &identity.identity_id,
+                target_ref: &identity.external_user_id,
+                fallback_target_ref: identity.external_channel_id.as_deref(),
+                dedupe_key: request.dedupe_key,
+            })
+            .await
+            .map_err(beaverki_tools::ToolError::Failed)?;
+
+        if delivery.status == "sent" {
+            return Ok(HouseholdDeliveryOutcome {
+                delivery_id: delivery.delivery_id,
+                recipient_user_id: recipient.user_id,
+                recipient_display_name: recipient.display_name,
+                connector_type: identity.connector_type,
+                connector_identity_id: identity.identity_id,
+                target_ref: delivery.target_ref,
+                status: delivery.status,
+                deduplicated: true,
+            });
+        }
+        if delivery.status == "failed" {
+            return Err(beaverki_tools::ToolError::Failed(anyhow!(
+                delivery
+                    .failure_reason
+                    .unwrap_or_else(|| "household delivery previously failed".to_owned())
+            )));
+        }
+        if delivery.status == "dispatching" && delivery.delivered_at.is_none() {
+            let send_result = self
+                .send_household_delivery(&delivery, &identity, &requester)
+                .await;
+            match send_result {
+                Ok(sent) => {
+                    self.db
+                        .mark_household_delivery_sent(
+                            &delivery.delivery_id,
+                            &sent.target_ref,
+                            Some(&sent.message_id),
+                        )
+                        .await
+                        .map_err(beaverki_tools::ToolError::Failed)?;
+                    self.db
+                        .append_task_event(
+                            request.task_id,
+                            "household_delivery_sent",
+                            "runtime",
+                            &self.runtime_actor_id,
+                            json!({
+                                "delivery_id": delivery.delivery_id,
+                                "requester_user_id": requester.user_id,
+                                "requester_identity_id": request.requester_identity_id,
+                                "recipient_user_id": recipient.user_id,
+                                "recipient_display_name": recipient.display_name,
+                                "connector_type": identity.connector_type,
+                                "connector_identity_id": identity.identity_id,
+                                "target_kind": sent.target_kind,
+                                "target_ref": sent.target_ref,
+                                "deduplicated": false,
+                            }),
+                        )
+                        .await
+                        .map_err(beaverki_tools::ToolError::Failed)?;
+                    self.db
+                        .record_audit_event(
+                            "runtime",
+                            &self.runtime_actor_id,
+                            "household_delivery_sent",
+                            json!({
+                                "delivery_id": delivery.delivery_id,
+                                "task_id": request.task_id,
+                                "requester_user_id": requester.user_id,
+                                "requester_identity_id": request.requester_identity_id,
+                                "requester_display_name": requester.display_name,
+                                "recipient_user_id": recipient.user_id,
+                                "recipient_display_name": recipient.display_name,
+                                "connector_type": identity.connector_type,
+                                "connector_identity_id": identity.identity_id,
+                                "target_kind": sent.target_kind,
+                                "target_ref": sent.target_ref,
+                            }),
+                        )
+                        .await
+                        .map_err(beaverki_tools::ToolError::Failed)?;
+
+                    return Ok(HouseholdDeliveryOutcome {
+                        delivery_id: delivery.delivery_id,
+                        recipient_user_id: recipient.user_id,
+                        recipient_display_name: recipient.display_name,
+                        connector_type: identity.connector_type,
+                        connector_identity_id: identity.identity_id,
+                        target_ref: sent.target_ref,
+                        status: "sent".to_owned(),
+                        deduplicated: false,
+                    });
+                }
+                Err(error) => {
+                    let message = error.to_string();
+                    self.db
+                        .mark_household_delivery_failed(&delivery.delivery_id, &message)
+                        .await
+                        .map_err(beaverki_tools::ToolError::Failed)?;
+                    self.db
+                        .append_task_event(
+                            request.task_id,
+                            "household_delivery_failed",
+                            "runtime",
+                            &self.runtime_actor_id,
+                            json!({
+                                "delivery_id": delivery.delivery_id,
+                                "requester_user_id": requester.user_id,
+                                "recipient_user_id": recipient.user_id,
+                                "connector_type": identity.connector_type,
+                                "connector_identity_id": identity.identity_id,
+                                "error": message,
+                            }),
+                        )
+                        .await
+                        .map_err(beaverki_tools::ToolError::Failed)?;
+                    self.db
+                        .record_audit_event(
+                            "runtime",
+                            &self.runtime_actor_id,
+                            "household_delivery_failed",
+                            json!({
+                                "delivery_id": delivery.delivery_id,
+                                "task_id": request.task_id,
+                                "requester_user_id": requester.user_id,
+                                "recipient_user_id": recipient.user_id,
+                                "connector_type": identity.connector_type,
+                                "connector_identity_id": identity.identity_id,
+                                "error": message,
+                            }),
+                        )
+                        .await
+                        .map_err(beaverki_tools::ToolError::Failed)?;
+                    return Err(beaverki_tools::ToolError::Failed(error));
+                }
+            }
+        }
+
+        Ok(HouseholdDeliveryOutcome {
+            delivery_id: delivery.delivery_id,
+            recipient_user_id: recipient.user_id,
+            recipient_display_name: recipient.display_name,
+            connector_type: identity.connector_type,
+            connector_identity_id: identity.identity_id,
+            target_ref: delivery.target_ref,
+            status: delivery.status,
+            deduplicated: true,
+        })
+    }
+}
+
+impl RuntimeHouseholdDeliveryDelegate {
+    async fn select_household_delivery_identity(
+        &self,
+        recipient_user_id: &str,
+    ) -> std::result::Result<ConnectorIdentityRow, beaverki_tools::ToolError> {
+        let identities = self
+            .db
+            .list_connector_identities_for_mapped_user(recipient_user_id)
+            .await
+            .map_err(beaverki_tools::ToolError::Failed)?;
+        let Some(identity) = identities
+            .into_iter()
+            .find(|identity| identity.connector_type == "discord")
+        else {
+            return Err(beaverki_tools::ToolError::Denied {
+                message: format!(
+                    "recipient '{}' does not have a mapped delivery route",
+                    recipient_user_id
+                ),
+                detail: json!({
+                    "recipient_user_id": recipient_user_id,
+                }),
+            });
+        };
+        Ok(identity)
+    }
+
+    async fn send_household_delivery(
+        &self,
+        delivery: &HouseholdDeliveryRow,
+        identity: &ConnectorIdentityRow,
+        requester: &UserRow,
+    ) -> Result<discord::DiscordDirectDeliveryResult> {
+        match identity.connector_type.as_str() {
+            "discord" => {
+                let token = self.discord_bot_token.as_deref().ok_or_else(|| {
+                    anyhow!("Discord direct delivery is not configured with a bot token")
+                })?;
+                let http_client = discord::build_discord_http_client()?;
+                let content = format_household_delivery_message(&requester.display_name, &delivery.message_text);
+                discord::send_direct_household_message(&http_client, token, identity, &content).await
+            }
+            other => bail!("unsupported household delivery connector '{}'", other),
+        }
+    }
+}
+
 impl Runtime {
     pub async fn load(config_dir: impl AsRef<Path>, passphrase: &str) -> Result<Self> {
         let config = LoadedConfig::load_from_dir(config_dir)?;
@@ -144,12 +402,18 @@ impl Runtime {
         tool_context.browser_headless_program =
             config.integrations.browser.headless_browser.clone();
         tool_context.browser_headless_args = config.integrations.browser.headless_args.clone();
+        let household_delivery_delegate = Arc::new(RuntimeHouseholdDeliveryDelegate {
+            db: db.clone(),
+            runtime_actor_id: config.runtime.instance_id.clone(),
+            discord_bot_token: discord_bot_token.clone(),
+        });
         let runner = PrimaryAgentRunner::new(
             db.clone(),
             memory,
             provider.clone(),
             builtin_registry(),
             tool_context,
+            Some(household_delivery_delegate),
             usize::from(config.runtime.defaults.max_agent_steps),
         );
 
@@ -3247,6 +3511,14 @@ fn compact_message_text(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+fn format_household_delivery_message(requester_display_name: &str, message_text: &str) -> String {
+    format!(
+        "Household message from {}:\n\n{}",
+        requester_display_name,
+        message_text.trim()
+    )
+}
+
 fn connector_type_from_events(events: &[TaskEventRow]) -> Option<String> {
     let event = events
         .iter()
@@ -3318,6 +3590,13 @@ mod tests {
     }
 
     async fn test_runtime(responses: Vec<ModelTurnResponse>) -> (TempDir, Runtime) {
+        test_runtime_with_discord_token(responses, None).await
+    }
+
+    async fn test_runtime_with_discord_token(
+        responses: Vec<ModelTurnResponse>,
+        discord_bot_token: Option<String>,
+    ) -> (TempDir, Runtime) {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let config_dir = tempdir.path().join("config");
         let state_dir = tempdir.path().join("state");
@@ -3360,11 +3639,12 @@ mod tests {
             .expect("db connect");
         db.bootstrap_single_user("Alex").await.expect("bootstrap");
         let default_user = db.default_user().await.expect("default").expect("user");
-        let runtime = Runtime::from_parts(
+        let runtime = Runtime::from_parts_with_secrets(
             config,
             db,
             default_user,
             Arc::new(FakeProvider::new(responses)),
+            discord_bot_token,
         )
         .expect("runtime");
         (tempdir, runtime)
@@ -4519,6 +4799,208 @@ end"#,
         let payload: Value = serde_json::from_str(&denial_event.payload_json).expect("payload");
         assert_eq!(payload["tool_name"], json!("shell_exec"));
         assert_eq!(payload["detail"]["risk"], json!("high"));
+    }
+
+    #[tokio::test]
+    async fn household_direct_delivery_sends_once_and_persists_audit_state() {
+        let (_tempdir, runtime) = test_runtime_with_discord_token(
+            vec![
+            ModelTurnResponse {
+                output_items: vec![json!({
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "household_send_message",
+                    "arguments": "{\"recipient\":\"Casey\",\"message\":\"Dinner is ready.\"}"
+                })],
+                tool_calls: vec![beaverki_models::ModelToolCall {
+                    call_id: "call_1".to_owned(),
+                    name: "household_send_message".to_owned(),
+                    arguments: json!({
+                        "recipient": "Casey",
+                        "message": "Dinner is ready."
+                    }),
+                }],
+                output_text: String::new(),
+                usage: None,
+            },
+            ModelTurnResponse {
+                output_items: vec![json!({
+                    "type": "function_call",
+                    "call_id": "call_2",
+                    "name": "household_send_message",
+                    "arguments": "{\"recipient\":\"Casey\",\"message\":\"Dinner is ready.\"}"
+                })],
+                tool_calls: vec![beaverki_models::ModelToolCall {
+                    call_id: "call_2".to_owned(),
+                    name: "household_send_message".to_owned(),
+                    arguments: json!({
+                        "recipient": "Casey",
+                        "message": "Dinner is ready."
+                    }),
+                }],
+                output_text: String::new(),
+                usage: None,
+            },
+            ModelTurnResponse {
+                output_items: vec![json!({
+                    "type": "message",
+                    "content": [{ "type": "output_text", "text": "Casey has been notified." }]
+                })],
+                tool_calls: vec![],
+                output_text: "Casey has been notified.".to_owned(),
+                usage: None,
+            },
+            ],
+            Some("discord-token".to_owned()),
+        )
+        .await;
+        let recipient = runtime
+            .create_user("Casey", &[String::from("adult")])
+            .await
+            .expect("create Casey");
+        runtime
+            .db
+            .upsert_connector_identity(
+                "discord",
+                "discord-casey",
+                None,
+                &recipient.user_id,
+                "authenticated_message",
+            )
+            .await
+            .expect("map Casey");
+        let direct_send_calls = Arc::new(Mutex::new(Vec::new()));
+        discord::set_test_direct_send_capture(Some(Arc::clone(&direct_send_calls)));
+
+        let result = runtime
+            .run_objective(None, "Tell Casey dinner is ready.", MemoryScope::Private)
+            .await
+            .expect("run objective");
+
+        discord::set_test_direct_send_capture(None);
+
+        assert_eq!(result.task.state, TaskState::Completed.as_str());
+        assert_eq!(result.task.result_text.as_deref(), Some("Casey has been notified."));
+
+        let deliveries = runtime
+            .db
+            .list_household_deliveries_for_task(&result.task.task_id)
+            .await
+            .expect("deliveries");
+        let inspection = runtime
+            .inspect_task(None, &result.task.task_id)
+            .await
+            .expect("inspect task");
+        let tool_statuses = inspection
+            .tool_invocations
+            .iter()
+            .map(|invocation| format!("{}:{}", invocation.tool_name, invocation.status))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            deliveries.len(),
+            1,
+            "unexpected tool statuses: {}",
+            tool_statuses.join(", ")
+        );
+        assert_eq!(deliveries[0].recipient_user_id, recipient.user_id);
+        assert_eq!(deliveries[0].status, "sent");
+        assert_eq!(deliveries[0].target_ref, "dm-casey");
+        assert_eq!(deliveries[0].external_message_id.as_deref(), Some("msg-casey-1"));
+        assert!(
+            inspection
+                .tool_invocations
+                .iter()
+                .all(|invocation| invocation.status == "completed"),
+            "unexpected tool statuses: {}",
+            tool_statuses.join(", ")
+        );
+        let sent_event = inspection
+            .events
+            .iter()
+            .find(|event| event.event_type == "household_delivery_sent")
+            .expect("household delivery sent event");
+        let sent_payload: Value =
+            serde_json::from_str(&sent_event.payload_json).expect("sent payload");
+        assert_eq!(sent_payload["recipient_display_name"], json!("Casey"));
+        assert_eq!(sent_payload["target_kind"], json!("discord_dm"));
+
+        let calls = direct_send_calls.lock().expect("captured sends");
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].contains("recipient=discord-casey"));
+        assert!(calls[0].contains("Household message from Alex"));
+        assert!(calls[0].contains("Dinner is ready."));
+    }
+
+    #[tokio::test]
+    async fn household_direct_delivery_denies_child_sender() {
+        let (_tempdir, runtime) = test_runtime(vec![
+            ModelTurnResponse {
+                output_items: vec![json!({
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "household_send_message",
+                    "arguments": "{\"recipient\":\"Alex\",\"message\":\"Dinner is ready.\"}"
+                })],
+                tool_calls: vec![beaverki_models::ModelToolCall {
+                    call_id: "call_1".to_owned(),
+                    name: "household_send_message".to_owned(),
+                    arguments: json!({
+                        "recipient": "Alex",
+                        "message": "Dinner is ready."
+                    }),
+                }],
+                output_text: String::new(),
+                usage: None,
+            },
+            ModelTurnResponse {
+                output_items: vec![json!({
+                    "type": "message",
+                    "content": [{ "type": "output_text", "text": "I cannot send that message." }]
+                })],
+                tool_calls: vec![],
+                output_text: "I cannot send that message.".to_owned(),
+                usage: None,
+            },
+        ])
+        .await;
+        let child = runtime
+            .create_user("Casey", &[String::from("child")])
+            .await
+            .expect("create child");
+
+        let result = runtime
+            .run_objective(
+                Some(&child.user_id),
+                "Tell Alex dinner is ready.",
+                MemoryScope::Private,
+            )
+            .await
+            .expect("run objective as child");
+
+        let deliveries = runtime
+            .db
+            .list_household_deliveries_for_task(&result.task.task_id)
+            .await
+            .expect("deliveries");
+        assert!(deliveries.is_empty());
+
+        let inspection = runtime
+            .inspect_task(Some(&child.user_id), &result.task.task_id)
+            .await
+            .expect("inspect task");
+        assert!(inspection
+            .tool_invocations
+            .iter()
+            .any(|invocation| invocation.tool_name == "household_send_message" && invocation.status == "denied"));
+
+        let audit = runtime.db.list_audit_events(8).await.expect("audit events");
+        let denial = audit
+            .into_iter()
+            .find(|event| event.event_type == "household_delivery_denied")
+            .expect("denial audit event");
+        let payload: Value = serde_json::from_str(&denial.payload_json).expect("payload");
+        assert_eq!(payload["reason"], json!("sender_not_allowed"));
+        assert_eq!(payload["owner_user_id"], json!(child.user_id));
     }
 
     #[tokio::test]

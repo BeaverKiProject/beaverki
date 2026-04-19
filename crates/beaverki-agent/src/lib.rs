@@ -4,19 +4,21 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
+use async_trait::async_trait;
 use beaverki_automation as automation;
 use beaverki_core::{MemoryKind, MemoryScope, ShellRisk, TaskState, ToolInvocationStatus};
 use beaverki_db::{
     Database, LuaToolRow, MemoryRow, NewApproval, NewLuaTool, NewLuaToolReview, NewSchedule,
-    NewScript, NewScriptReview, NewTask, TaskRow, UpdateLuaTool, UpdateScript,
+    NewScript, NewScriptReview, NewTask, TaskRow, UpdateLuaTool, UpdateScript, UserRow,
 };
 use beaverki_memory::{
     MemoryStore, RetrievalScope, SemanticMemoryRecord, SemanticMemoryWriteResult,
 };
 use beaverki_models::{ConversationItem, ModelProvider};
 use beaverki_policy::{
-    can_request_automation_approval, can_request_shell_approval, can_spawn_subagents,
-    can_write_household_memory, visible_memory_scopes,
+    can_request_automation_approval, can_request_shell_approval,
+    can_send_household_direct_delivery, can_spawn_subagents, can_write_household_memory,
+    visible_memory_scopes,
 };
 use beaverki_tools::{
     ToolContext, ToolDefinition, ToolError, ToolOutput, ToolRegistry,
@@ -57,12 +59,44 @@ pub struct AgentResult {
     pub task: TaskRow,
 }
 
+#[derive(Debug, Clone)]
+pub struct HouseholdDeliveryRequest<'a> {
+    pub task_id: &'a str,
+    pub requester_user_id: &'a str,
+    pub requester_identity_id: &'a str,
+    pub requester_agent_id: &'a str,
+    pub recipient_user_id: &'a str,
+    pub message_text: &'a str,
+    pub dedupe_key: &'a str,
+}
+
+#[derive(Debug, Clone)]
+pub struct HouseholdDeliveryOutcome {
+    pub delivery_id: String,
+    pub recipient_user_id: String,
+    pub recipient_display_name: String,
+    pub connector_type: String,
+    pub connector_identity_id: String,
+    pub target_ref: String,
+    pub status: String,
+    pub deduplicated: bool,
+}
+
+#[async_trait]
+pub trait HouseholdDeliveryDelegate: Send + Sync {
+    async fn deliver_immediate_household_message(
+        &self,
+        request: HouseholdDeliveryRequest<'_>,
+    ) -> std::result::Result<HouseholdDeliveryOutcome, ToolError>;
+}
+
 pub struct PrimaryAgentRunner {
     db: Database,
     memory: MemoryStore,
     provider: Arc<dyn ModelProvider>,
     tools: ToolRegistry,
     base_tool_context: ToolContext,
+    household_delivery_delegate: Option<Arc<dyn HouseholdDeliveryDelegate>>,
     max_steps: usize,
 }
 
@@ -160,6 +194,7 @@ impl PrimaryAgentRunner {
         provider: Arc<dyn ModelProvider>,
         tools: ToolRegistry,
         tool_context: ToolContext,
+        household_delivery_delegate: Option<Arc<dyn HouseholdDeliveryDelegate>>,
         max_steps: usize,
     ) -> Self {
         Self {
@@ -168,6 +203,7 @@ impl PrimaryAgentRunner {
             provider,
             tools,
             base_tool_context: tool_context,
+            household_delivery_delegate,
             max_steps,
         }
     }
@@ -840,6 +876,9 @@ impl PrimaryAgentRunner {
             "memory_write" => self.handle_memory_write(task, request, arguments).await,
             "memory_remember" => self.handle_memory_remember(task, request, arguments).await,
             "memory_forget" => self.handle_memory_forget(task, request, arguments).await,
+            "household_send_message" => {
+                self.handle_household_send_message(task, request, arguments).await
+            }
             "lua_script_list"
             | "lua_script_get"
             | "lua_script_write"
@@ -927,6 +966,122 @@ impl PrimaryAgentRunner {
     ) -> std::result::Result<ToolOutput, ToolError> {
         self.handle_semantic_memory_write(task, request, arguments, "memory_write")
             .await
+    }
+
+    async fn handle_household_send_message(
+        &self,
+        task: &TaskRow,
+        request: &AgentRequest,
+        arguments: Value,
+    ) -> std::result::Result<ToolOutput, ToolError> {
+        let recipient_query = required_string_arg(&arguments, "recipient", "household_send_message")?;
+        let message_text = required_string_arg(&arguments, "message", "household_send_message")?;
+
+        if !can_send_household_direct_delivery(&request.role_ids) {
+            self.record_household_delivery_denial(
+                task,
+                request,
+                recipient_query,
+                Some(message_text),
+                "sender_not_allowed",
+                json!({
+                    "recipient": recipient_query,
+                    "role_ids": request.role_ids,
+                }),
+            )
+            .await?;
+            return Err(ToolError::Denied {
+                message: "the current user is not allowed to send direct household messages"
+                    .to_owned(),
+                detail: json!({
+                    "recipient": recipient_query,
+                }),
+            });
+        }
+
+        let recipient = match self
+            .resolve_household_delivery_recipient(&request.owner_user_id, recipient_query)
+            .await
+        {
+            Ok(recipient) => recipient,
+            Err(error) => {
+                self.record_household_delivery_denial(
+                    task,
+                    request,
+                    recipient_query,
+                    Some(message_text),
+                    "recipient_resolution_failed",
+                    json!({
+                        "recipient": recipient_query,
+                        "error": error.to_string(),
+                    }),
+                )
+                .await?;
+                return Err(ToolError::Denied {
+                    message: error.to_string(),
+                    detail: json!({
+                        "recipient": recipient_query,
+                    }),
+                });
+            }
+        };
+
+        if recipient.user_id == request.owner_user_id {
+            self.record_household_delivery_denial(
+                task,
+                request,
+                recipient_query,
+                Some(message_text),
+                "self_delivery_not_allowed",
+                json!({
+                    "recipient_user_id": recipient.user_id,
+                }),
+            )
+            .await?;
+            return Err(ToolError::Denied {
+                message: "direct household delivery requires another user as the recipient"
+                    .to_owned(),
+                detail: json!({
+                    "recipient_user_id": recipient.user_id,
+                }),
+            });
+        }
+
+        let Some(delegate) = &self.household_delivery_delegate else {
+            return Err(ToolError::Failed(anyhow!(
+                "household direct delivery is not available in this runtime"
+            )));
+        };
+
+        let dedupe_key = format!(
+            "{}:{}:{}",
+            task.task_id, recipient.user_id, message_text.trim()
+        );
+        let outcome = delegate
+            .deliver_immediate_household_message(HouseholdDeliveryRequest {
+                task_id: &task.task_id,
+                requester_user_id: &request.owner_user_id,
+                requester_identity_id: &request.initiating_identity_id,
+                requester_agent_id: &request.assigned_agent_id,
+                recipient_user_id: &recipient.user_id,
+                message_text,
+                dedupe_key: &dedupe_key,
+            })
+            .await?;
+
+        Ok(ToolOutput {
+            payload: json!({
+                "status": outcome.status,
+                "delivery_id": outcome.delivery_id,
+                "recipient_user_id": outcome.recipient_user_id,
+                "recipient_display_name": outcome.recipient_display_name,
+                "connector_type": outcome.connector_type,
+                "connector_identity_id": outcome.connector_identity_id,
+                "target_ref": outcome.target_ref,
+                "deduplicated": outcome.deduplicated,
+                "message": message_text,
+            }),
+        })
     }
 
     async fn handle_memory_read(
@@ -2402,6 +2557,99 @@ impl PrimaryAgentRunner {
             .any(|action| action.action_type == action_type && action.target_ref == target_ref)
     }
 
+    async fn resolve_household_delivery_recipient(
+        &self,
+        requester_user_id: &str,
+        recipient_query: &str,
+    ) -> Result<UserRow> {
+        let normalized = normalize_household_recipient_query(recipient_query);
+        if normalized.is_empty() {
+            return Err(anyhow!("household delivery requires a non-empty recipient"));
+        }
+
+        let users = self
+            .db
+            .list_users()
+            .await?
+            .into_iter()
+            .filter(|user| matches!(user.status.as_str(), "enabled" | "active"))
+            .collect::<Vec<_>>();
+
+        let exact_matches = users
+            .iter()
+            .filter(|user| household_recipient_exact_match(user, &normalized))
+            .cloned()
+            .collect::<Vec<_>>();
+        if exact_matches.len() == 1 {
+            return Ok(exact_matches[0].clone());
+        }
+        if exact_matches.len() > 1 {
+            return Err(anyhow!(
+                "recipient '{}' is ambiguous; matches {}",
+                recipient_query,
+                exact_matches
+                    .iter()
+                    .map(|user| user.display_name.clone())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+
+        let fuzzy_matches = users
+            .iter()
+            .filter(|user| household_recipient_fuzzy_match(user, &normalized))
+            .cloned()
+            .collect::<Vec<_>>();
+        if fuzzy_matches.len() == 1 {
+            return Ok(fuzzy_matches[0].clone());
+        }
+        if fuzzy_matches.len() > 1 {
+            return Err(anyhow!(
+                "recipient '{}' is ambiguous; matches {}",
+                recipient_query,
+                fuzzy_matches
+                    .iter()
+                    .map(|user| user.display_name.clone())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+
+        Err(anyhow!(
+            "recipient '{}' does not match any active mapped household user visible to '{}'",
+            recipient_query,
+            requester_user_id
+        ))
+    }
+
+    async fn record_household_delivery_denial(
+        &self,
+        task: &TaskRow,
+        request: &AgentRequest,
+        recipient: &str,
+        message_text: Option<&str>,
+        reason: &str,
+        detail: Value,
+    ) -> Result<()> {
+        self.db
+            .record_audit_event(
+                "agent",
+                &request.assigned_agent_id,
+                "household_delivery_denied",
+                json!({
+                    "task_id": task.task_id,
+                    "owner_user_id": request.owner_user_id,
+                    "initiating_identity_id": request.initiating_identity_id,
+                    "recipient": recipient,
+                    "message_text": message_text,
+                    "reason": reason,
+                    "detail": detail,
+                }),
+            )
+            .await?;
+        Ok(())
+    }
+
     async fn review_shell_command(
         &self,
         task_id: &str,
@@ -2620,6 +2868,30 @@ fn reserved_tool_names(tools: &ToolRegistry) -> Vec<String> {
         .into_iter()
         .map(|definition| definition.name)
         .collect()
+}
+
+fn normalize_household_recipient_query(value: &str) -> String {
+    value.trim().to_ascii_lowercase()
+}
+
+fn household_recipient_exact_match(user: &UserRow, normalized_query: &str) -> bool {
+    let user_id = user.user_id.to_ascii_lowercase();
+    let display_name = user.display_name.trim().to_ascii_lowercase();
+    let short_user_id = user_id.strip_prefix("user_").unwrap_or(&user_id);
+    normalized_query == user_id
+        || normalized_query == short_user_id
+        || normalized_query == display_name
+}
+
+fn household_recipient_fuzzy_match(user: &UserRow, normalized_query: &str) -> bool {
+    let display_name = user.display_name.trim().to_ascii_lowercase();
+    let user_id = user.user_id.to_ascii_lowercase();
+    let short_user_id = user_id.strip_prefix("user_").unwrap_or(&user_id);
+    display_name.contains(normalized_query)
+        || display_name
+            .split_whitespace()
+            .any(|word| word.starts_with(normalized_query))
+        || short_user_id.starts_with(normalized_query)
 }
 
 fn load_filesystem_lua_tools(tool_context: &ToolContext) -> Result<Vec<RegisteredLuaTool>> {
@@ -2845,6 +3117,19 @@ fn tool_definitions(tools: &ToolRegistry) -> Vec<ToolDefinition> {
                 "source_ref": { "type": ["string", "null"] }
             },
             "required": ["scope", "subject_type", "subject_key", "content_text", "source_type", "source_summary", "source_ref"],
+            "additionalProperties": false
+        }),
+    });
+    definitions.push(ToolDefinition {
+        name: "household_send_message".to_owned(),
+        description: "Send an immediate direct message to another mapped household user right now. Use this for explicit requests to tell or notify another household member now. Do not use it for reminders or future schedules.".to_owned(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "recipient": { "type": "string" },
+                "message": { "type": "string" }
+            },
+            "required": ["recipient", "message"],
             "additionalProperties": false
         }),
     });
@@ -3088,7 +3373,7 @@ fn system_prompt(kind: &str, role_ids: &[String], allowed_roots: &[PathBuf]) -> 
 
     format!(
         "You are BeaverKI M1, a local multi-user CLI-first assistant.
-Current milestone: M4 semantic memory.
+    Current milestone: M5 household direct delivery.
 Current agent kind: {kind}.
 Current role set: {roles}.
 Use tools when needed, but keep the task focused and auditable.
@@ -3100,6 +3385,7 @@ Use memory_write for mutable durable scoped state such as shopping lists, invent
 Automatic memory retrieval for the current conversation may be narrower than your role-based memory tool access. In a private DM, you may still use explicit memory tools against household scope when the user clearly asks for a household update and the current user is allowed to access household memory.
 Use memory_remember only for durable semantic facts that are likely to matter in future conversations, such as names, identities, stable preferences, or long-lived household facts. Do not store transient task progress or one-off summaries with memory_remember. Use `private` scope by default and only use `household` for explicitly shared facts. Reuse the same subject_key when correcting an existing fact.
 Use memory_forget when a previously stored memory row is wrong or should stop affecting future tasks. If the user says an earlier remembered fact was incorrect, forget the wrong row and then store the corrected fact if appropriate.
+Use household_send_message only when the user explicitly wants BeaverKI to pass an immediate message to another mapped household user now. Keep the delivery payload concise, use the intended recipient's name or user identifier, and do not use this tool for later reminders or recurring schedules. If the recipient is ambiguous or unmapped, ask for clarification instead of pretending delivery succeeded.
 Never claim memory was persisted unless a memory_write or memory_remember tool call returned success in this task.
 For file writes, prefer filesystem_write_text. Never claim a denied tool succeeded.
 Use agent_spawn_subagent only for a tightly bounded, materially useful child task. Any sub-agent receives only the explicit task slice you provide.
@@ -3390,6 +3676,7 @@ mod tests {
             provider,
             builtin_registry(),
             ToolContext::new(std::env::temp_dir(), vec![std::env::temp_dir()]),
+            None,
             6,
         );
         std::mem::forget(db_dir);
@@ -5803,6 +6090,7 @@ end"#,
                 tempdir.path().to_path_buf(),
                 vec![tempdir.path().to_path_buf()],
             ),
+            None,
             6,
         );
         let default_user = db.default_user().await.expect("default").expect("user");

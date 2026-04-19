@@ -188,6 +188,8 @@ The orchestrator should distinguish between:
 - event-driven runs: a message arrives on Discord, Telegram, Slack, or another connector
 - autonomous runs: the heartbeat notices pending follow-up work
 
+Scheduled runs should not be limited to a single direct action target. Simple schedules may still point straight at one reviewed Lua script, but the orchestrator should also support a reviewed workflow target that materializes a bounded multi-stage run. That workflow run may execute one or more scripted stages first and then hand off to a bounded agent stage when model reasoning is useful.
+
 ### 7.3 Execution Loop
 
 An agent execution cycle may look like this:
@@ -217,6 +219,70 @@ That means:
 - sub-agents may only receive the task slice explicitly prepared by the parent agent
 
 Without this invariant, the design would retain a latent cross-user data leakage path.
+
+### 7.3.2 Scheduled Workflow Pipelines
+
+The cron or reminder system should be flexible enough to run more than one step. In practice, many useful automations need a shape like:
+
+1. gather or normalize data with one or more reviewed Lua stages
+2. optionally invoke reviewed Lua-defined tools for reusable transformations
+3. hand the prepared result to a bounded agent stage for interpretation, planning, drafting, or follow-up action under a stage-specific prompt contract
+4. continue into a later delivery or notification stage when the workflow needs to surface the result to a human user
+
+The scheduler should therefore support a first-class workflow target in addition to a single-script target. A scheduled workflow run should persist:
+
+- the owner and initiating identity context
+- the workflow definition and current stage
+- structured stage inputs and outputs
+- artifacts and summaries passed between stages
+- defer or wake-up state
+- retry state
+- fail-closed policy denials and blocked-state reasons
+- full audit history for every handoff
+
+For safety and auditability, the preferred composition model is runtime-orchestrated stage chaining rather than one Lua script dynamically dispatching arbitrary other scripts in opaque ways. The runtime should know which stage is running, what capability profile applies to it, what output it produced, and exactly what bounded task slice is handed to any later agent stage.
+
+For scheduled workflow runs specifically, the safety model should be pre-approval by review rather than inline human approval. If the workflow definition is active and approved, and each referenced script or tool stage is also active and approved, the run should be considered safe to execute autonomously inside that reviewed envelope. If a stage would require a new approval at runtime because it exceeds the reviewed capability or policy boundary, the workflow should fail closed or transition to `blocked`; it should not pause waiting for approval.
+
+Agent stages in a scheduled workflow must follow the same prompt-assembly invariant as any other agent run. They should receive only:
+
+- the workflow objective
+- explicit artifacts or structured outputs from prior stages
+- scoped memory allowed for that run
+- completion and reporting expectations
+
+They should not implicitly inherit unrestricted access to all prior workflow internals or broad unfiltered runtime history.
+
+The workflow model should also support richer `agent_task` stage configuration than a plain objective string. In practice an `agent_task` stage should be able to declare:
+
+- a stage-specific prompt or instruction template
+- required input artifacts or structured fields from prior stages
+- optional model-role or budget hints
+- allowed tool or Lua-artifact references for that stage
+- an explicit output contract for what the agent must return to the workflow
+
+Workflows also need a first-class notification or delivery stage rather than assuming that the final result will always be consumed only inside runtime state. That stage should support notifying the workflow owner or another allowed target user through the normal connector-agnostic delivery layer. When the M5 household direct-delivery and reminder foundation exists, workflow delivery should reuse that routing and persistence model rather than introduce a parallel notification subsystem.
+
+### 7.3.3 Example Target Workflow: Feed Digest
+
+One concrete target workflow shape the design should support is a scheduled feed-digest workflow. This is a design goal for the workflow model, not a claim that the repository already implements a dedicated RSS reader today.
+
+Example shape:
+
+1. a feed-read stage retrieves one or more configured RSS or Atom sources
+2. a reviewed Lua stage parses the feed payloads, filters or normalizes entries, and emits structured digest input
+3. an `agent_task` stage receives that structured input under a stored stage-specific prompt such as "summarize the important new items for this user, highlight what changed since the last run, and decide whether any follow-up action is worth suggesting"
+4. that agent stage may call only the reviewed Lua tools or scripted helpers explicitly allowed for the stage, for example a formatter or deduplication helper
+5. the workflow stores the composed result plus any machine-readable follow-up suggestions
+6. a `user_notify` stage delivers the final digest to the target user through the normal delivery layer
+
+Important properties of this example:
+
+- the parser or normalizer logic lives in reviewed Lua where that is the right fit
+- the reasoning and synthesis step lives in a bounded agent stage rather than being forced into Lua
+- the stage-specific prompt contract is part of the workflow definition, not reconstructed ad hoc each run
+- the final user-visible delivery is part of the workflow itself rather than an external side effect that operators must stitch together manually
+- if feed retrieval is not yet implemented as a first-class tool, the workflow model should still be designed so this use case can plug in cleanly once a feed-read or lightweight website-read stage exists
 
 ### 7.4 Multi-User Identity Model
 
@@ -527,6 +593,7 @@ Lua is included to support higher-order workflows without recompiling the Rust c
 - task-specific helpers
 - recurring automations created from user requests
 - cron-like maintenance jobs authored by the agent under policy
+- preparatory stages inside reviewed scheduled workflows that may later hand off to an agent
 
 ### 11.3 Lua Integration Model
 
@@ -547,6 +614,8 @@ Host API examples:
 - `task.defer(duration)`
 - `user.notify(message)`
 - `user.notify_target(user_id, message, options)`
+
+Lua should be usable both as a standalone automation target and as one stage within a larger scheduled workflow. When several Lua stages are needed, the preferred pattern is to let the runtime orchestrate explicit stage boundaries and state handoff rather than hiding the chain inside one opaque script body.
 
 ### 11.4 Script Safety
 

@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+async-trait.workspace = true
 beaverki-automation = { path = "../beaverki-automation" }
 beaverki-agent = { path = "../beaverki-agent" }
 beaverki-config = { path = "../beaverki-config" }
@@ -27,7 +28,6 @@ tokio-tungstenite.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-async-trait.workspace = true
 tempfile.workspace = true
 
 [lints]

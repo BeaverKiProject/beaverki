@@ -2275,6 +2275,171 @@ impl Database {
         Ok(rows)
     }
 
+    pub async fn list_connector_identities_for_mapped_user(
+        &self,
+        mapped_user_id: &str,
+    ) -> Result<Vec<ConnectorIdentityRow>> {
+        let rows = sqlx::query_as::<_, ConnectorIdentityRow>(
+            "SELECT identity_id, connector_type, external_user_id, external_channel_id, mapped_user_id, trust_level, created_at, updated_at
+             FROM connector_identities
+             WHERE mapped_user_id = ?
+             ORDER BY connector_type ASC, updated_at DESC, external_user_id ASC",
+        )
+        .bind(mapped_user_id)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list connector identities for mapped user")?;
+        Ok(rows)
+    }
+
+    pub async fn fetch_connector_identity_by_id(
+        &self,
+        identity_id: &str,
+    ) -> Result<Option<ConnectorIdentityRow>> {
+        let row = sqlx::query_as::<_, ConnectorIdentityRow>(
+            "SELECT identity_id, connector_type, external_user_id, external_channel_id, mapped_user_id, trust_level, created_at, updated_at
+             FROM connector_identities
+             WHERE identity_id = ?",
+        )
+        .bind(identity_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to fetch connector identity by id")?;
+        Ok(row)
+    }
+
+    pub async fn create_or_reuse_household_delivery(
+        &self,
+        input: NewHouseholdDelivery<'_>,
+    ) -> Result<HouseholdDeliveryRow> {
+        if let Some(existing) = self
+            .fetch_household_delivery_by_dedupe_key(input.dedupe_key)
+            .await?
+        {
+            return Ok(existing);
+        }
+
+        let delivery_id = new_prefixed_id("delivery");
+        let timestamp = now_rfc3339();
+        sqlx::query(
+            "INSERT INTO household_deliveries
+             (delivery_id, task_id, requester_user_id, requester_identity_id, recipient_user_id, message_text, delivery_mode, connector_type, connector_identity_id, target_ref, fallback_target_ref, dedupe_key, status, failure_reason, external_message_id, delivered_at, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'dispatching', NULL, NULL, NULL, ?, ?)",
+        )
+        .bind(&delivery_id)
+        .bind(input.task_id)
+        .bind(input.requester_user_id)
+        .bind(input.requester_identity_id)
+        .bind(input.recipient_user_id)
+        .bind(input.message_text)
+        .bind(input.delivery_mode)
+        .bind(input.connector_type)
+        .bind(input.connector_identity_id)
+        .bind(input.target_ref)
+        .bind(input.fallback_target_ref)
+        .bind(input.dedupe_key)
+        .bind(&timestamp)
+        .bind(&timestamp)
+        .execute(&self.pool)
+        .await
+        .context("failed to create household delivery")?;
+
+        self.fetch_household_delivery(&delivery_id)
+            .await?
+            .ok_or_else(|| anyhow!("household delivery missing after insert"))
+    }
+
+    pub async fn fetch_household_delivery(
+        &self,
+        delivery_id: &str,
+    ) -> Result<Option<HouseholdDeliveryRow>> {
+        let row = sqlx::query_as::<_, HouseholdDeliveryRow>(
+            "SELECT delivery_id, task_id, requester_user_id, requester_identity_id, recipient_user_id, message_text, delivery_mode, connector_type, connector_identity_id, target_ref, fallback_target_ref, dedupe_key, status, failure_reason, external_message_id, delivered_at, created_at, updated_at
+             FROM household_deliveries
+             WHERE delivery_id = ?",
+        )
+        .bind(delivery_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to fetch household delivery")?;
+        Ok(row)
+    }
+
+    pub async fn fetch_household_delivery_by_dedupe_key(
+        &self,
+        dedupe_key: &str,
+    ) -> Result<Option<HouseholdDeliveryRow>> {
+        let row = sqlx::query_as::<_, HouseholdDeliveryRow>(
+            "SELECT delivery_id, task_id, requester_user_id, requester_identity_id, recipient_user_id, message_text, delivery_mode, connector_type, connector_identity_id, target_ref, fallback_target_ref, dedupe_key, status, failure_reason, external_message_id, delivered_at, created_at, updated_at
+             FROM household_deliveries
+             WHERE dedupe_key = ?",
+        )
+        .bind(dedupe_key)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to fetch household delivery by dedupe key")?;
+        Ok(row)
+    }
+
+    pub async fn list_household_deliveries_for_task(
+        &self,
+        task_id: &str,
+    ) -> Result<Vec<HouseholdDeliveryRow>> {
+        let rows = sqlx::query_as::<_, HouseholdDeliveryRow>(
+            "SELECT delivery_id, task_id, requester_user_id, requester_identity_id, recipient_user_id, message_text, delivery_mode, connector_type, connector_identity_id, target_ref, fallback_target_ref, dedupe_key, status, failure_reason, external_message_id, delivered_at, created_at, updated_at
+             FROM household_deliveries
+             WHERE task_id = ?
+             ORDER BY created_at ASC",
+        )
+        .bind(task_id)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list household deliveries for task")?;
+        Ok(rows)
+    }
+
+    pub async fn mark_household_delivery_sent(
+        &self,
+        delivery_id: &str,
+        target_ref: &str,
+        external_message_id: Option<&str>,
+    ) -> Result<()> {
+        let timestamp = now_rfc3339();
+        sqlx::query(
+            "UPDATE household_deliveries
+             SET status = 'sent', target_ref = ?, external_message_id = ?, delivered_at = ?, failure_reason = NULL, updated_at = ?
+             WHERE delivery_id = ?",
+        )
+        .bind(target_ref)
+        .bind(external_message_id)
+        .bind(&timestamp)
+        .bind(&timestamp)
+        .bind(delivery_id)
+        .execute(&self.pool)
+        .await
+        .context("failed to mark household delivery sent")?;
+        Ok(())
+    }
+
+    pub async fn mark_household_delivery_failed(
+        &self,
+        delivery_id: &str,
+        reason: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE household_deliveries
+             SET status = 'failed', failure_reason = ?, updated_at = ?
+             WHERE delivery_id = ?",
+        )
+        .bind(reason)
+        .bind(now_rfc3339())
+        .bind(delivery_id)
+        .execute(&self.pool)
+        .await
+        .context("failed to mark household delivery failed")?;
+        Ok(())
+    }
+
     pub async fn fetch_task_for_owner(
         &self,
         owner_user_id: &str,
@@ -2544,6 +2709,21 @@ pub struct NewApproval<'a> {
     pub action_summary: Option<&'a str>,
     pub requester_display_name: Option<&'a str>,
     pub target_details: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct NewHouseholdDelivery<'a> {
+    pub task_id: &'a str,
+    pub requester_user_id: &'a str,
+    pub requester_identity_id: &'a str,
+    pub recipient_user_id: &'a str,
+    pub message_text: &'a str,
+    pub delivery_mode: &'a str,
+    pub connector_type: &'a str,
+    pub connector_identity_id: &'a str,
+    pub target_ref: &'a str,
+    pub fallback_target_ref: Option<&'a str>,
+    pub dedupe_key: &'a str,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2871,6 +3051,28 @@ pub struct ConnectorIdentityRow {
     pub external_channel_id: Option<String>,
     pub mapped_user_id: String,
     pub trust_level: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct HouseholdDeliveryRow {
+    pub delivery_id: String,
+    pub task_id: String,
+    pub requester_user_id: String,
+    pub requester_identity_id: String,
+    pub recipient_user_id: String,
+    pub message_text: String,
+    pub delivery_mode: String,
+    pub connector_type: String,
+    pub connector_identity_id: String,
+    pub target_ref: String,
+    pub fallback_target_ref: Option<String>,
+    pub dedupe_key: String,
+    pub status: String,
+    pub failure_reason: Option<String>,
+    pub external_message_id: Option<String>,
+    pub delivered_at: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }

@@ -359,6 +359,7 @@ Purpose:
 
 - recurring jobs
 - script bindings
+- workflow bindings
 - task wakeups
 
 Example:
@@ -371,7 +372,15 @@ schedules:
     target_id: "script_cleanup_tmp"
     cron: "0 3 * * *"
     enabled: true
+  - schedule_id: "sched_weekly_digest"
+    owner_user_id: "u_owner"
+    target_type: "workflow"
+    target_id: "wf_weekly_digest"
+    cron: "0 7 * * MON"
+    enabled: true
 ```
+
+Simple schedules may still target a single Lua script. More complex recurring work should target a reviewed workflow definition whose stages can include reviewed Lua execution, reviewed Lua-defined tools, and bounded agent handoff.
 
 ## 6. Setup Assistant
 
@@ -454,6 +463,10 @@ Core entities:
 - `scripts`
 - `script_reviews`
 - `schedules`
+- `workflows`
+- `workflow_steps`
+- `workflow_runs`
+- `workflow_run_steps`
 - `tool_invocations`
 - `policy_decisions`
 - `provider_profiles`
@@ -596,6 +609,81 @@ CREATE TABLE script_reviews (
   verdict TEXT NOT NULL,             -- approved | rejected | needs_changes
   findings_json TEXT NOT NULL,
   created_at TEXT NOT NULL
+);
+```
+
+#### `workflows`
+
+```sql
+CREATE TABLE workflows (
+  workflow_id TEXT PRIMARY KEY,
+  owner_user_id TEXT NOT NULL,
+  status TEXT NOT NULL,              -- draft | active | disabled | blocked
+  entrypoint_kind TEXT NOT NULL,     -- schedule | manual | event
+  definition_summary TEXT,
+  created_from_task_id TEXT,
+  safety_status TEXT NOT NULL,       -- pending | approved | needs_changes | rejected
+  safety_summary TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+```
+
+#### `workflow_steps`
+
+```sql
+CREATE TABLE workflow_steps (
+  workflow_id TEXT NOT NULL,
+  step_id TEXT NOT NULL,
+  position INTEGER NOT NULL,
+  step_kind TEXT NOT NULL,           -- lua_script | lua_tool | agent_task | user_notify
+  target_ref TEXT NOT NULL,
+  input_schema_json TEXT,
+  output_schema_json TEXT,
+  capability_profile_json TEXT,
+  handoff_policy_json TEXT,
+  PRIMARY KEY (workflow_id, step_id)
+);
+```
+
+`workflow_steps.handoff_policy_json` should be flexible enough to carry step-type-specific contracts without forcing a separate table per initial stage kind. In particular:
+
+- for `agent_task`, it should support a prompt template, required artifact refs, optional model-role override, allowed tool or Lua-artifact refs, and a declared output contract
+- for `user_notify`, it should support recipient targeting, delivery mode, channel policy, message template, and deduplication or delivery semantics
+
+#### `workflow_runs`
+
+```sql
+CREATE TABLE workflow_runs (
+  run_id TEXT PRIMARY KEY,
+  workflow_id TEXT NOT NULL,
+  schedule_id TEXT,
+  owner_user_id TEXT NOT NULL,
+  initiating_identity_id TEXT NOT NULL,
+  state TEXT NOT NULL,               -- pending | running | blocked | completed | failed
+  current_step_position INTEGER,
+  artifact_bundle_json TEXT,
+  wake_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  completed_at TEXT
+);
+```
+
+#### `workflow_run_steps`
+
+```sql
+CREATE TABLE workflow_run_steps (
+  run_step_id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL,
+  workflow_id TEXT NOT NULL,
+  step_id TEXT NOT NULL,
+  task_id TEXT,
+  state TEXT NOT NULL,               -- pending | running | blocked | completed | failed | skipped
+  input_json TEXT,
+  output_json TEXT,
+  started_at TEXT,
+  completed_at TEXT
 );
 ```
 
@@ -1082,6 +1170,25 @@ This is the critical point: sandboxing should be enforced by the Rust host API s
 - timeouts
 - no arbitrary host process access except through tool calls
 - no unrestricted filesystem access
+
+### 14.6 Scheduled Workflow Composition
+
+The current single-script schedule target should remain supported as the simplest automation path, but the scheduler should also be able to trigger a reviewed workflow definition.
+
+Initial workflow-stage kinds should be:
+
+- `lua_script` for reviewed scripted stages
+- `lua_tool` for reviewed reusable Lua-defined tool stages
+- `agent_task` for a bounded primary-agent or sub-agent handoff with an explicit task slice and stage-specific prompt contract
+- `user_notify` for connector-agnostic result delivery to the workflow owner or another allowed target user
+
+The important rule is that composition should remain runtime-orchestrated. A scheduled workflow run should expose explicit stage boundaries, structured handoff artifacts, fail-closed block reasons, retries, and wake-up state. This keeps cron-driven automations debuggable and auditable while allowing richer behavior than a single script can reasonably express.
+
+For scheduled workflow runs, the runtime should treat prior review and activation as the approval boundary. A run whose workflow definition and referenced stages are active and safety-approved should execute autonomously without pausing for fresh approval. If runtime conditions reveal that a stage would need a new approval or exceeds its reviewed capability envelope, the run should fail closed or move to `blocked` with an audit record rather than entering an interactive approval wait.
+
+For agent stages, the runtime should construct a bounded request from prior stage outputs and policy-approved context. The agent stage should not inherit unrestricted access to all prior internal state merely because it is part of the same workflow run. The workflow definition should be able to constrain that stage with a stored prompt template, explicit artifact bindings, and allowed tool or Lua references so recurring workflows can run a repeatable agent subtask rather than an underspecified general conversation.
+
+For `user_notify` stages, the workflow engine should reuse the normal delivery abstraction rather than inventing a workflow-only notification path. In practice this means the first implementation may start with notifying the workflow owner or initiating user, but it should align with the household-delivery persistence and routing foundation introduced in M5 so later cross-user workflow delivery does not require a redesign.
 
 ### 14.6 V1 Recommendation
 

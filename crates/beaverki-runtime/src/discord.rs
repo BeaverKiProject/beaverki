@@ -2,6 +2,9 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
+#[cfg(test)]
+use std::sync::{Mutex, OnceLock};
+
 use anyhow::{Context, Result, anyhow, bail};
 use beaverki_db::{
     ApprovalActionRow, ApprovalActionSet, ApprovalRow, ConnectorIdentityRow,
@@ -36,6 +39,18 @@ const CONNECTOR_FOLLOW_UP_REQUESTED_EVENT: &str = "connector_follow_up_requested
 const CONNECTOR_FOLLOW_UP_SENT_EVENT: &str = "connector_follow_up_sent";
 const APPROVAL_ACTION_TOKEN_PREFIX: &str = "approval_token_";
 
+#[cfg(test)]
+static DISCORD_API_BASE_OVERRIDE: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+
+#[cfg(test)]
+static TEST_DIRECT_SEND_CAPTURE: OnceLock<Mutex<Option<Arc<Mutex<Vec<String>>>>>> = OnceLock::new();
+
+pub(crate) struct DiscordDirectDeliveryResult {
+    pub target_kind: &'static str,
+    pub target_ref: String,
+    pub message_id: String,
+}
+
 #[derive(Debug, Deserialize)]
 struct DiscordGatewayInfo {
     url: String,
@@ -65,6 +80,16 @@ struct DiscordAuthor {
 
 #[derive(Debug, Deserialize)]
 struct DiscordCurrentUser {
+    id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct DiscordCreateDmResponse {
+    id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct DiscordCreatedMessage {
     id: String,
 }
 
@@ -305,7 +330,7 @@ async fn run_gateway_session(
                                                 )
                                                 .await?;
                                             if let Some(reply_text) = reply.reply {
-                                                send_discord_message(
+                                                let _ = send_discord_message(
                                                     http_client,
                                                     token,
                                                     &message.channel_id,
@@ -385,15 +410,45 @@ async fn run_gateway_session(
     }
 }
 
+fn discord_api_base() -> String {
+    #[cfg(test)]
+    if let Some(override_base) = DISCORD_API_BASE_OVERRIDE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .expect("discord api base override lock")
+        .clone()
+    {
+        return override_base;
+    }
+
+    DISCORD_API_BASE.to_owned()
+}
+
+#[cfg(test)]
+pub(crate) fn set_test_discord_api_base(value: Option<String>) {
+    *DISCORD_API_BASE_OVERRIDE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .expect("discord api base override lock") = value;
+}
+
+#[cfg(test)]
+pub(crate) fn set_test_direct_send_capture(value: Option<Arc<Mutex<Vec<String>>>>) {
+    *TEST_DIRECT_SEND_CAPTURE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .expect("discord direct send capture lock") = value;
+}
+
 async fn send_discord_message(
     http_client: &reqwest::Client,
     token: &str,
     channel_id: &str,
     content: &str,
-) -> Result<()> {
+) -> Result<String> {
     let message = truncate_reply(content);
-    http_client
-        .post(format!("{DISCORD_API_BASE}/channels/{channel_id}/messages"))
+    let response = http_client
+        .post(format!("{}/channels/{channel_id}/messages", discord_api_base()))
         .header("Authorization", format!("Bot {token}"))
         .json(&json!({ "content": message }))
         .send()
@@ -401,7 +456,92 @@ async fn send_discord_message(
         .with_context(|| format!("failed to send Discord message to channel {channel_id}"))?
         .error_for_status()
         .with_context(|| format!("Discord rejected message for channel {channel_id}"))?;
-    Ok(())
+    let created = response
+        .json::<DiscordCreatedMessage>()
+        .await
+        .with_context(|| format!("failed to decode Discord message response for channel {channel_id}"))?;
+    Ok(created.id)
+}
+
+async fn create_discord_dm_channel(
+    http_client: &reqwest::Client,
+    token: &str,
+    recipient_user_id: &str,
+) -> Result<String> {
+    let response = http_client
+        .post(format!("{}/users/@me/channels", discord_api_base()))
+        .header("Authorization", format!("Bot {token}"))
+        .json(&json!({ "recipient_id": recipient_user_id }))
+        .send()
+        .await
+        .with_context(|| {
+            format!("failed to create Discord DM channel for user {recipient_user_id}")
+        })?
+        .error_for_status()
+        .with_context(|| {
+            format!("Discord rejected DM channel creation for user {recipient_user_id}")
+        })?;
+    let created = response
+        .json::<DiscordCreateDmResponse>()
+        .await
+        .with_context(|| {
+            format!("failed to decode Discord DM channel response for user {recipient_user_id}")
+        })?;
+    Ok(created.id)
+}
+
+pub(crate) async fn send_direct_household_message(
+    http_client: &reqwest::Client,
+    token: &str,
+    identity: &ConnectorIdentityRow,
+    content: &str,
+) -> Result<DiscordDirectDeliveryResult> {
+    #[cfg(test)]
+    if let Some(capture) = TEST_DIRECT_SEND_CAPTURE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .expect("discord direct send capture lock")
+        .clone()
+    {
+        capture.lock().expect("capture direct send").push(format!(
+            "recipient={} content={}",
+            identity.external_user_id, content
+        ));
+        return Ok(DiscordDirectDeliveryResult {
+            target_kind: "discord_dm",
+            target_ref: "dm-casey".to_owned(),
+            message_id: "msg-casey-1".to_owned(),
+        });
+    }
+
+    match create_discord_dm_channel(http_client, token, &identity.external_user_id).await {
+        Ok(channel_id) => {
+            let message_id = send_discord_message(http_client, token, &channel_id, content).await?;
+            Ok(DiscordDirectDeliveryResult {
+                target_kind: "discord_dm",
+                target_ref: channel_id,
+                message_id,
+            })
+        }
+        Err(dm_error) => {
+            let Some(channel_id) = identity.external_channel_id.as_deref() else {
+                return Err(dm_error);
+            };
+            let message_id = send_discord_message(http_client, token, channel_id, content)
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed direct Discord delivery after DM fallback from user {} to channel {}",
+                        identity.external_user_id, channel_id
+                    )
+                })?;
+            Ok(DiscordDirectDeliveryResult {
+                target_kind: "discord_channel_fallback",
+                target_ref: channel_id.to_owned(),
+                message_id,
+            })
+        }
+    }
 }
 
 async fn sync_discord_global_commands(
@@ -768,7 +908,7 @@ async fn delete_discord_reaction(
     Ok(())
 }
 
-fn build_discord_http_client() -> Result<reqwest::Client> {
+pub(crate) fn build_discord_http_client() -> Result<reqwest::Client> {
     reqwest::Client::builder()
         .user_agent("beaverki/0.1")
         .build()
@@ -893,7 +1033,7 @@ pub(super) async fn maybe_send_task_follow_up(
 
     let http_client = build_discord_http_client()?;
     let reply = format_task_reply(task);
-    send_discord_message(&http_client, token, &channel_id, &reply).await?;
+    let _ = send_discord_message(&http_client, token, &channel_id, &reply).await?;
     if let Some(context) = connector_context_from_events(events)
         && context.connector_type == "discord"
         && let Some(message_id) = context.message_id.as_deref()
