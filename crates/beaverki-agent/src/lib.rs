@@ -6795,11 +6795,12 @@ mod tests {
             .expect("schedule");
         assert_eq!(schedule.target_type, "workflow");
         assert_eq!(schedule.target_id, "workflow_sched");
-        assert!(db
-            .list_approvals_for_user(&default_user.user_id, Some("pending"))
-            .await
-            .expect("approvals")
-            .is_empty());
+        assert!(
+            db.list_approvals_for_user(&default_user.user_id, Some("pending"))
+                .await
+                .expect("approvals")
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -8048,8 +8049,14 @@ mod tests {
             .await
             .expect("schedule should succeed without approval");
 
-        assert_eq!(output.payload["schedule_id"], json!("sched_workflow_schedule_gate"));
-        assert_eq!(output.payload["workflow_id"], json!("workflow_schedule_gate"));
+        assert_eq!(
+            output.payload["schedule_id"],
+            json!("sched_workflow_schedule_gate")
+        );
+        assert_eq!(
+            output.payload["workflow_id"],
+            json!("workflow_schedule_gate")
+        );
         assert_eq!(output.payload["enabled"], json!(true));
         let approvals = db
             .list_approvals_for_user(&default_user.user_id, Some("pending"))

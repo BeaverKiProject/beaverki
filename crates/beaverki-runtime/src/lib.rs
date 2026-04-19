@@ -40,12 +40,14 @@ use tokio::sync::{Notify, RwLock};
 use tokio::time::{self, Instant};
 use tracing::{error, info, warn};
 
+mod connector_support;
 mod discord;
+
+use self::connector_support::{assistant_reply_for_context, connector_type_from_events};
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
 const QUEUE_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const TASK_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(150);
-const CONNECTOR_MESSAGE_CONTEXT_EVENT: &str = "connector_message_context";
 const CLI_CONVERSATION_HISTORY_LIMIT: i64 = 4;
 const CLI_ACTIVE_CONVERSATION_WINDOW_SECS: i64 = 45 * 60;
 const SESSION_RESET_COMMAND: &str = "/new";
@@ -5630,29 +5632,6 @@ fn parse_timestamp(value: &str) -> Option<DateTime<Utc>> {
         .map(|timestamp| timestamp.with_timezone(&Utc))
 }
 
-fn assistant_reply_for_context(task: &TaskRow) -> String {
-    match task.state.parse::<TaskState>() {
-        Ok(TaskState::Completed) => task
-            .result_text
-            .clone()
-            .unwrap_or_else(|| "Task completed without a recorded reply.".to_owned()),
-        Ok(TaskState::WaitingApproval) => task.result_text.clone().unwrap_or_else(|| {
-            "The assistant is waiting for approval before it can continue.".to_owned()
-        }),
-        Ok(TaskState::Pending | TaskState::Running) => {
-            "The assistant is still working on that request.".to_owned()
-        }
-        Ok(TaskState::Failed) => task
-            .result_text
-            .clone()
-            .unwrap_or_else(|| "The assistant failed without a recorded explanation.".to_owned()),
-        Ok(TaskState::Blocked) | Err(_) => task
-            .result_text
-            .clone()
-            .unwrap_or_else(|| format!("Task state: {}.", task.state)),
-    }
-}
-
 fn compact_message_text(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
@@ -5663,17 +5642,6 @@ fn format_household_delivery_message(requester_display_name: &str, message_text:
         requester_display_name,
         message_text.trim()
     )
-}
-
-fn connector_type_from_events(events: &[TaskEventRow]) -> Option<String> {
-    let event = events
-        .iter()
-        .find(|event| event.event_type == CONNECTOR_MESSAGE_CONTEXT_EVENT)?;
-    let payload: Value = serde_json::from_str(&event.payload_json).ok()?;
-    payload
-        .get("connector_type")
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned)
 }
 
 #[cfg(test)]
