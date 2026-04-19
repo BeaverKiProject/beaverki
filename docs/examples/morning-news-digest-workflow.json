@@ -1,0 +1,32 @@
+{
+  "name": "Morning ORF News Digest",
+  "description": "Fetch a morning ORF headline, summarize it, hand it to an agent for phrasing, and notify the user.",
+  "stages": [
+    {
+      "kind": "lua_script",
+      "label": "Fetch headline",
+      "artifact_ref": "script_orf_fetch_headline",
+      "config": {}
+    },
+    {
+      "kind": "lua_tool",
+      "label": "Summarize headline",
+      "artifact_ref": "lua_tool_news_digest_summary",
+      "config": {}
+    },
+    {
+      "kind": "agent_task",
+      "label": "Draft digest",
+      "artifact_ref": null,
+      "config": {
+        "prompt": "Write a concise morning news digest from the workflow artifacts. Keep it to two sentences and name the source."
+      }
+    },
+    {
+      "kind": "user_notify",
+      "label": "Deliver digest",
+      "artifact_ref": null,
+      "config": {}
+    }
+  ]
+}

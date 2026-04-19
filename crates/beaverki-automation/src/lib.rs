@@ -210,6 +210,32 @@ pub async fn review_lua_tool(
     .await
 }
 
+pub async fn review_workflow_definition(
+    provider: &Arc<dyn ModelProvider>,
+    workflow_id: &str,
+    task_id: Option<&str>,
+    owner_user_id: &str,
+    workflow_definition: &Value,
+    intended_behavior_summary: &str,
+) -> Result<SafetyReviewOutcome> {
+    let request = json!({
+        "review_type": "workflow_definition",
+        "workflow_id": workflow_id,
+        "originating_task_id": task_id,
+        "owner_user_id": owner_user_id,
+        "workflow_definition": workflow_definition,
+        "intended_behavior_summary": intended_behavior_summary,
+    });
+    review_with_prompt(
+        provider,
+        "safety_review",
+        provider.model_names().safety_review.as_str(),
+        WORKFLOW_REVIEW_INSTRUCTIONS,
+        &request,
+    )
+    .await
+}
+
 async fn review_with_prompt(
     provider: &Arc<dyn ModelProvider>,
     model_role: &str,
@@ -585,6 +611,11 @@ fn capability_allowed_roots(
 
 const LUA_REVIEW_INSTRUCTIONS: &str = r#"You are BeaverKI's safety review agent.
 Review the provided Lua automation artifact for intent matching, dangerous side effects, privilege escalation, hidden exfiltration, and capability/profile mismatch.
+Return only JSON with this exact schema:
+{"verdict":"approved|rejected|needs_changes","risk_level":"low|medium|high|critical","findings":["..."],"required_changes":["..."],"summary":"..."}"#;
+
+const WORKFLOW_REVIEW_INSTRUCTIONS: &str = r#"You are BeaverKI's safety review agent.
+Review the provided scheduled workflow definition for intent matching, stage-to-stage safety, hidden privilege escalation, unauthorized autonomy, unsafe notification behavior, and whether every referenced artifact stays inside the declared bounded workflow envelope.
 Return only JSON with this exact schema:
 {"verdict":"approved|rejected|needs_changes","risk_level":"low|medium|high|critical","findings":["..."],"required_changes":["..."],"summary":"..."}"#;
 

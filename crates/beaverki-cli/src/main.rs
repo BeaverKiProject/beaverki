@@ -13,7 +13,9 @@ use beaverki_core::{MemoryKind, MemoryScope};
 use beaverki_db::{ConversationSessionRow, Database, MemoryRow, UserRow};
 use beaverki_models::OpenAiProvider;
 use beaverki_policy::{is_builtin_role, visible_memory_scopes};
-use beaverki_runtime::{DaemonClient, Runtime, RuntimeDaemon, latest_daemon_status};
+use beaverki_runtime::{
+    DaemonClient, Runtime, RuntimeDaemon, WorkflowDefinitionInput, latest_daemon_status,
+};
 use clap::{Args, Parser, Subcommand};
 use dialoguer::{Input, Password};
 use tokio::time::{self, Duration};
@@ -77,6 +79,10 @@ enum AutomationCommand {
         #[command(subcommand)]
         command: Box<ScriptCommand>,
     },
+    Workflow {
+        #[command(subcommand)]
+        command: Box<WorkflowCommand>,
+    },
     Schedule {
         #[command(subcommand)]
         command: Box<ScheduleCommand>,
@@ -91,6 +97,17 @@ enum ScriptCommand {
     Review(ScriptReviewArgs),
     Activate(ScriptActionArgs),
     Disable(ScriptActionArgs),
+}
+
+#[derive(Subcommand)]
+enum WorkflowCommand {
+    Create(WorkflowCreateArgs),
+    List(UserConfigArgs),
+    Show(WorkflowShowArgs),
+    Review(WorkflowReviewArgs),
+    Activate(WorkflowActionArgs),
+    Disable(WorkflowActionArgs),
+    Replay(WorkflowActionArgs),
 }
 
 #[derive(Subcommand)]
@@ -547,11 +564,67 @@ struct ScheduleAddArgs {
     #[arg(long)]
     schedule_id: Option<String>,
     #[arg(long)]
-    script_id: String,
+    script_id: Option<String>,
+    #[arg(long)]
+    workflow_id: Option<String>,
     #[arg(long)]
     cron: String,
     #[arg(long, default_value_t = true)]
     enabled: bool,
+    #[arg(long, default_value = "BEAVERKI_MASTER_PASSPHRASE")]
+    passphrase_env: String,
+}
+
+#[derive(Args, Clone)]
+struct WorkflowCreateArgs {
+    #[arg(long)]
+    config_dir: Option<PathBuf>,
+    #[arg(long)]
+    user: Option<String>,
+    #[arg(long)]
+    workflow_id: Option<String>,
+    #[arg(long)]
+    definition_file: PathBuf,
+    #[arg(long)]
+    summary: String,
+    #[arg(long)]
+    created_from_task_id: Option<String>,
+    #[arg(long, default_value = "BEAVERKI_MASTER_PASSPHRASE")]
+    passphrase_env: String,
+}
+
+#[derive(Args, Clone)]
+struct WorkflowShowArgs {
+    #[arg(long)]
+    config_dir: Option<PathBuf>,
+    #[arg(long)]
+    user: Option<String>,
+    #[arg(long)]
+    workflow_id: String,
+}
+
+#[derive(Args, Clone)]
+struct WorkflowReviewArgs {
+    #[arg(long)]
+    config_dir: Option<PathBuf>,
+    #[arg(long)]
+    user: Option<String>,
+    #[arg(long)]
+    workflow_id: String,
+    #[arg(long)]
+    summary: String,
+    #[arg(long, default_value = "BEAVERKI_MASTER_PASSPHRASE")]
+    passphrase_env: String,
+}
+
+#[derive(Args, Clone)]
+struct WorkflowActionArgs {
+    #[arg(long)]
+    config_dir: Option<PathBuf>,
+    #[arg(long)]
+    user: Option<String>,
+    #[arg(long)]
+    workflow_id: String,
     #[arg(long, default_value = "BEAVERKI_MASTER_PASSPHRASE")]
     passphrase_env: String,
 }
@@ -614,6 +687,15 @@ async fn main() -> Result<()> {
                 ScriptCommand::Review(args) => script_review(args).await,
                 ScriptCommand::Activate(args) => script_activate(args).await,
                 ScriptCommand::Disable(args) => script_disable(args).await,
+            },
+            AutomationCommand::Workflow { command } => match *command {
+                WorkflowCommand::Create(args) => workflow_create(args).await,
+                WorkflowCommand::List(args) => workflow_list(args).await,
+                WorkflowCommand::Show(args) => workflow_show(args).await,
+                WorkflowCommand::Review(args) => workflow_review(args).await,
+                WorkflowCommand::Activate(args) => workflow_activate(args).await,
+                WorkflowCommand::Disable(args) => workflow_disable(args).await,
+                WorkflowCommand::Replay(args) => workflow_replay(args).await,
             },
             AutomationCommand::Schedule { command } => match *command {
                 ScheduleCommand::Add(args) => schedule_add(args).await,
@@ -1651,6 +1733,145 @@ async fn script_disable(args: ScriptActionArgs) -> Result<()> {
     Ok(())
 }
 
+async fn workflow_create(args: WorkflowCreateArgs) -> Result<()> {
+    let config_dir = resolve_config_dir(args.config_dir)?;
+    let passphrase = prompt_passphrase_from_env(&args.passphrase_env).unwrap_or_else(|| {
+        Password::new()
+            .with_prompt("Master passphrase")
+            .interact()
+            .expect("failed to read master passphrase")
+    });
+    let definition_text = std::fs::read_to_string(&args.definition_file)
+        .with_context(|| format!("failed to read {}", args.definition_file.display()))?;
+    let definition: WorkflowDefinitionInput = serde_json::from_str(&definition_text)
+        .context("failed to parse workflow definition JSON")?;
+    let runtime = Runtime::load(&config_dir, &passphrase).await?;
+    let inspection = runtime
+        .create_workflow_definition(
+            args.user.as_deref(),
+            args.workflow_id.as_deref(),
+            definition,
+            args.created_from_task_id.as_deref(),
+            &args.summary,
+        )
+        .await?;
+    print_workflow_inspection(&inspection);
+    Ok(())
+}
+
+async fn workflow_list(args: UserConfigArgs) -> Result<()> {
+    let config_dir = resolve_config_dir(args.config_dir)?;
+    let (_, db) = load_db(&config_dir).await?;
+    let user = resolve_user_for_db(&db, args.user.as_deref()).await?;
+    let workflows = db.list_workflow_definitions_for_owner(&user.user_id).await?;
+    for workflow in workflows {
+        println!(
+            "- {} name={} status={} safety_status={}",
+            workflow.workflow_id, workflow.name, workflow.status, workflow.safety_status
+        );
+    }
+    Ok(())
+}
+
+async fn workflow_show(args: WorkflowShowArgs) -> Result<()> {
+    let config_dir = resolve_config_dir(args.config_dir)?;
+    let (_, db) = load_db(&config_dir).await?;
+    let user = resolve_user_for_db(&db, args.user.as_deref()).await?;
+    let workflow = db
+        .fetch_workflow_definition_for_owner(&user.user_id, &args.workflow_id)
+        .await?
+        .ok_or_else(|| anyhow!("workflow '{}' not found", args.workflow_id))?;
+    let versions = db.list_workflow_versions(&workflow.workflow_id).await?;
+    let stages = db.list_workflow_stages(&workflow.workflow_id).await?;
+    let reviews = db.list_workflow_reviews(&workflow.workflow_id).await?;
+    let schedules = db
+        .list_schedules_for_owner(&user.user_id)
+        .await?
+        .into_iter()
+        .filter(|row| row.target_type == "workflow" && row.target_id == workflow.workflow_id)
+        .collect::<Vec<_>>();
+    let runs = db.list_workflow_runs_for_workflow(&workflow.workflow_id).await?;
+    print_workflow_inspection(&beaverki_runtime::WorkflowInspection {
+        workflow,
+        versions,
+        stages,
+        reviews,
+        schedules,
+        runs,
+    });
+    Ok(())
+}
+
+async fn workflow_review(args: WorkflowReviewArgs) -> Result<()> {
+    let config_dir = resolve_config_dir(args.config_dir)?;
+    let passphrase = prompt_passphrase_from_env(&args.passphrase_env).unwrap_or_else(|| {
+        Password::new()
+            .with_prompt("Master passphrase")
+            .interact()
+            .expect("failed to read master passphrase")
+    });
+    let runtime = Runtime::load(&config_dir, &passphrase).await?;
+    let review = runtime
+        .review_workflow_definition(args.user.as_deref(), &args.workflow_id, &args.summary)
+        .await?;
+    print_workflow_review_details(&review);
+    Ok(())
+}
+
+async fn workflow_activate(args: WorkflowActionArgs) -> Result<()> {
+    let config_dir = resolve_config_dir(args.config_dir)?;
+    let passphrase = prompt_passphrase_from_env(&args.passphrase_env).unwrap_or_else(|| {
+        Password::new()
+            .with_prompt("Master passphrase")
+            .interact()
+            .expect("failed to read master passphrase")
+    });
+    let runtime = Runtime::load(&config_dir, &passphrase).await?;
+    let workflow = runtime
+        .activate_workflow_definition(args.user.as_deref(), &args.workflow_id)
+        .await?;
+    println!(
+        "Workflow {} is now {}.",
+        workflow.workflow_id, workflow.status
+    );
+    Ok(())
+}
+
+async fn workflow_disable(args: WorkflowActionArgs) -> Result<()> {
+    let config_dir = resolve_config_dir(args.config_dir)?;
+    let passphrase = prompt_passphrase_from_env(&args.passphrase_env).unwrap_or_else(|| {
+        Password::new()
+            .with_prompt("Master passphrase")
+            .interact()
+            .expect("failed to read master passphrase")
+    });
+    let runtime = Runtime::load(&config_dir, &passphrase).await?;
+    let workflow = runtime
+        .disable_workflow_definition(args.user.as_deref(), &args.workflow_id)
+        .await?;
+    println!(
+        "Workflow {} is now {}.",
+        workflow.workflow_id, workflow.status
+    );
+    Ok(())
+}
+
+async fn workflow_replay(args: WorkflowActionArgs) -> Result<()> {
+    let config_dir = resolve_config_dir(args.config_dir)?;
+    let passphrase = prompt_passphrase_from_env(&args.passphrase_env).unwrap_or_else(|| {
+        Password::new()
+            .with_prompt("Master passphrase")
+            .interact()
+            .expect("failed to read master passphrase")
+    });
+    let runtime = Runtime::load(&config_dir, &passphrase).await?;
+    let task = runtime
+        .replay_workflow_definition(args.user.as_deref(), &args.workflow_id)
+        .await?;
+    println!("Workflow replay queued as task {}.", task.task_id);
+    Ok(())
+}
+
 async fn schedule_add(args: ScheduleAddArgs) -> Result<()> {
     let config_dir = resolve_config_dir(args.config_dir)?;
     let passphrase = prompt_passphrase_from_env(&args.passphrase_env).unwrap_or_else(|| {
@@ -1660,17 +1881,34 @@ async fn schedule_add(args: ScheduleAddArgs) -> Result<()> {
             .expect("failed to read master passphrase")
     });
     let runtime = Runtime::load(&config_dir, &passphrase).await?;
-    let schedule = runtime
-        .create_schedule(
-            args.user.as_deref(),
-            args.schedule_id.as_deref(),
-            &args.script_id,
-            &args.cron,
-            args.enabled,
-        )
-        .await?;
+    let schedule = match (args.script_id.as_deref(), args.workflow_id.as_deref()) {
+        (Some(script_id), None) => {
+            runtime
+                .create_schedule(
+                    args.user.as_deref(),
+                    args.schedule_id.as_deref(),
+                    script_id,
+                    &args.cron,
+                    args.enabled,
+                )
+                .await?
+        }
+        (None, Some(workflow_id)) => {
+            runtime
+                .create_workflow_schedule(
+                    args.user.as_deref(),
+                    args.schedule_id.as_deref(),
+                    workflow_id,
+                    &args.cron,
+                    args.enabled,
+                )
+                .await?
+        }
+        _ => bail!("provide exactly one of --script-id or --workflow-id"),
+    };
     println!("Schedule created.");
     println!("Schedule ID: {}", schedule.schedule_id);
+    println!("Target type: {}", schedule.target_type);
     println!("Target: {}", schedule.target_id);
     println!("Cron: {}", schedule.cron_expr);
     println!(
@@ -1688,8 +1926,9 @@ async fn schedule_list(args: UserConfigArgs) -> Result<()> {
     let schedules = db.list_schedules_for_owner(&user.user_id).await?;
     for schedule in schedules {
         println!(
-            "- {} target={} enabled={} next_run_at={}",
+            "- {} target_type={} target={} enabled={} next_run_at={}",
             schedule.schedule_id,
+            schedule.target_type,
             schedule.target_id,
             if schedule.enabled != 0 { "yes" } else { "no" },
             schedule.next_run_at
@@ -1761,7 +2000,114 @@ fn print_script_inspection(inspection: &beaverki_runtime::ScriptInspection) {
     }
 }
 
+fn print_workflow_inspection(inspection: &beaverki_runtime::WorkflowInspection) {
+    println!("Workflow ID: {}", inspection.workflow.workflow_id);
+    println!("Name: {}", inspection.workflow.name);
+    println!("Status: {}", inspection.workflow.status);
+    println!("Safety status: {}", inspection.workflow.safety_status);
+    println!("Current version: v{}", inspection.workflow.current_version_number);
+    if let Some(summary) = inspection.workflow.safety_summary.as_deref() {
+        println!("Safety summary: {summary}");
+    }
+    if let Some(task_id) = inspection.workflow.created_from_task_id.as_deref() {
+        println!("Created from task: {task_id}");
+    }
+
+    println!("\nStages:");
+    for stage in &inspection.stages {
+        println!(
+            "- [{}] {} kind={} artifact={}",
+            stage.stage_index,
+            stage.stage_label.as_deref().unwrap_or("(unnamed)"),
+            stage.stage_kind,
+            stage.artifact_ref.as_deref().unwrap_or("-")
+        );
+        println!("  config={}", stage.stage_config_json);
+    }
+
+    if !inspection.reviews.is_empty() {
+        println!("\nReviews:");
+        for review in &inspection.reviews {
+            print_workflow_review_details(review);
+        }
+    }
+
+    if !inspection.versions.is_empty() {
+        println!("\nVersions:");
+        for version in &inspection.versions {
+            println!(
+                "- v{} name={} created_at={}",
+                version.version_number, version.name, version.created_at
+            );
+        }
+    }
+
+    if !inspection.schedules.is_empty() {
+        println!("\nSchedules:");
+        for schedule in &inspection.schedules {
+            println!(
+                "- {} cron={} enabled={} next_run_at={}",
+                schedule.schedule_id,
+                schedule.cron_expr,
+                if schedule.enabled != 0 { "yes" } else { "no" },
+                schedule.next_run_at
+            );
+        }
+    }
+
+    if !inspection.runs.is_empty() {
+        println!("\nRuns:");
+        for run in &inspection.runs {
+            println!(
+                "- {} state={} stage={} wake_at={} block_reason={}",
+                run.workflow_run_id,
+                run.state,
+                run.current_stage_index,
+                run.wake_at.as_deref().unwrap_or("-"),
+                run.block_reason.as_deref().unwrap_or("-")
+            );
+        }
+    }
+}
+
 fn print_script_review_details(review: &beaverki_db::ScriptReviewRow) {
+    let findings_json = match serde_json::from_str::<serde_json::Value>(&review.findings_json) {
+        Ok(value) => value,
+        Err(_) => return,
+    };
+
+    if let Some(findings) = findings_json
+        .get("findings")
+        .and_then(serde_json::Value::as_array)
+        && !findings.is_empty()
+    {
+        println!("  Findings:");
+        for finding in findings.iter().filter_map(serde_json::Value::as_str) {
+            println!("    - {finding}");
+        }
+    }
+
+    if let Some(required_changes) = findings_json
+        .get("required_changes")
+        .and_then(serde_json::Value::as_array)
+        && !required_changes.is_empty()
+    {
+        println!("  Required changes:");
+        for required_change in required_changes
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+        {
+            println!("    - {required_change}");
+        }
+    }
+}
+
+fn print_workflow_review_details(review: &beaverki_db::WorkflowReviewRow) {
+    println!(
+        "- {} verdict={} risk={} summary={}",
+        review.review_id, review.verdict, review.risk_level, review.summary_text
+    );
+
     let findings_json = match serde_json::from_str::<serde_json::Value>(&review.findings_json) {
         Ok(value) => value,
         Err(_) => return,
