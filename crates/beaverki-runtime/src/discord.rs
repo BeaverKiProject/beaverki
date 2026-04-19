@@ -57,6 +57,57 @@ struct DiscordGatewayInfo {
 }
 
 #[derive(Debug, Deserialize)]
+struct DiscordReadyPayload {
+    session_id: String,
+    #[serde(default)]
+    resume_gateway_url: Option<String>,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct DiscordGatewaySessionState {
+    sequence_number: Option<i64>,
+    session_id: Option<String>,
+    resume_gateway_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiscordGatewayConnectMode {
+    Identify,
+    Resume,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiscordGatewaySessionOutcome {
+    Shutdown,
+    Reconnect,
+}
+
+impl DiscordGatewaySessionState {
+    fn connect_mode(&self) -> DiscordGatewayConnectMode {
+        if self.sequence_number.is_some() && self.session_id.is_some() {
+            DiscordGatewayConnectMode::Resume
+        } else {
+            DiscordGatewayConnectMode::Identify
+        }
+    }
+
+    fn websocket_url<'a>(&'a self, default_url: &'a str) -> &'a str {
+        self.resume_gateway_url.as_deref().unwrap_or(default_url)
+    }
+
+    fn update_ready(&mut self, ready: DiscordReadyPayload) {
+        self.session_id = Some(ready.session_id);
+        self.resume_gateway_url = ready.resume_gateway_url;
+    }
+
+    fn clear_resume_state(&mut self) {
+        self.sequence_number = None;
+        self.session_id = None;
+        self.resume_gateway_url = None;
+    }
+}
+
+#[derive(Debug, Deserialize)]
 struct DiscordRateLimitBody {
     retry_after: Option<f64>,
 }
@@ -193,13 +244,26 @@ pub(crate) async fn run_discord_loop(daemon: Arc<RuntimeDaemon>) -> Result<()> {
         .await?;
 
     let mut retry_delay = Duration::from_secs(1);
+    let mut session_state = DiscordGatewaySessionState::default();
     loop {
         if daemon.shutdown_notified().await {
             return Ok(());
         }
 
-        match run_gateway_session(Arc::clone(&daemon), &http_client, &token, &bot_user_id).await {
-            Ok(()) => return Ok(()),
+        match run_gateway_session(
+            Arc::clone(&daemon),
+            &http_client,
+            &token,
+            &bot_user_id,
+            &mut session_state,
+        )
+        .await
+        {
+            Ok(DiscordGatewaySessionOutcome::Shutdown) => return Ok(()),
+            Ok(DiscordGatewaySessionOutcome::Reconnect) => {
+                retry_delay = Duration::from_secs(1);
+                continue;
+            }
             Err(error) => {
                 warn!("discord connector session failed: {error:#}");
                 daemon
@@ -228,7 +292,8 @@ async fn run_gateway_session(
     http_client: &reqwest::Client,
     token: &str,
     bot_user_id: &str,
-) -> Result<()> {
+    session_state: &mut DiscordGatewaySessionState,
+) -> Result<DiscordGatewaySessionOutcome> {
     let gateway_response = http_client
         .get(DISCORD_GATEWAY_URL)
         .header("Authorization", format!("Bot {token}"))
@@ -248,12 +313,11 @@ async fn run_gateway_session(
         .json::<DiscordGatewayInfo>()
         .await
         .context("failed to decode Discord gateway URL response")?;
-    let gateway_url = build_gateway_websocket_url(&gateway_info.url);
+    let gateway_url = build_gateway_websocket_url(session_state.websocket_url(&gateway_info.url));
     let (mut socket, _) = connect_async(&gateway_url)
         .await
         .with_context(|| format!("failed to connect to Discord gateway at {gateway_url}"))?;
 
-    let mut sequence_number: Option<i64> = None;
     let mut heartbeat = time::interval(Duration::from_secs(60));
     heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut identified = false;
@@ -262,12 +326,12 @@ async fn run_gateway_session(
         tokio::select! {
             _ = daemon.shutdown.notified() => {
                 let _ = socket.close(None).await;
-                return Ok(());
+                return Ok(DiscordGatewaySessionOutcome::Shutdown);
             }
             _ = heartbeat.tick(), if identified => {
                 let heartbeat_payload = json!({
                     "op": 1,
-                    "d": sequence_number,
+                    "d": session_state.sequence_number,
                 });
                 socket
                     .send(Message::Text(heartbeat_payload.to_string()))
@@ -284,7 +348,7 @@ async fn run_gateway_session(
                         let payload: Value = serde_json::from_str(&text)
                             .context("failed to decode Discord gateway payload")?;
                         if let Some(sequence) = payload.get("s").and_then(Value::as_i64) {
-                            sequence_number = Some(sequence);
+                            session_state.sequence_number = Some(sequence);
                         }
 
                         match payload.get("op").and_then(Value::as_i64).unwrap_or_default() {
@@ -292,6 +356,11 @@ async fn run_gateway_session(
                                 if let Some(event_type) = payload.get("t").and_then(Value::as_str) {
                                     match event_type {
                                         "READY" => {
+                                            let ready = serde_json::from_value::<DiscordReadyPayload>(
+                                                payload.get("d").cloned().unwrap_or(Value::Null),
+                                            )
+                                            .context("failed to decode Discord ready payload")?;
+                                            session_state.update_ready(ready);
                                             daemon.runtime.db.record_audit_event(
                                                 "connector",
                                                 "discord",
@@ -355,15 +424,55 @@ async fn run_gateway_session(
                             1 => {
                                 let heartbeat_payload = json!({
                                     "op": 1,
-                                    "d": sequence_number,
+                                    "d": session_state.sequence_number,
                                 });
                                 socket
                                     .send(Message::Text(heartbeat_payload.to_string()))
                                     .await
                                     .context("failed to send Discord heartbeat request response")?;
                             }
-                            7 => bail!("Discord gateway requested reconnect"),
-                            9 => bail!("Discord gateway invalidated the session"),
+                            7 => {
+                                daemon
+                                    .runtime
+                                    .db
+                                    .record_audit_event(
+                                        "connector",
+                                        "discord",
+                                        "discord_connector_reconnect_requested",
+                                        json!({
+                                            "session_id": session_state.session_id,
+                                            "sequence_number": session_state.sequence_number,
+                                        }),
+                                    )
+                                    .await?;
+                                let _ = socket.close(None).await;
+                                return Ok(DiscordGatewaySessionOutcome::Reconnect);
+                            }
+                            9 => {
+                                let can_resume = payload
+                                    .get("d")
+                                    .and_then(Value::as_bool)
+                                    .unwrap_or(false);
+                                if !can_resume {
+                                    session_state.clear_resume_state();
+                                }
+                                daemon
+                                    .runtime
+                                    .db
+                                    .record_audit_event(
+                                        "connector",
+                                        "discord",
+                                        "discord_connector_session_invalidated",
+                                        json!({
+                                            "can_resume": can_resume,
+                                            "session_id": session_state.session_id,
+                                            "sequence_number": session_state.sequence_number,
+                                        }),
+                                    )
+                                    .await?;
+                                let _ = socket.close(None).await;
+                                return Ok(DiscordGatewaySessionOutcome::Reconnect);
+                            }
                             10 => {
                                 let heartbeat_interval_ms = payload
                                     .get("d")
@@ -372,22 +481,16 @@ async fn run_gateway_session(
                                     .ok_or_else(|| anyhow!("Discord gateway hello payload missing heartbeat interval"))?;
                                 heartbeat = time::interval(Duration::from_millis(heartbeat_interval_ms));
                                 heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
-                                let identify_payload = json!({
-                                    "op": 2,
-                                    "d": {
-                                        "token": token,
-                                        "intents": DISCORD_INTENTS,
-                                        "properties": {
-                                            "os": std::env::consts::OS,
-                                            "browser": "beaverki",
-                                            "device": "beaverki"
-                                        }
-                                    }
-                                });
+                                let identify_payload = gateway_connect_payload(token, session_state);
                                 socket
                                     .send(Message::Text(identify_payload.to_string()))
                                     .await
-                                    .context("failed to send Discord identify payload")?;
+                                    .with_context(|| {
+                                        format!(
+                                            "failed to send Discord {} payload",
+                                            gateway_connect_mode_label(session_state.connect_mode())
+                                        )
+                                    })?;
                                 identified = true;
                             }
                             11 => {}
@@ -407,6 +510,38 @@ async fn run_gateway_session(
                 }
             }
         }
+    }
+}
+
+fn gateway_connect_payload(token: &str, session_state: &DiscordGatewaySessionState) -> Value {
+    match session_state.connect_mode() {
+        DiscordGatewayConnectMode::Identify => json!({
+            "op": 2,
+            "d": {
+                "token": token,
+                "intents": DISCORD_INTENTS,
+                "properties": {
+                    "os": std::env::consts::OS,
+                    "browser": "beaverki",
+                    "device": "beaverki"
+                }
+            }
+        }),
+        DiscordGatewayConnectMode::Resume => json!({
+            "op": 6,
+            "d": {
+                "token": token,
+                "session_id": session_state.session_id.as_deref().unwrap_or_default(),
+                "seq": session_state.sequence_number,
+            }
+        }),
+    }
+}
+
+fn gateway_connect_mode_label(mode: DiscordGatewayConnectMode) -> &'static str {
+    match mode {
+        DiscordGatewayConnectMode::Identify => "identify",
+        DiscordGatewayConnectMode::Resume => "resume",
     }
 }
 
@@ -2696,6 +2831,69 @@ mod tests {
         let error = anyhow!("Discord gateway URL request rate limited; retry_after_secs=42");
         let delay = retry_delay_for_error(&error).expect("retry delay");
         assert_eq!(delay, Duration::from_secs(42));
+    }
+
+    #[test]
+    fn gateway_session_identifies_without_resume_state() {
+        let session_state = DiscordGatewaySessionState::default();
+
+        assert_eq!(
+            session_state.connect_mode(),
+            DiscordGatewayConnectMode::Identify
+        );
+        assert_eq!(gateway_connect_payload("token-123", &session_state)["op"], 2);
+    }
+
+    #[test]
+    fn gateway_session_resumes_with_session_id_and_sequence() {
+        let session_state = DiscordGatewaySessionState {
+            sequence_number: Some(42),
+            session_id: Some("session-123".to_owned()),
+            resume_gateway_url: Some("wss://gateway.discord.gg".to_owned()),
+        };
+
+        assert_eq!(
+            session_state.connect_mode(),
+            DiscordGatewayConnectMode::Resume
+        );
+        assert_eq!(gateway_connect_payload("token-123", &session_state)["op"], 6);
+        assert_eq!(
+            gateway_connect_payload("token-123", &session_state)["d"]["session_id"],
+            "session-123"
+        );
+        assert_eq!(
+            gateway_connect_payload("token-123", &session_state)["d"]["seq"],
+            42
+        );
+    }
+
+    #[test]
+    fn gateway_session_updates_resume_state_from_ready_payload() {
+        let mut session_state = DiscordGatewaySessionState::default();
+
+        session_state.update_ready(DiscordReadyPayload {
+            session_id: "session-123".to_owned(),
+            resume_gateway_url: Some("wss://resume.discord.gg".to_owned()),
+        });
+
+        assert_eq!(session_state.session_id.as_deref(), Some("session-123"));
+        assert_eq!(
+            session_state.resume_gateway_url.as_deref(),
+            Some("wss://resume.discord.gg")
+        );
+    }
+
+    #[test]
+    fn gateway_session_can_clear_resume_state() {
+        let mut session_state = DiscordGatewaySessionState {
+            sequence_number: Some(42),
+            session_id: Some("session-123".to_owned()),
+            resume_gateway_url: Some("wss://resume.discord.gg".to_owned()),
+        };
+
+        session_state.clear_resume_state();
+
+        assert_eq!(session_state, DiscordGatewaySessionState::default());
     }
 
     #[test]
