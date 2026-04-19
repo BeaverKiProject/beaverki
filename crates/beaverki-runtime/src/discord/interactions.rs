@@ -140,8 +140,12 @@ pub(super) fn interaction_command_text(data: &DiscordInteractionData) -> Result<
         return Ok(approval_command);
     }
 
-    if values.is_empty() && path.len() == 1 && path[0] == "new" {
-        return Ok("/new".to_owned());
+    if values.is_empty() && path.len() == 1 {
+        match path[0].as_str() {
+            "new" => return Ok("/new".to_owned()),
+            "status" => return Ok("/status".to_owned()),
+            _ => {}
+        }
     }
 
     if path.len() == 1 {

@@ -17,7 +17,7 @@ use tracing::{error, info, warn};
 
 use crate::connector_support::connector_type_from_events;
 use crate::discord;
-use crate::session::{is_session_reset_command, parse_scope};
+use crate::session::{is_session_reset_command, is_session_status_command, parse_scope};
 use crate::{MemoryInspection, Runtime, TaskInspection};
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
@@ -758,9 +758,19 @@ impl RuntimeDaemon {
                 let scope = parse_scope(&scope)?;
                 let user = self.runtime.resolve_user(user_id.as_deref()).await?;
                 let is_reset = is_session_reset_command(&objective);
+                let is_status = is_session_status_command(&objective);
+                let queue_depth = if is_status {
+                    self.runtime.pending_task_count().await?
+                } else {
+                    0
+                };
                 let task = if is_reset {
                     self.runtime
                         .reset_cli_conversation_session(&user, &objective, scope)
+                        .await?
+                } else if is_status {
+                    self.runtime
+                        .status_cli_conversation_session(&user, &objective, scope, queue_depth)
                         .await?
                 } else {
                     self.runtime
@@ -778,6 +788,21 @@ impl RuntimeDaemon {
                                 "task_id": task.task_id,
                                 "owner_user_id": task.owner_user_id,
                                 "scope": task.scope,
+                            }),
+                        )
+                        .await?;
+                } else if is_status {
+                    self.runtime
+                        .db
+                        .record_audit_event(
+                            "runtime",
+                            &self.current_session_id().await,
+                            "conversation_session_status_requested",
+                            json!({
+                                "task_id": task.task_id,
+                                "owner_user_id": task.owner_user_id,
+                                "scope": task.scope,
+                                "queue_depth": queue_depth,
                             }),
                         )
                         .await?;

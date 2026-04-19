@@ -416,6 +416,40 @@ impl RuntimeDaemon {
                 ),
             });
         }
+        if crate::is_session_status_command(&command_text) {
+            let queue_depth = self.runtime.pending_task_count().await?;
+            let task = self
+                .runtime
+                .status_connector_conversation_session(
+                    &mapped_user,
+                    &identity.identity_id,
+                    &command_text,
+                    &session,
+                    scope,
+                    queue_depth,
+                )
+                .await?;
+            self.runtime
+                .db
+                .record_audit_event(
+                    "connector",
+                    &identity.identity_id,
+                    "connector_session_status_requested",
+                    json!({
+                        "connector_type": &message.connector_type,
+                        "channel_id": &message.channel_id,
+                        "message_id": &message.message_id,
+                        "session_id": session.session_id,
+                        "task_id": task.task_id,
+                        "queue_depth": queue_depth,
+                    }),
+                )
+                .await?;
+            return Ok(ConnectorMessageReply {
+                accepted: true,
+                reply: task.result_text,
+            });
+        }
         let user_label = message
             .external_display_name
             .as_deref()
@@ -1329,6 +1363,17 @@ mod tests {
     }
 
     #[test]
+    fn interaction_command_maps_status_to_session_status() {
+        let command = interaction_command_text(&DiscordInteractionData {
+            name: "status".to_owned(),
+            options: Vec::new(),
+        })
+        .expect("command text");
+
+        assert_eq!(command, "/status");
+    }
+
+    #[test]
     fn registered_command_match_requires_expected_new_shape() {
         let command = DiscordRegisteredCommand {
             name: "new".to_owned(),
@@ -1396,12 +1441,19 @@ mod tests {
                 options: Vec::new(),
             },
             DiscordRegisteredCommand {
+                name: "status".to_owned(),
+                description: "Show the current BeaverKI session status".to_owned(),
+                command_type: 1,
+                contexts: Some(vec![0, 1]),
+                options: Vec::new(),
+            },
+            DiscordRegisteredCommand {
                 name: "approval".to_owned(),
                 description: "Inspect or resolve BeaverKI approvals".to_owned(),
                 command_type: 1,
                 contexts: Some(vec![0, 1]),
                 options: normalized_discord_command_options_from_value(
-                    discord_global_command_payloads()[1].get("options"),
+                    discord_global_command_payloads()[2].get("options"),
                 ),
             },
         ];

@@ -3279,6 +3279,40 @@ impl Database {
         Ok(events)
     }
 
+    pub async fn list_task_events_for_session(
+        &self,
+        session_id: &str,
+        since_inclusive: Option<&str>,
+    ) -> Result<Vec<TaskEventRow>> {
+        let events = if let Some(since_inclusive) = since_inclusive {
+            sqlx::query_as::<_, TaskEventRow>(
+                "SELECT task_events.event_id, task_events.task_id, task_events.event_type, task_events.actor_type, task_events.actor_id, task_events.payload_json, task_events.created_at
+                 FROM task_events
+                 INNER JOIN tasks ON tasks.task_id = task_events.task_id
+                 WHERE tasks.session_id = ?
+                   AND tasks.created_at >= ?
+                 ORDER BY task_events.created_at ASC",
+            )
+            .bind(session_id)
+            .bind(since_inclusive)
+            .fetch_all(&self.pool)
+            .await
+        } else {
+            sqlx::query_as::<_, TaskEventRow>(
+                "SELECT task_events.event_id, task_events.task_id, task_events.event_type, task_events.actor_type, task_events.actor_id, task_events.payload_json, task_events.created_at
+                 FROM task_events
+                 INNER JOIN tasks ON tasks.task_id = task_events.task_id
+                 WHERE tasks.session_id = ?
+                 ORDER BY task_events.created_at ASC",
+            )
+            .bind(session_id)
+            .fetch_all(&self.pool)
+            .await
+        }
+        .context("failed to list task events for session")?;
+        Ok(events)
+    }
+
     pub async fn fetch_tool_invocations_for_owner(
         &self,
         owner_user_id: &str,

@@ -11,6 +11,7 @@ pub(crate) const CLI_CONVERSATION_HISTORY_LIMIT: i64 = 4;
 const CLI_ACTIVE_CONVERSATION_WINDOW_SECS: i64 = 45 * 60;
 
 pub(crate) const SESSION_RESET_COMMAND: &str = "/new";
+pub(crate) const SESSION_STATUS_COMMAND: &str = "/status";
 pub(crate) const SESSION_KIND_CLI: &str = "cli";
 pub(crate) const SESSION_KIND_DIRECT_MESSAGE: &str = "direct_message";
 pub(crate) const SESSION_KIND_GROUP_ROOM: &str = "group_room";
@@ -118,6 +119,10 @@ pub(crate) fn cap_scopes_to_session(
 
 pub(crate) fn is_session_reset_command(objective: &str) -> bool {
     objective.trim() == SESSION_RESET_COMMAND
+}
+
+pub(crate) fn is_session_status_command(objective: &str) -> bool {
+    objective.trim() == SESSION_STATUS_COMMAND
 }
 
 pub(crate) fn parse_memory_kind_filter(value: Option<&str>) -> Result<Option<MemoryKind>> {

@@ -369,6 +369,12 @@ pub(super) fn discord_global_command_payloads() -> Vec<Value> {
             "contexts": [0, 1],
         }),
         json!({
+            "name": "status",
+            "type": 1,
+            "description": "Show the current BeaverKI session status",
+            "contexts": [0, 1],
+        }),
+        json!({
             "name": "approval",
             "type": 1,
             "description": "Inspect or resolve BeaverKI approvals",

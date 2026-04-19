@@ -54,8 +54,9 @@ use self::session::{
     SESSION_KIND_CRON_RUN, SESSION_KIND_DIRECT_MESSAGE, SESSION_KIND_GROUP_ROOM,
     SESSION_LIFECYCLE_REASON_MANUAL_RESET, build_cli_task_context, cap_scopes_to_session,
     cap_task_scope_to_session, cli_conversation_status, connector_group_room_policy,
-    ensure_memory_visible_to_user, is_session_reset_command, parse_memory_kind_filter,
-    parse_session_max_scope, resolve_visible_memory_scopes, session_lifecycle_is_due,
+    ensure_memory_visible_to_user, is_session_reset_command, is_session_status_command,
+    parse_memory_kind_filter, parse_session_max_scope, resolve_visible_memory_scopes,
+    session_lifecycle_is_due,
 };
 use self::workflow::{
     apply_stage_result, parse_json_field, validate_workflow_definition_input,
@@ -73,6 +74,13 @@ pub struct Runtime {
     provider: Arc<dyn ModelProvider>,
     runner: PrimaryAgentRunner,
     discord_bot_token: Option<String>,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct SessionTokenUsage {
+    input_tokens: u64,
+    output_tokens: u64,
+    compactions: u64,
 }
 
 impl Runtime {
@@ -376,6 +384,166 @@ impl Runtime {
             .fetch_task_for_owner(&user.user_id, &task.task_id)
             .await?
             .ok_or_else(|| anyhow!("reset task '{}' disappeared after completion", task.task_id))
+    }
+
+    async fn create_status_task(
+        &self,
+        user: &UserRow,
+        initiating_identity_id: &str,
+        objective: &str,
+        session: &ConversationSessionRow,
+        requested_scope: MemoryScope,
+        queue_depth: i64,
+    ) -> Result<TaskRow> {
+        let effective_scope =
+            cap_task_scope_to_session(requested_scope, parse_session_max_scope(session)?);
+        let primary_agent_id = user
+            .primary_agent_id
+            .clone()
+            .ok_or_else(|| anyhow!("user '{}' has no primary agent", user.user_id))?;
+        let summary = self
+            .render_conversation_session_status(session, queue_depth)
+            .await?;
+        let task = self
+            .db
+            .create_task_with_params(NewTask {
+                owner_user_id: &user.user_id,
+                initiating_identity_id,
+                primary_agent_id: &primary_agent_id,
+                assigned_agent_id: &primary_agent_id,
+                parent_task_id: None,
+                session_id: Some(&session.session_id),
+                kind: "session_command",
+                objective,
+                context_summary: Some("Conversation session status handled by runtime."),
+                scope: effective_scope,
+                wake_at: None,
+            })
+            .await?;
+        let status_payload = self.session_status_payload(session, queue_depth).await?;
+        self.db
+            .append_task_event(
+                &task.task_id,
+                "conversation_session_status",
+                "runtime",
+                &self.config.runtime.instance_id,
+                status_payload,
+            )
+            .await?;
+        self.db.complete_task(&task.task_id, &summary).await?;
+        self.db
+            .fetch_task_for_owner(&user.user_id, &task.task_id)
+            .await?
+            .ok_or_else(|| {
+                anyhow!(
+                    "status task '{}' disappeared after completion",
+                    task.task_id
+                )
+            })
+    }
+
+    async fn session_status_payload(
+        &self,
+        session: &ConversationSessionRow,
+        queue_depth: i64,
+    ) -> Result<Value> {
+        let usage = self.session_token_usage(session).await?;
+        Ok(json!({
+            "session_id": session.session_id,
+            "session_key": session.session_key,
+            "session_kind": session.session_kind,
+            "audience_policy": session.audience_policy,
+            "max_memory_scope": session.max_memory_scope,
+            "input_tokens": usage.input_tokens,
+            "output_tokens": usage.output_tokens,
+            "compactions": usage.compactions,
+            "queue_depth": queue_depth,
+        }))
+    }
+
+    async fn render_conversation_session_status(
+        &self,
+        session: &ConversationSessionRow,
+        queue_depth: i64,
+    ) -> Result<String> {
+        let active_provider = self.config.providers.active_provider()?;
+        let usage = self.session_token_usage(session).await?;
+        let mut lines = Vec::new();
+        lines.push(format!(
+            "Models: planner {}/{} | executor {}/{}",
+            active_provider.kind,
+            active_provider.models.planner,
+            active_provider.kind,
+            active_provider.models.executor,
+        ));
+        lines.push(format!(
+            "Support models: summarizer {}/{} | safety {}/{}",
+            active_provider.kind,
+            active_provider.models.summarizer,
+            active_provider.kind,
+            active_provider.models.safety_review,
+        ));
+        lines.push(format!(
+            "Auth: {} ({})",
+            active_provider.auth.mode.replace('_', "-"),
+            active_provider.provider_id,
+        ));
+        lines.push(format!(
+            "Tokens: {} in / {} out",
+            format_token_count(usage.input_tokens),
+            format_token_count(usage.output_tokens),
+        ));
+        lines.push(format!(
+            "Context: {} in-session | Compactions: {}",
+            format_token_count(usage.input_tokens.saturating_add(usage.output_tokens)),
+            usage.compactions,
+        ));
+        lines.push(format!(
+            "Session: {} | updated {}",
+            session.session_key,
+            relative_time_text(&session.last_activity_at),
+        ));
+        lines.push(format!(
+            "Runtime: mode {} | kind {} | audience {} | scope cap {}",
+            self.config.runtime.mode,
+            session.session_kind,
+            session.audience_policy,
+            session.max_memory_scope,
+        ));
+        lines.push(format!("Queue: depth {queue_depth}"));
+        Ok(lines.join("\n"))
+    }
+
+    async fn session_token_usage(
+        &self,
+        session: &ConversationSessionRow,
+    ) -> Result<SessionTokenUsage> {
+        let events = self
+            .db
+            .list_task_events_for_session(&session.session_id, session.last_reset_at.as_deref())
+            .await?;
+        let mut usage = SessionTokenUsage::default();
+        for event in events {
+            let payload: Value = match serde_json::from_str(&event.payload_json) {
+                Ok(payload) => payload,
+                Err(_) => continue,
+            };
+            match event.event_type.as_str() {
+                "model_turn_completed" => {
+                    usage.input_tokens += payload
+                        .get("input_tokens")
+                        .and_then(Value::as_u64)
+                        .unwrap_or_default();
+                    usage.output_tokens += payload
+                        .get("output_tokens")
+                        .and_then(Value::as_u64)
+                        .unwrap_or_default();
+                }
+                "conversation_compacted" | "context_compacted" => usage.compactions += 1,
+                _ => {}
+            }
+        }
+        Ok(usage)
     }
 
     pub async fn execute_task(&self, task: TaskRow) -> Result<AgentResult> {
@@ -1473,10 +1641,11 @@ impl Runtime {
                     })
                     .to_string();
                     if let Some(existing_task_id) = occurrence.materialized_task_id.as_deref()
-                        && let Some(existing_task) = self.db.fetch_task(existing_task_id).await? {
-                            tasks.push(existing_task);
-                            continue;
-                        }
+                        && let Some(existing_task) = self.db.fetch_task(existing_task_id).await?
+                    {
+                        tasks.push(existing_task);
+                        continue;
+                    }
                     let primary_agent_id = self
                         .primary_agent_id_for_owner(&schedule.owner_user_id)
                         .await?;
@@ -3169,6 +3338,25 @@ impl Runtime {
         .await
     }
 
+    async fn status_cli_conversation_session(
+        &self,
+        user: &UserRow,
+        objective: &str,
+        requested_scope: MemoryScope,
+        queue_depth: i64,
+    ) -> Result<TaskRow> {
+        let session = self.resolve_cli_conversation_session(user).await?;
+        self.create_status_task(
+            user,
+            &format!("cli:{}", user.user_id),
+            objective,
+            &session,
+            requested_scope,
+            queue_depth,
+        )
+        .await
+    }
+
     pub(crate) async fn reset_connector_conversation_session(
         &self,
         user: &UserRow,
@@ -3185,6 +3373,26 @@ impl Runtime {
             objective,
             session,
             effective_scope,
+        )
+        .await
+    }
+
+    pub(crate) async fn status_connector_conversation_session(
+        &self,
+        user: &UserRow,
+        initiating_identity_id: &str,
+        objective: &str,
+        session: &ConversationSessionRow,
+        requested_scope: MemoryScope,
+        queue_depth: i64,
+    ) -> Result<TaskRow> {
+        self.create_status_task(
+            user,
+            initiating_identity_id,
+            objective,
+            session,
+            requested_scope,
+            queue_depth,
         )
         .await
     }
@@ -3675,6 +3883,36 @@ fn approval_action_is_expired(action: &beaverki_db::ApprovalActionRow) -> bool {
         .unwrap_or(false)
 }
 
+fn format_token_count(value: u64) -> String {
+    if value >= 1_000_000 {
+        format!("{:.1}M", value as f64 / 1_000_000.0)
+    } else if value >= 1_000 {
+        format!("{:.1}k", value as f64 / 1_000.0)
+    } else {
+        value.to_string()
+    }
+}
+
+fn relative_time_text(timestamp: &str) -> String {
+    let parsed =
+        DateTime::parse_from_rfc3339(timestamp).map(|timestamp| timestamp.with_timezone(&Utc));
+    let Ok(parsed) = parsed else {
+        return "at an unknown time".to_owned();
+    };
+    let age = Utc::now().signed_duration_since(parsed);
+    if age.num_seconds() < 30 {
+        "just now".to_owned()
+    } else if age.num_minutes() < 1 {
+        format!("{}s ago", age.num_seconds())
+    } else if age.num_hours() < 1 {
+        format!("{}m ago", age.num_minutes())
+    } else if age.num_days() < 1 {
+        format!("{}h ago", age.num_hours())
+    } else {
+        format!("{}d ago", age.num_days())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
@@ -3688,12 +3926,13 @@ mod tests {
         DiscordAllowedChannel, DiscordChannelMode, ProviderModels, RuntimeConfig, RuntimeDefaults,
         RuntimeFeatures, SessionManagementConfig,
     };
+    use beaverki_core::MemoryKind;
     use beaverki_models::{ConversationItem, ModelTurnResponse};
     use tempfile::TempDir;
     use tokio::time;
 
     use super::*;
-    use crate::session::SESSION_RESET_COMMAND;
+    use crate::session::{SESSION_RESET_COMMAND, SESSION_STATUS_COMMAND};
 
     static DIRECT_SEND_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
@@ -3787,7 +4026,20 @@ mod tests {
             providers: beaverki_config::ProvidersConfig {
                 version: 1,
                 active: "fake".to_owned(),
-                entries: vec![],
+                entries: vec![beaverki_config::ProviderEntry {
+                    provider_id: "fake".to_owned(),
+                    kind: "fake".to_owned(),
+                    auth: beaverki_config::ProviderAuth {
+                        mode: "api_token".to_owned(),
+                        secret_ref: "secret://local/fake_api_token".to_owned(),
+                    },
+                    models: ProviderModels {
+                        planner: "planner".to_owned(),
+                        executor: "executor".to_owned(),
+                        summarizer: "summarizer".to_owned(),
+                        safety_review: "safety".to_owned(),
+                    },
+                }],
             },
             integrations: beaverki_config::IntegrationsConfig::default(),
         };
@@ -3950,6 +4202,74 @@ mod tests {
         assert!(context.contains("new conversation"));
         assert!(!context.contains("Remember this topic"));
         assert!(session.last_reset_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn session_status_reports_usage_since_last_reset() {
+        let (_tempdir, runtime) = test_runtime(vec![]).await;
+        let user = runtime.default_user().clone();
+        let session = runtime
+            .resolve_cli_conversation_session(&user)
+            .await
+            .expect("cli session");
+        let primary_agent_id = user.primary_agent_id.clone().expect("primary agent id");
+        let initiating_identity_id = format!("cli:{}", user.user_id);
+        let task = runtime
+            .db
+            .create_task_with_params(NewTask {
+                owner_user_id: &user.user_id,
+                initiating_identity_id: &initiating_identity_id,
+                primary_agent_id: &primary_agent_id,
+                assigned_agent_id: &primary_agent_id,
+                parent_task_id: None,
+                session_id: Some(&session.session_id),
+                kind: "interactive",
+                objective: "Use some tokens",
+                context_summary: None,
+                scope: MemoryScope::Private,
+                wake_at: None,
+            })
+            .await
+            .expect("task");
+        runtime
+            .db
+            .append_task_event(
+                &task.task_id,
+                "model_turn_completed",
+                "agent",
+                &primary_agent_id,
+                json!({
+                    "input_tokens": 1200,
+                    "output_tokens": 45,
+                }),
+            )
+            .await
+            .expect("event");
+        runtime
+            .db
+            .complete_task(&task.task_id, "done")
+            .await
+            .expect("complete task");
+
+        let status = runtime
+            .status_cli_conversation_session(&user, SESSION_STATUS_COMMAND, MemoryScope::Private, 0)
+            .await
+            .expect("status task");
+        let result = status.result_text.as_deref().expect("status text");
+        assert!(result.contains("Tokens: 1.2k in / 45 out"));
+        assert!(result.contains("Context: 1.2k in-session | Compactions: 0"));
+
+        runtime
+            .reset_cli_conversation_session(&user, SESSION_RESET_COMMAND, MemoryScope::Private)
+            .await
+            .expect("reset");
+        let reset_status = runtime
+            .status_cli_conversation_session(&user, SESSION_STATUS_COMMAND, MemoryScope::Private, 0)
+            .await
+            .expect("status task after reset");
+        let reset_result = reset_status.result_text.as_deref().expect("status text");
+        assert!(reset_result.contains("Tokens: 0 in / 0 out"));
+        assert!(reset_result.contains("Context: 0 in-session | Compactions: 0"));
     }
 
     #[tokio::test]
@@ -4425,6 +4745,92 @@ mod tests {
             .expect("task");
         let context = latest_task.context_summary.as_deref().expect("context");
         assert!(!context.contains("Old DM message"));
+    }
+
+    #[tokio::test]
+    async fn discord_status_returns_session_summary_without_enqueuing_agent_work() {
+        let (_tempdir, mut runtime) = test_runtime(vec![]).await;
+        runtime.config.integrations.discord.task_wait_timeout_secs = 0;
+        runtime
+            .db
+            .upsert_connector_identity(
+                "discord",
+                "discord-user-status",
+                None,
+                "user_alex",
+                "authenticated_message",
+            )
+            .await
+            .expect("mapping");
+        let session = runtime
+            .resolve_connector_conversation_session("user_alex", "discord", "dm-status-1", true)
+            .await
+            .expect("session");
+        let primary_agent_id = runtime
+            .default_user()
+            .primary_agent_id
+            .clone()
+            .expect("primary agent id");
+        let task = runtime
+            .db
+            .create_task_with_params(NewTask {
+                owner_user_id: "user_alex",
+                initiating_identity_id: "discord:discord-user-status",
+                primary_agent_id: &primary_agent_id,
+                assigned_agent_id: &primary_agent_id,
+                parent_task_id: None,
+                session_id: Some(&session.session_id),
+                kind: "interactive",
+                objective: "Previous DM task",
+                context_summary: None,
+                scope: MemoryScope::Private,
+                wake_at: None,
+            })
+            .await
+            .expect("task");
+        runtime
+            .db
+            .append_task_event(
+                &task.task_id,
+                "model_turn_completed",
+                "agent",
+                &primary_agent_id,
+                json!({
+                    "input_tokens": 800,
+                    "output_tokens": 120,
+                }),
+            )
+            .await
+            .expect("event");
+        runtime
+            .db
+            .complete_task(&task.task_id, "done")
+            .await
+            .expect("complete");
+        let db = runtime.db.clone();
+        let daemon = RuntimeDaemon::new(runtime);
+
+        let reply = daemon
+            .handle_connector_message(ConnectorMessageRequest {
+                connector_type: "discord".to_owned(),
+                external_user_id: "discord-user-status".to_owned(),
+                external_display_name: Some("Alex".to_owned()),
+                channel_id: "dm-status-2".to_owned(),
+                message_id: "dm-status-msg-1".to_owned(),
+                content: SESSION_STATUS_COMMAND.to_owned(),
+                is_direct_message: true,
+            })
+            .await
+            .expect("status");
+
+        let reply_text = reply.reply.as_deref().expect("reply text");
+        assert!(reply_text.contains("Tokens: 800 in / 120 out"));
+        assert!(reply_text.contains("Queue: depth 0"));
+        let recent_tasks = db
+            .list_recent_interactive_tasks_for_owner("user_alex", 8)
+            .await
+            .expect("recent tasks");
+        assert_eq!(recent_tasks.len(), 1);
     }
 
     #[test]
