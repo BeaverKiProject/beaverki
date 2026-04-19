@@ -335,7 +335,7 @@ struct ApprovalListArgs {
     config_dir: Option<PathBuf>,
     #[arg(long)]
     user: Option<String>,
-    #[arg(long)]
+    #[arg(long, default_value = "pending")]
     status: Option<String>,
 }
 

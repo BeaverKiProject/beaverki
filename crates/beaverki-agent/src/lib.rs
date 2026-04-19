@@ -741,6 +741,7 @@ impl PrimaryAgentRunner {
             "lua_script_activate"
                 | "lua_script_schedule"
                 | "lua_tool_activate"
+                | "workflow_schedule"
                 | "household_schedule_message"
         ) && let ToolError::Denied { detail, .. } = &error
             && let Some(action_type) = detail.get("action_type").and_then(Value::as_str)
@@ -6627,6 +6628,166 @@ mod tests {
             .expect("schedule fetch")
             .expect("schedule");
         assert_eq!(schedule.target_id, "script_sched");
+    }
+
+    #[tokio::test]
+    async fn workflow_schedule_pauses_for_approval_and_resumes() {
+        let provider = FakeProvider::new(vec![
+            ModelTurnResponse {
+                output_items: vec![json!({
+                    "type": "function_call",
+                    "call_id": "call_workflow_schedule_wait",
+                    "name": "workflow_schedule",
+                    "arguments": "{\"workflow_id\":\"workflow_sched\",\"schedule_id\":\"sched_workflow_agent_test\",\"cron_expr\":\"TZ=Europe/Vienna 0 7 * * *\",\"enabled\":true}"
+                })],
+                tool_calls: vec![beaverki_models::ModelToolCall {
+                    call_id: "call_workflow_schedule_wait".to_owned(),
+                    name: "workflow_schedule".to_owned(),
+                    arguments: json!({
+                        "workflow_id": "workflow_sched",
+                        "schedule_id": "sched_workflow_agent_test",
+                        "cron_expr": "TZ=Europe/Vienna 0 7 * * *",
+                        "enabled": true
+                    }),
+                }],
+                output_text: String::new(),
+                usage: None,
+            },
+            ModelTurnResponse {
+                output_items: vec![json!({
+                    "type": "function_call",
+                    "call_id": "call_workflow_schedule_ok",
+                    "name": "workflow_schedule",
+                    "arguments": "{\"workflow_id\":\"workflow_sched\",\"schedule_id\":\"sched_workflow_agent_test\",\"cron_expr\":\"TZ=Europe/Vienna 0 7 * * *\",\"enabled\":true}"
+                })],
+                tool_calls: vec![beaverki_models::ModelToolCall {
+                    call_id: "call_workflow_schedule_ok".to_owned(),
+                    name: "workflow_schedule".to_owned(),
+                    arguments: json!({
+                        "workflow_id": "workflow_sched",
+                        "schedule_id": "sched_workflow_agent_test",
+                        "cron_expr": "TZ=Europe/Vienna 0 7 * * *",
+                        "enabled": true
+                    }),
+                }],
+                output_text: String::new(),
+                usage: None,
+            },
+            ModelTurnResponse {
+                output_items: vec![json!({
+                    "type": "message",
+                    "content": [{ "type": "output_text", "text": "workflow schedule complete" }]
+                })],
+                tool_calls: vec![],
+                output_text: "workflow schedule complete".to_owned(),
+                usage: None,
+            },
+        ]);
+        let (db, runner) = test_runner(provider).await;
+        let default_user = db.default_user().await.expect("default").expect("user");
+        let roles = db
+            .list_user_roles(&default_user.user_id)
+            .await
+            .expect("roles")
+            .into_iter()
+            .map(|row| row.role_id)
+            .collect::<Vec<_>>();
+        db.create_workflow_definition(
+            NewWorkflowDefinition {
+                workflow_id: Some("workflow_sched"),
+                owner_user_id: &default_user.user_id,
+                name: "Workflow sched",
+                description: Some("Schedule me"),
+                status: "active",
+                created_from_task_id: None,
+                safety_status: "approved",
+                safety_summary: Some("approved"),
+            },
+            &[NewWorkflowStage {
+                stage_id: Some("workflow_stage_notify"),
+                stage_kind: "user_notify",
+                stage_label: Some("Notify"),
+                artifact_ref: None,
+                stage_config_json: json!({}),
+            }],
+        )
+        .await
+        .expect("workflow");
+
+        let first = runner
+            .run_task(AgentRequest {
+                owner_user_id: default_user.user_id.clone(),
+                initiating_identity_id: format!("cli:{}", default_user.user_id),
+                primary_agent_id: default_user.primary_agent_id.clone().expect("agent"),
+                assigned_agent_id: default_user.primary_agent_id.clone().expect("agent"),
+                role_ids: roles.clone(),
+                objective: "Schedule a workflow".to_owned(),
+                scope: MemoryScope::Private,
+                kind: "interactive".to_owned(),
+                parent_task_id: None,
+                task_context: None,
+                visible_scopes: visible_memory_scopes(&roles),
+                memory_mode: AgentMemoryMode::ScopedRetrieval,
+                approved_shell_commands: Vec::new(),
+                approved_automation_actions: Vec::new(),
+            })
+            .await
+            .expect("first run");
+        assert_eq!(first.task.state, TaskState::WaitingApproval.as_str());
+
+        let approval = db
+            .list_approvals_for_user(&default_user.user_id, Some("pending"))
+            .await
+            .expect("approvals")
+            .into_iter()
+            .next()
+            .expect("approval");
+        assert_eq!(approval.action_type, "workflow_schedule");
+        db.resolve_approval(&approval.approval_id, "approved")
+            .await
+            .expect("approve");
+        let resumed_task = db
+            .fetch_task_for_owner(&default_user.user_id, &first.task.task_id)
+            .await
+            .expect("fetch task")
+            .expect("task");
+
+        let resumed = runner
+            .resume_task(
+                resumed_task,
+                AgentRequest {
+                    owner_user_id: default_user.user_id.clone(),
+                    initiating_identity_id: format!("cli:{}", default_user.user_id),
+                    primary_agent_id: default_user.primary_agent_id.clone().expect("agent"),
+                    assigned_agent_id: default_user.primary_agent_id.clone().expect("agent"),
+                    role_ids: roles.clone(),
+                    objective: "Schedule a workflow".to_owned(),
+                    scope: MemoryScope::Private,
+                    kind: "interactive".to_owned(),
+                    parent_task_id: None,
+                    task_context: None,
+                    visible_scopes: visible_memory_scopes(&roles),
+                    memory_mode: AgentMemoryMode::ScopedRetrieval,
+                    approved_shell_commands: Vec::new(),
+                    approved_automation_actions: approved_actions_for_task(
+                        &db,
+                        &default_user.user_id,
+                        &first.task.task_id,
+                    )
+                    .await,
+                },
+            )
+            .await
+            .expect("resume");
+
+        assert_eq!(resumed.task.state, TaskState::Completed.as_str());
+        let schedule = db
+            .fetch_schedule_for_owner(&default_user.user_id, "sched_workflow_agent_test")
+            .await
+            .expect("schedule fetch")
+            .expect("schedule");
+        assert_eq!(schedule.target_type, "workflow");
+        assert_eq!(schedule.target_id, "workflow_sched");
     }
 
     #[tokio::test]
