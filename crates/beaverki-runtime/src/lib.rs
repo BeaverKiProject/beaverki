@@ -5,7 +5,7 @@ use beaverki_config::{
     LoadedConfig, SessionLifecycleAction, SessionLifecyclePolicy, SessionPolicyMatchInput,
     select_session_lifecycle_policy,
 };
-use beaverki_core::{MemoryKind, MemoryScope, TaskState, now_rfc3339};
+use beaverki_core::{MemoryScope, TaskState, now_rfc3339};
 use beaverki_db::{
     ApprovalActionSet, ApprovalRow, BootstrapState, ConnectorIdentityRow, ConversationSessionRow,
     Database, IssueApprovalActions, MemoryRow, NewConversationSession, NewHouseholdDelivery,
@@ -1472,12 +1472,11 @@ impl Runtime {
                         "schedule_id": schedule.schedule_id,
                     })
                     .to_string();
-                    if let Some(existing_task_id) = occurrence.materialized_task_id.as_deref() {
-                        if let Some(existing_task) = self.db.fetch_task(existing_task_id).await? {
+                    if let Some(existing_task_id) = occurrence.materialized_task_id.as_deref()
+                        && let Some(existing_task) = self.db.fetch_task(existing_task_id).await? {
                             tasks.push(existing_task);
                             continue;
                         }
-                    }
                     let primary_agent_id = self
                         .primary_agent_id_for_owner(&schedule.owner_user_id)
                         .await?;
