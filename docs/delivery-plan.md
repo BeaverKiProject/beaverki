@@ -471,6 +471,9 @@ Goal:
 
 Extend the scheduler from single-target Lua execution into reviewed durable workflow pipelines so cron and reminder features can combine multiple Lua stages with later bounded agent interaction.
 
+Example use case:
+- A user asks their agent to "fetch news from orf.at and give me a news digest every morning at 8am"
+
 Status:
 
 - proposed after M5.5
