@@ -100,7 +100,9 @@ impl HouseholdDeliveryDelegate for RuntimeHouseholdDeliveryDelegate {
             )));
         }
         if delivery.status == "dispatching" && delivery.delivered_at.is_none() {
-            let send_result = self.send_household_delivery(&delivery, &identity, &requester).await;
+            let send_result = self
+                .send_household_delivery(&delivery, &identity, &requester)
+                .await;
             match send_result {
                 Ok(sent) => {
                     self.db

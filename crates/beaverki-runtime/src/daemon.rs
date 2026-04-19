@@ -809,7 +809,10 @@ impl RuntimeDaemon {
             }
             DaemonRequest::ShowTask { user_id, task_id } => Ok((
                 DaemonResponse::Inspection {
-                    inspection: self.runtime.inspect_task(user_id.as_deref(), &task_id).await?,
+                    inspection: self
+                        .runtime
+                        .inspect_task(user_id.as_deref(), &task_id)
+                        .await?,
                 },
                 false,
             )),
@@ -838,7 +841,10 @@ impl RuntimeDaemon {
             )),
             DaemonRequest::ShowMemory { user_id, memory_id } => Ok((
                 DaemonResponse::Memory {
-                    memory: self.runtime.inspect_memory(user_id.as_deref(), &memory_id).await?,
+                    memory: self
+                        .runtime
+                        .inspect_memory(user_id.as_deref(), &memory_id)
+                        .await?,
                 },
                 false,
             )),
@@ -925,7 +931,11 @@ impl RuntimeDaemon {
         }
     }
 
-    pub(crate) async fn wait_for_task_state(&self, owner_user_id: &str, task_id: &str) -> Result<TaskRow> {
+    pub(crate) async fn wait_for_task_state(
+        &self,
+        owner_user_id: &str,
+        task_id: &str,
+    ) -> Result<TaskRow> {
         loop {
             let task = self
                 .runtime
@@ -1061,7 +1071,10 @@ impl RuntimeDaemon {
             )
             .await?;
 
-        if tokio::fs::try_exists(&self.socket_path).await.unwrap_or(false) {
+        if tokio::fs::try_exists(&self.socket_path)
+            .await
+            .unwrap_or(false)
+        {
             tokio::fs::remove_file(&self.socket_path)
                 .await
                 .with_context(|| format!("failed to remove {}", self.socket_path.display()))?;
@@ -1112,7 +1125,9 @@ impl RuntimeDaemon {
 
 pub async fn load_daemon_client(config_dir: impl AsRef<Path>) -> Result<DaemonClient> {
     let config = LoadedConfig::load_from_dir(config_dir)?;
-    Ok(DaemonClient::new(config.runtime.state_dir.join("daemon.sock")))
+    Ok(DaemonClient::new(
+        config.runtime.state_dir.join("daemon.sock"),
+    ))
 }
 
 pub async fn latest_daemon_status(config_dir: impl AsRef<Path>) -> Result<Option<DaemonStatus>> {

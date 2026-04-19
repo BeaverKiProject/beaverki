@@ -1,9 +1,5 @@
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use anyhow::{Context, Result, anyhow, bail};
-use beaverki_agent::{
-    AgentMemoryMode, AgentRequest, AgentResult, PrimaryAgentRunner,
-};
+use beaverki_agent::{AgentMemoryMode, AgentRequest, AgentResult, PrimaryAgentRunner};
 use beaverki_automation as automation;
 use beaverki_config::{
     LoadedConfig, SessionLifecycleAction, SessionLifecyclePolicy, SessionPolicyMatchInput,
@@ -12,12 +8,11 @@ use beaverki_config::{
 use beaverki_core::{MemoryKind, MemoryScope, TaskState, now_rfc3339};
 use beaverki_db::{
     ApprovalActionSet, ApprovalRow, BootstrapState, ConnectorIdentityRow, ConversationSessionRow,
-    Database, IssueApprovalActions, MemoryRow, NewConversationSession,
-    NewHouseholdDelivery, NewSchedule, NewScript, NewScriptReview, NewTask,
-    NewWorkflowDefinition, NewWorkflowReview, NewWorkflowRun, NewWorkflowStage, RoleRow,
-    RuntimeHeartbeatRow, RuntimeSessionRow, ScheduleRow, ScriptReviewRow, ScriptRow, TaskRow,
-    UpdateWorkflowDefinition, UserRoleRow, UserRow, WorkflowDefinitionRow, WorkflowReviewRow,
-    WorkflowRunRow, WorkflowStageRow,
+    Database, IssueApprovalActions, MemoryRow, NewConversationSession, NewHouseholdDelivery,
+    NewSchedule, NewScript, NewScriptReview, NewTask, NewWorkflowDefinition, NewWorkflowReview,
+    NewWorkflowRun, NewWorkflowStage, RoleRow, RuntimeHeartbeatRow, RuntimeSessionRow, ScheduleRow,
+    ScriptReviewRow, ScriptRow, TaskRow, UpdateWorkflowDefinition, UserRoleRow, UserRow,
+    WorkflowDefinitionRow, WorkflowReviewRow, WorkflowRunRow, WorkflowStageRow,
 };
 use beaverki_memory::MemoryStore;
 use beaverki_models::ModelProvider;
@@ -28,6 +23,8 @@ use beaverki_policy::{
 use beaverki_tools::{ToolContext, builtin_registry, validate_json_value_against_schema};
 use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tracing::info;
 
 mod connector_support;
@@ -40,8 +37,8 @@ mod types;
 mod workflow;
 
 pub use self::daemon::{
-    ConnectorMessageReply, ConnectorMessageRequest, DaemonClient, DaemonRequest,
-    DaemonResponse, DaemonStatus, RuntimeDaemon, latest_daemon_status, load_daemon_client,
+    ConnectorMessageReply, ConnectorMessageRequest, DaemonClient, DaemonRequest, DaemonResponse,
+    DaemonStatus, RuntimeDaemon, latest_daemon_status, load_daemon_client,
 };
 pub use self::types::{
     MemoryInspection, RemoteApprovalActionOutcome, ScriptInspection, SessionLifecycleExecution,
@@ -53,13 +50,12 @@ use self::delivery::{RuntimeHouseholdDeliveryDelegate, tool_error_to_anyhow};
 use self::secrets::{load_discord_bot_token, load_provider};
 use self::session::{
     CLI_CONVERSATION_HISTORY_LIMIT, CliConversationExchange, CliConversationStatus,
-    SESSION_AUDIENCE_DIRECT_USER, SESSION_AUDIENCE_SCHEDULED_RUN,
-    SESSION_KIND_CLI, SESSION_KIND_CRON_RUN, SESSION_KIND_DIRECT_MESSAGE,
-    SESSION_KIND_GROUP_ROOM, SESSION_LIFECYCLE_REASON_MANUAL_RESET, build_cli_task_context,
-    cap_scopes_to_session, cap_task_scope_to_session,
-    cli_conversation_status, connector_group_room_policy, ensure_memory_visible_to_user,
-    is_session_reset_command, parse_memory_kind_filter, parse_session_max_scope,
-    resolve_visible_memory_scopes, session_lifecycle_is_due,
+    SESSION_AUDIENCE_DIRECT_USER, SESSION_AUDIENCE_SCHEDULED_RUN, SESSION_KIND_CLI,
+    SESSION_KIND_CRON_RUN, SESSION_KIND_DIRECT_MESSAGE, SESSION_KIND_GROUP_ROOM,
+    SESSION_LIFECYCLE_REASON_MANUAL_RESET, build_cli_task_context, cap_scopes_to_session,
+    cap_task_scope_to_session, cli_conversation_status, connector_group_room_policy,
+    ensure_memory_visible_to_user, is_session_reset_command, parse_memory_kind_filter,
+    parse_session_max_scope, resolve_visible_memory_scopes, session_lifecycle_is_due,
 };
 use self::workflow::{
     apply_stage_result, parse_json_field, validate_workflow_definition_input,

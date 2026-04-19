@@ -1,5 +1,7 @@
 use anyhow::{Context, Result, anyhow, bail};
-use beaverki_config::{DiscordChannelMode, LoadedConfig, SessionLifecycleAction, SessionLifecyclePolicy};
+use beaverki_config::{
+    DiscordChannelMode, LoadedConfig, SessionLifecycleAction, SessionLifecyclePolicy,
+};
 use beaverki_core::{MemoryKind, MemoryScope, TaskState};
 use beaverki_db::{ConversationSessionRow, MemoryRow};
 use beaverki_policy::visible_memory_scopes;
@@ -244,10 +246,7 @@ pub(crate) fn build_cli_task_context(recent_exchanges: &[CliConversationExchange
     context
 }
 
-pub(crate) fn cli_conversation_status(
-    state: &str,
-    created_at: &str,
-) -> CliConversationStatus {
+pub(crate) fn cli_conversation_status(state: &str, created_at: &str) -> CliConversationStatus {
     if matches!(
         state.parse::<TaskState>(),
         Ok(TaskState::Pending | TaskState::Running | TaskState::WaitingApproval)
