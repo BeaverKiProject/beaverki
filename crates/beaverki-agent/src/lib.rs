@@ -3164,6 +3164,7 @@ impl PrimaryAgentRunner {
                 "workflow_write requires at least one stage"
             )));
         }
+        let mut prior_status = None::<String>;
         let stage_rows = stage_inputs
             .iter()
             .map(|stage| NewWorkflowStage {
@@ -3175,13 +3176,13 @@ impl PrimaryAgentRunner {
             })
             .collect::<Vec<_>>();
         let workflow = if let Some(existing_id) = workflow_id.as_deref()
-            && self
+            && let Some(existing_workflow) = self
                 .db
                 .fetch_workflow_definition_for_owner(&request.owner_user_id, existing_id)
                 .await
                 .map_err(ToolError::Failed)?
-                .is_some()
         {
+            prior_status = Some(existing_workflow.status);
             self.db
                 .update_workflow_definition_contents(
                     beaverki_db::UpdateWorkflowDefinition {
@@ -3233,7 +3234,13 @@ impl PrimaryAgentRunner {
         )
         .await
         .map_err(ToolError::Failed)?;
-        let application = automation::apply_script_review(&review, "draft", Some("draft"));
+        let approved_status = if prior_status.as_deref() == Some("active") {
+            "active"
+        } else {
+            "draft"
+        };
+        let application =
+            automation::apply_script_review(&review, approved_status, prior_status.as_deref());
         self.db
             .update_workflow_definition_safety(
                 &workflow.workflow_id,
@@ -3265,6 +3272,8 @@ impl PrimaryAgentRunner {
                 json!({
                     "task_id": task.task_id,
                     "workflow_id": workflow.workflow_id,
+                    "prior_status": prior_status,
+                    "reactivated_after_rewrite": application.reactivated_after_rewrite,
                     "stage_count": stage_inputs.len(),
                     "current_version_number": workflow.current_version_number,
                     "safety_status": application.safety_status,
@@ -7700,6 +7709,107 @@ mod tests {
             .expect("fetch workflow")
             .expect("workflow");
         assert_eq!(workflow.status, "active");
+    }
+
+    #[tokio::test]
+    async fn rewriting_active_workflow_keeps_it_active_after_approved_review() {
+        let provider = FakeProvider::new(vec![ModelTurnResponse {
+            output_items: vec![json!({
+                "type": "message",
+                "content": [{
+                    "type": "output_text",
+                    "text": "{\"verdict\":\"approved\",\"risk_level\":\"low\",\"findings\":[],\"required_changes\":[],\"summary\":\"The rewritten workflow matches the stated intent.\"}"
+                }]
+            })],
+            tool_calls: vec![],
+            output_text: "{\"verdict\":\"approved\",\"risk_level\":\"low\",\"findings\":[],\"required_changes\":[],\"summary\":\"The rewritten workflow matches the stated intent.\"}".to_owned(),
+            usage: None,
+        }]);
+        let (db, runner) = test_runner(provider).await;
+        let default_user = db.default_user().await.expect("default").expect("user");
+        let roles = db
+            .list_user_roles(&default_user.user_id)
+            .await
+            .expect("roles")
+            .into_iter()
+            .map(|row| row.role_id)
+            .collect::<Vec<_>>();
+        let task = db
+            .create_task_with_params(NewTask {
+                owner_user_id: &default_user.user_id,
+                initiating_identity_id: &format!("cli:{}", default_user.user_id),
+                primary_agent_id: default_user.primary_agent_id.as_deref().expect("agent"),
+                assigned_agent_id: default_user.primary_agent_id.as_deref().expect("agent"),
+                parent_task_id: None,
+                session_id: None,
+                kind: "interactive",
+                objective: "Rewrite an active workflow",
+                context_summary: None,
+                scope: MemoryScope::Private,
+                wake_at: None,
+            })
+            .await
+            .expect("task");
+        db.create_workflow_definition(
+            NewWorkflowDefinition {
+                workflow_id: Some("workflow_active_rewrite"),
+                owner_user_id: &default_user.user_id,
+                name: "Rewrite me",
+                description: Some("Initial version"),
+                status: "active",
+                created_from_task_id: Some(&task.task_id),
+                safety_status: "approved",
+                safety_summary: Some("approved"),
+            },
+            &[NewWorkflowStage {
+                stage_id: Some("workflow_stage_notify_v1"),
+                stage_kind: "user_notify",
+                stage_label: Some("Notify"),
+                artifact_ref: None,
+                stage_config_json: json!({"message": "v1"}),
+            }],
+        )
+        .await
+        .expect("workflow");
+
+        let payload = runner
+            .handle_workflow_write(
+                &task,
+                &test_request(
+                    &default_user,
+                    &roles,
+                    "Rewrite an active workflow",
+                    Vec::new(),
+                ),
+                json!({
+                    "workflow_id": "workflow_active_rewrite",
+                    "name": "Rewrite me",
+                    "description": "Updated version",
+                    "stages": [{
+                        "kind": "user_notify",
+                        "label": "Notify",
+                        "artifact_ref": null,
+                        "config": "{\"message\":\"v2\"}"
+                    }],
+                    "intended_behavior_summary": "Update the active workflow to notify with the new message."
+                }),
+            )
+            .await
+            .expect("workflow write should succeed")
+            .payload;
+
+        assert_eq!(payload["workflow_id"], json!("workflow_active_rewrite"));
+        assert_eq!(payload["status"], json!("active"));
+        assert_eq!(payload["safety_status"], json!("approved"));
+
+        let workflow = db
+            .fetch_workflow_definition_for_owner(&default_user.user_id, "workflow_active_rewrite")
+            .await
+            .expect("fetch workflow")
+            .expect("workflow");
+        assert_eq!(workflow.status, "active");
+        assert_eq!(workflow.safety_status, "approved");
+        assert_eq!(workflow.current_version_number, 2);
     }
 
     #[tokio::test]
