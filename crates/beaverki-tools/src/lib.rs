@@ -14,6 +14,10 @@ use tokio::process::Command;
 use tokio::time::timeout;
 use walkdir::WalkDir;
 
+mod notion;
+
+use self::notion::{NotionCreatePageTool, NotionFetchTool, NotionSearchTool};
+
 #[derive(Debug, Clone)]
 pub struct ToolDefinition {
     pub name: String,
@@ -357,6 +361,9 @@ pub struct ToolContext {
     pub browser_interactive_launcher: Option<String>,
     pub browser_headless_program: Option<String>,
     pub browser_headless_args: Vec<String>,
+    pub notion_api_base_url: Option<String>,
+    pub notion_api_version: Option<String>,
+    pub notion_api_token: Option<String>,
 }
 
 impl ToolContext {
@@ -370,6 +377,9 @@ impl ToolContext {
             browser_interactive_launcher: None,
             browser_headless_program: None,
             browser_headless_args: Vec::new(),
+            notion_api_base_url: None,
+            notion_api_version: None,
+            notion_api_token: None,
         }
     }
 }
@@ -471,6 +481,9 @@ pub fn builtin_registry() -> ToolRegistry {
     registry.register(WriteTextTool);
     registry.register(SearchFilesTool);
     registry.register(BrowserVisitTool);
+    registry.register(NotionSearchTool);
+    registry.register(NotionFetchTool);
+    registry.register(NotionCreatePageTool);
     registry
 }
 
@@ -962,7 +975,7 @@ fn normalize_path(path: &Path) -> PathBuf {
     normalized
 }
 
-fn truncate_text(text: &str, max_chars: usize) -> String {
+pub(crate) fn truncate_text(text: &str, max_chars: usize) -> String {
     if text.chars().count() <= max_chars {
         text.to_owned()
     } else {

@@ -376,10 +376,12 @@ dependencies = [
  "async-trait",
  "beaverki-core",
  "beaverki-policy",
+ "reqwest",
  "serde",
  "serde_json",
  "tempfile",
  "tokio",
+ "uuid",
  "walkdir",
 ]
 

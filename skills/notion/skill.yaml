@@ -1,0 +1,72 @@
+tools:
+  - tool_id: notion_workspace_search
+    kind: lua
+    description: Search the configured Notion workspace for pages or data sources related to a query.
+    source_path: notion_workspace_search.lua
+    input_schema:
+      type: object
+      properties:
+        query:
+          type: string
+        object_kind:
+          type: [string, "null"]
+          enum: [page, data_source, null]
+        page_size:
+          type: [integer, "null"]
+          minimum: 1
+          maximum: 100
+      required: [query, object_kind, page_size]
+      additionalProperties: false
+    output_schema:
+      type: object
+      additionalProperties: true
+    capability_profile:
+      allowed_tools: [notion_search]
+  - tool_id: notion_read_entry
+    kind: lua
+    description: Fetch a Notion page or data source by ID or URL, with optional page content included.
+    source_path: notion_read_entry.lua
+    input_schema:
+      type: object
+      properties:
+        ref:
+          type: string
+        object_kind:
+          type: [string, "null"]
+          enum: [page, data_source, null]
+        include_content:
+          type: [boolean, "null"]
+        page_size:
+          type: [integer, "null"]
+          minimum: 1
+          maximum: 100
+      required: [ref, object_kind, include_content, page_size]
+      additionalProperties: false
+    output_schema:
+      type: object
+      additionalProperties: true
+    capability_profile:
+      allowed_tools: [notion_fetch]
+  - tool_id: notion_capture_note
+    kind: lua
+    description: Create a new Notion page under a parent page or data source using a title and optional plain-text body.
+    source_path: notion_capture_note.lua
+    input_schema:
+      type: object
+      properties:
+        parent_kind:
+          type: string
+          enum: [page, data_source]
+        parent_ref:
+          type: string
+        title:
+          type: string
+        content:
+          type: [string, "null"]
+      required: [parent_kind, parent_ref, title, content]
+      additionalProperties: false
+    output_schema:
+      type: object
+      additionalProperties: true
+    capability_profile:
+      allowed_tools: [notion_create_page]

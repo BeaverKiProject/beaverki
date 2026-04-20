@@ -110,6 +110,9 @@ pub struct LuaExecutionInput {
     pub browser_interactive_launcher: Option<String>,
     pub browser_headless_program: Option<String>,
     pub browser_headless_args: Vec<String>,
+    pub notion_api_base_url: Option<String>,
+    pub notion_api_version: Option<String>,
+    pub notion_api_token: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -366,6 +369,9 @@ pub async fn execute_lua_script(input: LuaExecutionInput) -> Result<LuaExecution
     let db = input.db.clone();
     let working_dir = input.working_dir.clone();
     let tool_roots = allowed_roots.clone();
+    let notion_api_base_url = input.notion_api_base_url.clone();
+    let notion_api_version = input.notion_api_version.clone();
+    let notion_api_token = input.notion_api_token.clone();
     let deferred_until = Arc::new(Mutex::new(None::<String>));
     let notifications = Arc::new(Mutex::new(Vec::<String>::new()));
     let logs = Arc::new(Mutex::new(Vec::<String>::new()));
@@ -515,6 +521,9 @@ pub async fn execute_lua_script(input: LuaExecutionInput) -> Result<LuaExecution
         let browser_interactive_launcher = input.browser_interactive_launcher.clone();
         let browser_headless_program = input.browser_headless_program.clone();
         let browser_headless_args = input.browser_headless_args.clone();
+        let notion_api_base_url = notion_api_base_url.clone();
+        let notion_api_version = notion_api_version.clone();
+        let notion_api_token = notion_api_token.clone();
         let function = lua
             .create_function(move |lua, (name, args): (String, LuaValue)| {
                 if let Some(allowed_tools) = &allowed_tools
@@ -532,6 +541,9 @@ pub async fn execute_lua_script(input: LuaExecutionInput) -> Result<LuaExecution
                 tool_context.browser_interactive_launcher = browser_interactive_launcher.clone();
                 tool_context.browser_headless_program = browser_headless_program.clone();
                 tool_context.browser_headless_args = browser_headless_args.clone();
+                tool_context.notion_api_base_url = notion_api_base_url.clone();
+                tool_context.notion_api_version = notion_api_version.clone();
+                tool_context.notion_api_token = notion_api_token.clone();
                 let registry = builtin_registry();
                 let handle = tokio::runtime::Handle::current();
                 let output = tokio::task::block_in_place(|| {

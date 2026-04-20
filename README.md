@@ -35,6 +35,8 @@ BeaverKi already has a usable local runtime foundation. Today the repository inc
 - private and household memory scopes enforced at retrieval time
 - CLI-first setup, daemon lifecycle, and task execution
 - shell, filesystem, and browser tools for the primary agent
+- filesystem-packaged Lua skill loading, including a starter Notion skill pack
+- Notion API-backed workspace search, fetch, and page creation tools
 - Discord connector setup, identity mapping, DM intake, allowlisted channel intake, and approval routing
 - Lua scripting with review and activation flow
 - CI for formatting and tests, plus tag-driven GitHub Releases
@@ -120,7 +122,11 @@ The shortest path is to use the Makefile targets for setup and daily operations,
 
 	Store a bot token, enable the connector, then map each Discord user ID to a BeaverKi user. Direct messages are accepted by default; guild messages are accepted only from allowlisted channel IDs and should either start with the configured prefix or include a direct bot mention. For the full setup flow, see [Discord Setup Guide](docs/discord-setup.md).
 
-9. Stop the daemon when you are done.
+9. Optionally enable the Notion integration and starter skill pack.
+
+	Store a Notion API token, enable the integration, and let the agent use the built-in `notion_*` tools or the packaged `skills/notion` wrappers. For the setup flow and current scope, see [Notion Setup Guide](docs/notion-setup.md).
+
+10. Stop the daemon when you are done.
 
 	```bash
 	make daemon-stop
@@ -132,6 +138,7 @@ For the direct CLI forms of these commands, model configuration, memory inspecti
 
 - [CLI and Operations Guide](docs/cli-operations.md)
 - [Discord Setup Guide](docs/discord-setup.md)
+- [Notion Setup Guide](docs/notion-setup.md)
 - [Product Design](docs/design.md)
 - [V1 Technical Spec](docs/technical-spec.md)
 - [Delivery Plan](docs/delivery-plan.md)

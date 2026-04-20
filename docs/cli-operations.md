@@ -304,6 +304,37 @@ If you are configuring the bot from scratch, make sure the Discord application h
 - access to the server and channels you intend to allowlist
 - permissions that let it read messages, send replies, read channel history, and add reactions in the channels where BeaverKi will operate
 
+## Notion Integration
+
+BeaverKi currently integrates with Notion through the official Notion REST API and encrypted local token storage. This is a better fit for BeaverKi's background automation than Notion's hosted MCP server, which currently uses interactive OAuth.
+
+Inspect the current Notion integration configuration:
+
+```bash
+cargo run -p beaverki-cli -- integration notion show
+```
+
+Enable Notion and store the API token from `NOTION_API_TOKEN` or from an interactive prompt:
+
+```bash
+cargo run -p beaverki-cli -- integration notion configure --enable
+```
+
+If the BeaverKi daemon is already running, restart it after changing the Notion integration so the runtime reloads the token from encrypted storage.
+
+Override the API version or base URL if needed:
+
+```bash
+cargo run -p beaverki-cli -- integration notion configure \
+  --api-version 2026-03-11 \
+  --api-base-url https://api.notion.com/v1
+```
+
+Once enabled, the agent can use:
+
+- built-in tools: `notion_search`, `notion_fetch`, `notion_create_page`
+- packaged skill wrappers from `skills/notion`: `notion_workspace_search`, `notion_read_entry`, `notion_capture_note`
+
 ## Lua Automation And Schedules
 
 Create and inspect a Lua script:

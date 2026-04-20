@@ -48,7 +48,7 @@ pub use self::workflow::parse_workflow_stage_config;
 
 use self::connector_support::assistant_reply_for_context;
 use self::delivery::{RuntimeHouseholdDeliveryDelegate, tool_error_to_anyhow};
-use self::secrets::{load_discord_bot_token, load_provider};
+use self::secrets::{load_discord_bot_token, load_notion_api_token, load_provider};
 use self::session::{
     CLI_CONVERSATION_HISTORY_LIMIT, CliConversationExchange, CliConversationStatus,
     SESSION_AUDIENCE_DIRECT_USER, SESSION_AUDIENCE_SCHEDULED_RUN, SESSION_KIND_CLI,
@@ -75,6 +75,7 @@ pub struct Runtime {
     provider: Arc<dyn ModelProvider>,
     runner: PrimaryAgentRunner,
     discord_bot_token: Option<String>,
+    notion_api_token: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -165,7 +166,15 @@ impl Runtime {
             .ok_or_else(|| anyhow!("runtime database has no bootstrap user; run setup first"))?;
         let provider = Arc::new(load_provider(&config, passphrase)?) as Arc<dyn ModelProvider>;
         let discord_bot_token = load_discord_bot_token(&config, passphrase)?;
-        Self::from_parts_with_secrets(config, db, default_user, provider, discord_bot_token)
+        let notion_api_token = load_notion_api_token(&config, passphrase)?;
+        Self::from_parts_with_secrets(
+            config,
+            db,
+            default_user,
+            provider,
+            discord_bot_token,
+            notion_api_token,
+        )
     }
 
     pub fn from_parts(
@@ -174,7 +183,7 @@ impl Runtime {
         default_user: UserRow,
         provider: Arc<dyn ModelProvider>,
     ) -> Result<Self> {
-        Self::from_parts_with_secrets(config, db, default_user, provider, None)
+        Self::from_parts_with_secrets(config, db, default_user, provider, None, None)
     }
 
     fn from_parts_with_secrets(
@@ -183,6 +192,7 @@ impl Runtime {
         default_user: UserRow,
         provider: Arc<dyn ModelProvider>,
         discord_bot_token: Option<String>,
+        notion_api_token: Option<String>,
     ) -> Result<Self> {
         let memory = MemoryStore::new(db.clone());
         let mut allowed_roots = vec![config.runtime.workspace_root.clone()];
@@ -197,6 +207,12 @@ impl Runtime {
         tool_context.browser_headless_program =
             config.integrations.browser.headless_browser.clone();
         tool_context.browser_headless_args = config.integrations.browser.headless_args.clone();
+        if config.integrations.notion.enabled {
+            tool_context.notion_api_base_url =
+                Some(config.integrations.notion.api_base_url.clone());
+            tool_context.notion_api_version = Some(config.integrations.notion.api_version.clone());
+            tool_context.notion_api_token = notion_api_token.clone();
+        }
         let household_delivery_delegate = Arc::new(RuntimeHouseholdDeliveryDelegate {
             db: db.clone(),
             runtime_actor_id: config.runtime.instance_id.clone(),
@@ -219,6 +235,7 @@ impl Runtime {
             provider,
             runner,
             discord_bot_token,
+            notion_api_token,
         })
     }
 
@@ -2288,6 +2305,19 @@ impl Runtime {
                             .browser
                             .headless_args
                             .clone(),
+                        notion_api_base_url: self
+                            .config
+                            .integrations
+                            .notion
+                            .enabled
+                            .then(|| self.config.integrations.notion.api_base_url.clone()),
+                        notion_api_version: self
+                            .config
+                            .integrations
+                            .notion
+                            .enabled
+                            .then(|| self.config.integrations.notion.api_version.clone()),
+                        notion_api_token: self.notion_api_token.clone(),
                     })
                     .await
                     {
@@ -2412,6 +2442,19 @@ impl Runtime {
                             .browser
                             .headless_args
                             .clone(),
+                        notion_api_base_url: self
+                            .config
+                            .integrations
+                            .notion
+                            .enabled
+                            .then(|| self.config.integrations.notion.api_base_url.clone()),
+                        notion_api_version: self
+                            .config
+                            .integrations
+                            .notion
+                            .enabled
+                            .then(|| self.config.integrations.notion.api_version.clone()),
+                        notion_api_token: self.notion_api_token.clone(),
                     })
                     .await
                     {
@@ -2759,6 +2802,19 @@ impl Runtime {
                 .clone(),
             browser_headless_program: self.config.integrations.browser.headless_browser.clone(),
             browser_headless_args: self.config.integrations.browser.headless_args.clone(),
+            notion_api_base_url: self
+                .config
+                .integrations
+                .notion
+                .enabled
+                .then(|| self.config.integrations.notion.api_base_url.clone()),
+            notion_api_version: self
+                .config
+                .integrations
+                .notion
+                .enabled
+                .then(|| self.config.integrations.notion.api_version.clone()),
+            notion_api_token: self.notion_api_token.clone(),
         })
         .await;
         let execution = match execution {
@@ -3912,6 +3968,70 @@ fn relative_time_text(timestamp: &str) -> String {
     } else {
         format!("{}d ago", age.num_days())
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct NotionBotInfo {
+    pub bot_name: String,
+    pub workspace_name: Option<String>,
+}
+
+pub async fn verify_notion_integration(
+    config: &LoadedConfig,
+    passphrase: &str,
+) -> Result<NotionBotInfo> {
+    let api_token = load_notion_api_token(config, passphrase)?
+        .ok_or_else(|| anyhow!("Notion integration is not enabled or not configured"))?;
+    let base_url = config
+        .integrations
+        .notion
+        .api_base_url
+        .trim_end_matches('/');
+    let api_version = &config.integrations.notion.api_version;
+    let url = format!("{base_url}/users/me");
+
+    let client = reqwest::Client::builder()
+        .user_agent("BeaverKi/0.1")
+        .build()
+        .context("failed to build HTTP client")?;
+    let response = client
+        .get(&url)
+        .bearer_auth(&api_token)
+        .header("Notion-Version", api_version)
+        .header("Accept", "application/json")
+        .send()
+        .await
+        .context("failed to reach Notion API")?;
+
+    let status = response.status();
+    let body: serde_json::Value = response
+        .json()
+        .await
+        .context("failed to parse Notion API response")?;
+
+    if !status.is_success() {
+        let msg = body
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown error");
+        bail!("Notion API returned {status}: {msg}");
+    }
+
+    let bot_name = body
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("(unknown)")
+        .to_owned();
+    let workspace_name = body
+        .get("bot")
+        .and_then(|bot| bot.get("workspace_name"))
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned);
+
+    Ok(NotionBotInfo {
+        bot_name,
+        workspace_name,
+    })
 }
 
 #[cfg(test)]

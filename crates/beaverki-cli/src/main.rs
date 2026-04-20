@@ -42,6 +42,10 @@ enum Commands {
         #[command(subcommand)]
         command: Box<ConnectorCommand>,
     },
+    Integration {
+        #[command(subcommand)]
+        command: Box<IntegrationCommand>,
+    },
     Daemon {
         #[command(subcommand)]
         command: Box<DaemonCommand>,
@@ -130,6 +134,14 @@ enum ConnectorCommand {
 }
 
 #[derive(Subcommand)]
+enum IntegrationCommand {
+    Notion {
+        #[command(subcommand)]
+        command: Box<NotionCommand>,
+    },
+}
+
+#[derive(Subcommand)]
 enum DiscordCommand {
     Show(ConfigDirArgs),
     ListChannels(ConfigDirArgs),
@@ -138,6 +150,12 @@ enum DiscordCommand {
     RemoveChannel(DiscordChannelRemoveArgs),
     MapUser(DiscordMapUserArgs),
     ListMappings(ConfigDirArgs),
+}
+
+#[derive(Subcommand)]
+enum NotionCommand {
+    Show(NotionShowArgs),
+    Configure(NotionConfigureArgs),
 }
 
 #[derive(Subcommand)]
@@ -469,6 +487,32 @@ struct DiscordConfigureArgs {
 }
 
 #[derive(Args, Clone)]
+struct NotionShowArgs {
+    #[arg(long)]
+    config_dir: Option<PathBuf>,
+    #[arg(long, default_value = "BEAVERKI_MASTER_PASSPHRASE")]
+    passphrase_env: String,
+}
+
+#[derive(Args, Clone)]
+struct NotionConfigureArgs {
+    #[arg(long)]
+    config_dir: Option<PathBuf>,
+    #[arg(long, default_value_t = false)]
+    enable: bool,
+    #[arg(long, default_value_t = false)]
+    disable: bool,
+    #[arg(long)]
+    api_base_url: Option<String>,
+    #[arg(long)]
+    api_version: Option<String>,
+    #[arg(long, default_value = "NOTION_API_TOKEN")]
+    notion_token_env: String,
+    #[arg(long, default_value = "BEAVERKI_MASTER_PASSPHRASE")]
+    passphrase_env: String,
+}
+
+#[derive(Args, Clone)]
 struct DiscordChannelAddArgs {
     #[arg(long)]
     config_dir: Option<PathBuf>,
@@ -716,6 +760,12 @@ async fn main() -> Result<()> {
                 DiscordCommand::RemoveChannel(args) => discord_remove_channel(args).await,
                 DiscordCommand::MapUser(args) => discord_map_user(args).await,
                 DiscordCommand::ListMappings(args) => discord_list_mappings(args).await,
+            },
+        },
+        Commands::Integration { command } => match *command {
+            IntegrationCommand::Notion { command } => match *command {
+                NotionCommand::Show(args) => notion_show(args).await,
+                NotionCommand::Configure(args) => notion_configure(args).await,
             },
         },
         Commands::Daemon { command } => match *command {
@@ -2428,6 +2478,127 @@ async fn discord_list_channels(args: ConfigDirArgs) -> Result<()> {
     for line in lines {
         println!("{line}");
     }
+    Ok(())
+}
+
+async fn notion_show(args: NotionShowArgs) -> Result<()> {
+    let config_dir = resolve_config_dir(args.config_dir)?;
+    let config = LoadedConfig::load_from_dir(&config_dir)?;
+    let notion = &config.integrations.notion;
+
+    println!("Config dir: {}", config.config_dir.display());
+    println!("Notion enabled: {}", notion.enabled);
+    println!("API base URL: {}", notion.api_base_url);
+    println!("API version: {}", notion.api_version);
+    println!(
+        "API token secret ref: {}",
+        notion
+            .api_token_secret_ref
+            .as_deref()
+            .unwrap_or("<not configured>")
+    );
+
+    if notion.enabled && notion.api_token_secret_ref.is_some() {
+        let passphrase = prompt_passphrase_from_env(&args.passphrase_env).unwrap_or_else(|| {
+            Password::new()
+                .with_prompt("Master passphrase")
+                .interact()
+                .expect("failed to read master passphrase")
+        });
+        match beaverki_runtime::verify_notion_integration(&config, &passphrase).await {
+            Ok(info) => {
+                println!("API connection: ok");
+                println!("Bot name: {}", info.bot_name);
+                println!(
+                    "Workspace: {}",
+                    info.workspace_name.as_deref().unwrap_or("(unknown)")
+                );
+            }
+            Err(error) => {
+                println!("API connection: FAILED");
+                println!("Error: {error:#}");
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn notion_configure(args: NotionConfigureArgs) -> Result<()> {
+    let config_dir = resolve_config_dir(args.config_dir)?;
+    if args.enable && args.disable {
+        bail!("--enable and --disable cannot be used together");
+    }
+
+    let mut config = LoadedConfig::load_from_dir(&config_dir)?;
+    let mut notion = config.integrations.notion.clone();
+
+    if args.enable {
+        notion.enabled = true;
+    }
+    if args.disable {
+        notion.enabled = false;
+    }
+    if let Some(api_base_url) = args.api_base_url {
+        let api_base_url = api_base_url.trim();
+        if api_base_url.is_empty() {
+            bail!("api base URL cannot be empty");
+        }
+        notion.api_base_url = api_base_url.trim_end_matches('/').to_owned();
+    }
+    if let Some(api_version) = args.api_version {
+        let api_version = api_version.trim();
+        if api_version.is_empty() {
+            bail!("api version cannot be empty");
+        }
+        notion.api_version = api_version.to_owned();
+    }
+
+    if notion.enabled {
+        let token_from_env = std::env::var(&args.notion_token_env).ok();
+        let requires_token_write =
+            token_from_env.is_some() || notion.api_token_secret_ref.is_none();
+        if requires_token_write {
+            let secret_ref = notion
+                .api_token_secret_ref
+                .clone()
+                .unwrap_or_else(|| "secret://local/notion_api_token".to_owned());
+            let token = token_from_env.unwrap_or_else(|| {
+                Password::new()
+                    .with_prompt("Notion API token")
+                    .interact()
+                    .expect("failed to read Notion API token")
+            });
+            if token.trim().is_empty() {
+                bail!("Notion API token cannot be empty when enabling the integration");
+            }
+
+            let passphrase =
+                prompt_passphrase_from_env(&args.passphrase_env).unwrap_or_else(|| {
+                    Password::new()
+                        .with_prompt("Master passphrase")
+                        .interact()
+                        .expect("failed to read master passphrase")
+                });
+            let secret_store = beaverki_config::SecretStore::new(&config.runtime.secret_dir);
+            secret_store.write_secret(&secret_ref, token.trim(), &passphrase)?;
+            notion.api_token_secret_ref = Some(secret_ref);
+        }
+    }
+
+    config.integrations.notion = notion.clone();
+    let path = write_integrations_config(&config_dir, &config.integrations)?;
+    println!("Updated Notion integration config in {}", path.display());
+    println!("Notion enabled: {}", notion.enabled);
+    println!("API base URL: {}", notion.api_base_url);
+    println!("API version: {}", notion.api_version);
+    println!(
+        "API token secret ref: {}",
+        notion
+            .api_token_secret_ref
+            .as_deref()
+            .unwrap_or("<not configured>")
+    );
     Ok(())
 }
 

@@ -2567,6 +2567,9 @@ impl PrimaryAgentRunner {
             browser_interactive_launcher: tool_context.browser_interactive_launcher.clone(),
             browser_headless_program: tool_context.browser_headless_program.clone(),
             browser_headless_args: tool_context.browser_headless_args.clone(),
+            notion_api_base_url: tool_context.notion_api_base_url.clone(),
+            notion_api_version: tool_context.notion_api_version.clone(),
+            notion_api_token: tool_context.notion_api_token.clone(),
         })
         .await;
         let execution = match execution {
@@ -3820,6 +3823,9 @@ impl PrimaryAgentRunner {
             browser_interactive_launcher: tool_context.browser_interactive_launcher.clone(),
             browser_headless_program: tool_context.browser_headless_program.clone(),
             browser_headless_args: tool_context.browser_headless_args.clone(),
+            notion_api_base_url: tool_context.notion_api_base_url.clone(),
+            notion_api_version: tool_context.notion_api_version.clone(),
+            notion_api_token: tool_context.notion_api_token.clone(),
         })
         .await;
         let execution = match execution {

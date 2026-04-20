@@ -31,3 +31,19 @@ pub(crate) fn load_discord_bot_token(
     let secret_store = SecretStore::new(&config.runtime.secret_dir);
     Ok(Some(secret_store.read_secret(secret_ref, passphrase)?))
 }
+
+pub(crate) fn load_notion_api_token(
+    config: &LoadedConfig,
+    passphrase: &str,
+) -> Result<Option<String>> {
+    if !config.integrations.notion.enabled {
+        return Ok(None);
+    }
+
+    let Some(secret_ref) = config.integrations.notion.api_token_secret_ref.as_deref() else {
+        bail!("Notion integration is enabled but api_token_secret_ref is not configured");
+    };
+
+    let secret_store = SecretStore::new(&config.runtime.secret_dir);
+    Ok(Some(secret_store.read_secret(secret_ref, passphrase)?))
+}

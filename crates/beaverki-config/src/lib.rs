@@ -249,6 +249,7 @@ pub struct IntegrationsConfig {
     pub version: u32,
     pub browser: BrowserConfig,
     pub discord: DiscordConfig,
+    pub notion: NotionConfig,
 }
 
 impl Default for IntegrationsConfig {
@@ -257,6 +258,7 @@ impl Default for IntegrationsConfig {
             version: CURRENT_CONFIG_VERSION,
             browser: BrowserConfig::default(),
             discord: DiscordConfig::default(),
+            notion: NotionConfig::default(),
         }
     }
 }
@@ -309,6 +311,26 @@ impl Default for DiscordConfig {
             approval_action_ttl_secs: 15 * 60,
             approval_dm_only: true,
             critical_confirmation_ttl_secs: 5 * 60,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NotionConfig {
+    pub enabled: bool,
+    pub api_token_secret_ref: Option<String>,
+    pub api_base_url: String,
+    pub api_version: String,
+}
+
+impl Default for NotionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            api_token_secret_ref: None,
+            api_base_url: "https://api.notion.com/v1".to_owned(),
+            api_version: "2026-03-11".to_owned(),
         }
     }
 }
