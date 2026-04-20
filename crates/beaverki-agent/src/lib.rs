@@ -5014,7 +5014,7 @@ fn tool_definitions(tools: &ToolRegistry) -> Vec<ToolDefinition> {
     });
     definitions.push(ToolDefinition {
         name: "workflow_write".to_owned(),
-        description: "Create or update a reviewed workflow definition with ordered stages. Reusing an existing `workflow_id` creates a new workflow version and makes that version the current editable definition. Stages support `lua_script`, `lua_tool`, `agent_task`, and `user_notify`. Each stage's `config` must be a JSON-encoded object string.".to_owned(),
+        description: "Create or update a reviewed workflow definition with ordered stages. Reusing an existing `workflow_id` creates a new workflow version and makes that version the current editable definition. Stages support `lua_script`, `lua_tool`, `agent_task`, and `user_notify`. Each stage's `config` must be a JSON-encoded object string. For `agent_task` stages, write `config.prompt` as a clear instruction template; when the stage has multiple constraints or output requirements, prefer readable multi-line prompt text with explicit line breaks instead of compressing everything into one long sentence.".to_owned(),
         input_schema: json!({
             "type": "object",
             "properties": {
@@ -5180,6 +5180,7 @@ Only low-risk read-only shell commands are allowed by default. Medium/high/criti
 For exploring allowed roots and locating files, prefer filesystem_list, filesystem_read_text, and filesystem_search over shell_exec.
 Use Lua tools when recurring or structured automation materially helps. Writing a Lua script triggers safety review. New scripts require explicit activation later, while rewrites of already active scripts stay active if the new version passes safety review. Scheduling standalone Lua automations requires user approval. When writing Lua, prefer `return function(ctx) ... end`, use BeaverKI host APIs such as `ctx.log_info`, `ctx.notify_user`, `ctx.task_defer`, `ctx.memory_read`, `ctx.memory_write`, and `ctx.tool_call`, and avoid legacy globals like `run()`, `log()`, or `notify()`.
 Use workflow tools for staged recurring automation. Reuse the same workflow_id when revising a workflow so BeaverKI creates a new workflow version instead of inventing unrelated workflows. Safety-approved workflows can be activated directly, and once active they can be scheduled without an extra approval step.
+When writing workflow definitions, treat `agent_task` prompts as durable prompt templates rather than short notes. If a stage has multiple rules, scope boundaries, or output-format requirements, encode them in readable multi-line text with explicit paragraphs or lists inside `config.prompt` instead of flattening them into one dense sentence.
 When a user is building or debugging a workflow, inspect existing state before proposing changes: use workflow_get for the current definition, workflow_run_list to see recent runs, and workflow_run_get to inspect persisted artifacts, final results, retry state, and block reasons for a specific run.
 If a workflow run failed or blocked, prefer reading the run state and artifacts first, then revise the workflow with workflow_write using the same workflow_id, and only then suggest activation, replay, or rescheduling as needed.
 Never claim a workflow was created, revised, activated, scheduled, replayed, or successfully completed unless the corresponding workflow tool returned success in this task.
@@ -7764,11 +7765,11 @@ mod tests {
     #[test]
     fn workflow_write_schema_exposes_stage_model() {
         let registry = builtin_registry();
-        let schema = tool_definitions(&registry)
+        let definition = tool_definitions(&registry)
             .into_iter()
             .find(|definition| definition.name == "workflow_write")
-            .expect("workflow_write definition")
-            .input_schema;
+            .expect("workflow_write definition");
+        let schema = definition.input_schema;
 
         assert_eq!(schema["properties"]["stages"]["type"], json!("array"));
         assert_eq!(
@@ -7779,6 +7780,21 @@ mod tests {
             schema["properties"]["stages"]["items"]["properties"]["config"]["type"],
             json!(["string", "null"])
         );
+        assert!(definition
+            .description
+            .contains("prefer readable multi-line prompt text with explicit line breaks"));
+    }
+
+    #[test]
+    fn system_prompt_guides_structured_workflow_agent_prompts() {
+        let prompt = system_prompt(
+            "interactive",
+            &["owner".to_owned()],
+            &[PathBuf::from("/tmp")],
+        );
+
+        assert!(prompt.contains("treat `agent_task` prompts as durable prompt templates"));
+        assert!(prompt.contains("encode them in readable multi-line text with explicit paragraphs or lists inside `config.prompt`"));
     }
 
     #[test]
