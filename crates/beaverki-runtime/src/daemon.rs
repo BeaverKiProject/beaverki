@@ -502,6 +502,22 @@ impl RuntimeDaemon {
             .await?;
         self.refresh_heartbeat(None).await?;
 
+        let cfg = &self.runtime.config;
+        let discord_channels = cfg.integrations.discord.allowed_channels.len();
+        info!(
+            session_id = %session_id,
+            instance_id = %cfg.runtime.instance_id,
+            mode = %cfg.runtime.mode,
+            workspace_root = %cfg.runtime.workspace_root.display(),
+            discord_enabled = cfg.integrations.discord.enabled,
+            discord_channels = discord_channels,
+            discord_prefix = %cfg.integrations.discord.command_prefix,
+            notion_enabled = cfg.integrations.notion.enabled,
+            browser_headless = cfg.integrations.browser.headless_browser.is_some(),
+            browser_interactive = cfg.integrations.browser.interactive_launcher.is_some(),
+            "daemon session started",
+        );
+
         let daemon = Arc::new(self);
         let worker = tokio::spawn(Self::worker_loop(Arc::clone(&daemon)));
         let heartbeat = tokio::spawn(Self::heartbeat_loop(Arc::clone(&daemon)));

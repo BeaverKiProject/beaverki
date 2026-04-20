@@ -218,11 +218,27 @@ impl Runtime {
             runtime_actor_id: config.runtime.instance_id.clone(),
             discord_bot_token: discord_bot_token.clone(),
         });
+        let builtin = builtin_registry();
+        let builtin_tool_names = builtin
+            .definitions()
+            .into_iter()
+            .map(|d| d.name)
+            .collect::<Vec<_>>();
+        info!(
+            tools = ?builtin_tool_names,
+            notion_enabled = config.integrations.notion.enabled,
+            discord_enabled = config.integrations.discord.enabled,
+            browser_headless = config.integrations.browser.headless_browser.is_some(),
+            browser_interactive = config.integrations.browser.interactive_launcher.is_some(),
+            workspace_root = %config.runtime.workspace_root.display(),
+            max_agent_steps = config.runtime.defaults.max_agent_steps,
+            "runtime initialized",
+        );
         let runner = PrimaryAgentRunner::new(
             db.clone(),
             memory,
             provider.clone(),
-            builtin_registry(),
+            builtin,
             tool_context,
             Some(household_delivery_delegate),
             usize::from(config.runtime.defaults.max_agent_steps),

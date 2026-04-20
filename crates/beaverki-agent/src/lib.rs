@@ -3721,6 +3721,19 @@ impl PrimaryAgentRunner {
         }
 
         loaded.sort_by(|left, right| left.tool_id.cmp(&right.tool_id));
+        if loaded.is_empty() {
+            info!(owner_user_id = %owner_user_id, "no Lua skills loaded");
+        } else {
+            for tool in &loaded {
+                info!(
+                    owner_user_id = %owner_user_id,
+                    tool_id = %tool.tool_id,
+                    source = tool.source_kind(),
+                    source_ref = %tool.source_ref(),
+                    "loaded Lua skill",
+                );
+            }
+        }
         Ok(loaded)
     }
 
