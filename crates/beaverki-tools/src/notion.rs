@@ -774,26 +774,431 @@ fn data_source_title_property_name(data_source: &Value) -> Option<String> {
 }
 
 fn notion_children_from_text(content: &str) -> Vec<Value> {
-    let mut children = Vec::new();
-    for paragraph in content
-        .split("\n\n")
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        for chunk in split_text_chunks(paragraph, MAX_BLOCK_TEXT_CHARS) {
-            children.push(json!({
-                "object": "block",
-                "type": "paragraph",
-                "paragraph": {
-                    "rich_text": notion_text_segments(&chunk)
+    let mut children: Vec<Value> = Vec::new();
+    let lines: Vec<&str> = content.lines().collect();
+    let mut i = 0;
+    // Index of the most recent top-level nestable block. An indented line becomes its child.
+    // Cleared by blank lines, headings, dividers, and code blocks.
+    let mut last_top_idx: Option<usize> = None;
+
+    while i < lines.len() && children.len() < MAX_CREATE_BLOCKS {
+        let raw_line = lines[i];
+
+        // Empty line — clear nesting context
+        if raw_line.trim().is_empty() {
+            last_top_idx = None;
+            i += 1;
+            continue;
+        }
+
+        let (is_indented, line) = strip_one_indent(raw_line);
+        let trimmed = line.trim();
+
+        // Fenced code block — always top-level; clears parent context
+        if line.starts_with("```") || line.starts_with("~~~") {
+            last_top_idx = None;
+            let fence = if line.starts_with("```") { "```" } else { "~~~" };
+            let lang = line.trim_start_matches('`').trim_start_matches('~').trim();
+            let mut code_lines: Vec<&str> = Vec::new();
+            i += 1;
+            while i < lines.len() && !lines[i].trim_start().starts_with(fence) {
+                code_lines.push(lines[i]);
+                i += 1;
+            }
+            if i < lines.len() {
+                i += 1;
+            }
+            let code_text = code_lines.join("\n");
+            for chunk in split_text_chunks(&code_text, MAX_BLOCK_TEXT_CHARS) {
+                if children.len() >= MAX_CREATE_BLOCKS {
+                    return children;
                 }
-            }));
+                children.push(json!({
+                    "object": "block",
+                    "type": "code",
+                    "code": {
+                        "language": if lang.is_empty() { "plain text" } else { lang },
+                        "rich_text": [{"type": "text", "text": {"content": chunk}}]
+                    }
+                }));
+            }
+            continue;
+        }
+
+        // Divider — always top-level; clears parent context
+        if trimmed == "---" || trimmed == "___" {
+            last_top_idx = None;
+            children.push(json!({"object": "block", "type": "divider", "divider": {}}));
+            i += 1;
+            continue;
+        }
+
+        // Headings — always top-level; clear parent context
+        if let Some(text) = line.strip_prefix("### ") {
+            last_top_idx = None;
+            children.push(make_rich_block("heading_3", text));
+            i += 1;
+            continue;
+        }
+        if let Some(text) = line.strip_prefix("## ") {
+            last_top_idx = None;
+            children.push(make_rich_block("heading_2", text));
+            i += 1;
+            continue;
+        }
+        if let Some(text) = line.strip_prefix("# ") {
+            last_top_idx = None;
+            children.push(make_rich_block("heading_1", text));
+            i += 1;
+            continue;
+        }
+
+        // Single-line block types
+        let block: Option<Value> =
+            if let Some(text) = line.strip_prefix("- [ ] ").or_else(|| line.strip_prefix("* [ ] ")) {
+                Some(json!({"object":"block","type":"to_do","to_do":{"checked":false,"rich_text":notion_rich_text_segments(text)}}))
+            } else if let Some(text) = line
+                .strip_prefix("- [x] ")
+                .or_else(|| line.strip_prefix("- [X] "))
+                .or_else(|| line.strip_prefix("* [x] "))
+                .or_else(|| line.strip_prefix("* [X] "))
+            {
+                Some(json!({"object":"block","type":"to_do","to_do":{"checked":true,"rich_text":notion_rich_text_segments(text)}}))
+            } else if let Some(text) = line.strip_prefix("- ").or_else(|| line.strip_prefix("* ")) {
+                Some(make_rich_block("bulleted_list_item", text))
+            } else if let Some(text) = strip_numbered_list_prefix(line) {
+                Some(make_rich_block("numbered_list_item", text))
+            } else if let Some(text) = line.strip_prefix("> ") {
+                Some(make_rich_block("quote", text))
+            } else {
+                None
+            };
+
+        if let Some(b) = block {
+            push_or_nest(&mut children, &mut last_top_idx, b, is_indented);
+            i += 1;
+            continue;
+        }
+
+        // Paragraph: collect consecutive plain lines at the same indent level
+        let mut para_lines: Vec<&str> = vec![line];
+        i += 1;
+        while i < lines.len() {
+            let l = lines[i];
+            if l.trim().is_empty() {
+                break;
+            }
+            let (l_ind, l_ded) = strip_one_indent(l);
+            if is_block_start(l_ded) || l_ind != is_indented {
+                break;
+            }
+            para_lines.push(l_ded);
+            i += 1;
+        }
+        let para_text = para_lines.join("\n");
+        for chunk in split_text_chunks(&para_text, MAX_BLOCK_TEXT_CHARS) {
             if children.len() >= MAX_CREATE_BLOCKS {
                 return children;
             }
+            let b = json!({
+                "object": "block",
+                "type": "paragraph",
+                "paragraph": {"rich_text": notion_rich_text_segments(&chunk)}
+            });
+            push_or_nest(&mut children, &mut last_top_idx, b, is_indented);
         }
     }
+
     children
+}
+
+/// Pushes `block` as a child of the current parent when indented, otherwise adds it to the
+/// top level. Updates `last_top_idx` for block types that support children.
+fn push_or_nest(
+    children: &mut Vec<Value>,
+    last_top_idx: &mut Option<usize>,
+    block: Value,
+    is_indented: bool,
+) {
+    if is_indented {
+        if let Some(pidx) = *last_top_idx {
+            nest_child_block(&mut children[pidx], block);
+            // Keep last_top_idx unchanged — the next sibling nests under the same parent.
+            return;
+        }
+        // No parent available — fall through to top-level.
+    }
+    let block_type = block.get("type").and_then(Value::as_str).unwrap_or("");
+    let can_be_parent = matches!(
+        block_type,
+        "bulleted_list_item" | "numbered_list_item" | "to_do" | "quote" | "paragraph"
+    );
+    let idx = children.len();
+    children.push(block);
+    if can_be_parent {
+        *last_top_idx = Some(idx);
+    }
+}
+
+fn nest_child_block(parent: &mut Value, child: Value) {
+    let parent_type = parent
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_owned();
+    if let Some(inner) = parent.get_mut(&parent_type) {
+        if let Some(obj) = inner.as_object_mut() {
+            obj.entry("children".to_owned())
+                .or_insert_with(|| Value::Array(Vec::new()))
+                .as_array_mut()
+                .unwrap()
+                .push(child);
+        }
+    }
+}
+
+/// Strips one indent level (2 spaces, 4 spaces, or a tab) from the start of a line.
+fn strip_one_indent(line: &str) -> (bool, &str) {
+    if let Some(rest) = line.strip_prefix("    ") {
+        (true, rest)
+    } else if let Some(rest) = line.strip_prefix("  ") {
+        (true, rest)
+    } else if let Some(rest) = line.strip_prefix('\t') {
+        (true, rest)
+    } else {
+        (false, line)
+    }
+}
+
+fn make_rich_block(block_type: &str, text: &str) -> Value {
+    let mut block = json!({"object": "block", "type": block_type});
+    block
+        .as_object_mut()
+        .unwrap()
+        .insert(block_type.to_owned(), json!({"rich_text": notion_rich_text_segments(text)}));
+    block
+}
+
+fn is_block_start(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed == "---"
+        || trimmed == "___"
+        || line.starts_with("```")
+        || line.starts_with("~~~")
+        || line.starts_with("# ")
+        || line.starts_with("## ")
+        || line.starts_with("### ")
+        || line.starts_with("- ")
+        || line.starts_with("* ")
+        || line.starts_with("> ")
+        || strip_numbered_list_prefix(line).is_some()
+}
+
+fn strip_numbered_list_prefix(line: &str) -> Option<&str> {
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i > 0 && i + 1 < bytes.len() && bytes[i] == b'.' && bytes[i + 1] == b' ' {
+        Some(&line[i + 2..])
+    } else {
+        None
+    }
+}
+
+fn notion_rich_text_segments(text: &str) -> Vec<Value> {
+    let mut out = Vec::new();
+    parse_inline_markdown(text, &mut out);
+    if out.is_empty() {
+        out.push(json!({"type": "text", "text": {"content": ""}}));
+    }
+    out
+}
+
+fn parse_inline_markdown(mut text: &str, out: &mut Vec<Value>) {
+    let mut plain = String::new();
+
+    while !text.is_empty() {
+        // Inline code: `...`
+        if text.starts_with('`') {
+            let rest = &text[1..];
+            if let Some(end) = rest.find('`') {
+                flush_inline_plain(&mut plain, out);
+                push_inline_annotated(out, &rest[..end], false, false, true, false);
+                text = &rest[end + 1..];
+                continue;
+            }
+        }
+        // Bold + italic: ***...***
+        if text.starts_with("***") {
+            let rest = &text[3..];
+            if let Some(end) = rest.find("***") {
+                flush_inline_plain(&mut plain, out);
+                push_inline_annotated(out, &rest[..end], true, true, false, false);
+                text = &rest[end + 3..];
+                continue;
+            }
+        }
+        // Bold: **...**
+        if text.starts_with("**") {
+            let rest = &text[2..];
+            if let Some(end) = rest.find("**") {
+                flush_inline_plain(&mut plain, out);
+                push_inline_annotated(out, &rest[..end], true, false, false, false);
+                text = &rest[end + 2..];
+                continue;
+            }
+        }
+        // Italic: *...* (single star, not **)
+        if text.starts_with('*') && !text.starts_with("**") {
+            let rest = &text[1..];
+            if let Some(end) = find_single_star(rest) {
+                flush_inline_plain(&mut plain, out);
+                push_inline_annotated(out, &rest[..end], false, true, false, false);
+                text = &rest[end + 1..];
+                continue;
+            }
+        }
+        // Strikethrough: ~~...~~
+        if text.starts_with("~~") {
+            let rest = &text[2..];
+            if let Some(end) = rest.find("~~") {
+                flush_inline_plain(&mut plain, out);
+                push_inline_annotated(out, &rest[..end], false, false, false, true);
+                text = &rest[end + 2..];
+                continue;
+            }
+        }
+        // Link: [text](url)
+        if text.starts_with('[') {
+            if let Some(bracket_end) = text.find("](") {
+                let link_text = &text[1..bracket_end];
+                let rest = &text[bracket_end + 2..];
+                if let Some(paren_end) = rest.find(')') {
+                    let url = &rest[..paren_end];
+                    flush_inline_plain(&mut plain, out);
+                    for chunk in split_text_chunks(link_text, MAX_BLOCK_TEXT_CHARS) {
+                        out.push(json!({
+                            "type": "text",
+                            "text": {"content": chunk, "link": {"url": url}}
+                        }));
+                    }
+                    text = &rest[paren_end + 1..];
+                    continue;
+                }
+            }
+        }
+        // Color: {color:text} or {color_background:text}
+        if text.starts_with('{') {
+            if let Some(colon_pos) = text[1..].find(':') {
+                let color = &text[1..colon_pos + 1];
+                if is_notion_color(color) {
+                    let rest = &text[colon_pos + 2..];
+                    if let Some(close_pos) = rest.find('}') {
+                        let colored = &rest[..close_pos];
+                        flush_inline_plain(&mut plain, out);
+                        for chunk in split_text_chunks(colored, MAX_BLOCK_TEXT_CHARS) {
+                            out.push(json!({
+                                "type": "text",
+                                "text": {"content": chunk},
+                                "annotations": {"color": color}
+                            }));
+                        }
+                        text = &rest[close_pos + 1..];
+                        continue;
+                    }
+                }
+            }
+        }
+        let ch_len = text.chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+        plain.push_str(&text[..ch_len]);
+        text = &text[ch_len..];
+    }
+    flush_inline_plain(&mut plain, out);
+}
+
+fn find_single_star(text: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'*' {
+            if i + 1 >= bytes.len() || bytes[i + 1] != b'*' {
+                return Some(i);
+            }
+            i += 2;
+            continue;
+        }
+        i += 1;
+    }
+    None
+}
+
+fn is_notion_color(s: &str) -> bool {
+    matches!(
+        s,
+        "default"
+            | "gray"
+            | "brown"
+            | "orange"
+            | "yellow"
+            | "green"
+            | "blue"
+            | "purple"
+            | "pink"
+            | "red"
+            | "gray_background"
+            | "brown_background"
+            | "orange_background"
+            | "yellow_background"
+            | "green_background"
+            | "blue_background"
+            | "purple_background"
+            | "pink_background"
+            | "red_background"
+    )
+}
+
+fn flush_inline_plain(plain: &mut String, out: &mut Vec<Value>) {
+    if plain.is_empty() {
+        return;
+    }
+    for chunk in split_text_chunks(plain, MAX_BLOCK_TEXT_CHARS) {
+        out.push(json!({"type": "text", "text": {"content": chunk}}));
+    }
+    plain.clear();
+}
+
+fn push_inline_annotated(
+    out: &mut Vec<Value>,
+    text: &str,
+    bold: bool,
+    italic: bool,
+    code: bool,
+    strikethrough: bool,
+) {
+    for chunk in split_text_chunks(text, MAX_BLOCK_TEXT_CHARS) {
+        let mut annotations = Map::new();
+        if bold {
+            annotations.insert("bold".to_owned(), Value::Bool(true));
+        }
+        if italic {
+            annotations.insert("italic".to_owned(), Value::Bool(true));
+        }
+        if code {
+            annotations.insert("code".to_owned(), Value::Bool(true));
+        }
+        if strikethrough {
+            annotations.insert("strikethrough".to_owned(), Value::Bool(true));
+        }
+        let mut seg = json!({"type": "text", "text": {"content": chunk}});
+        if !annotations.is_empty() {
+            seg.as_object_mut()
+                .unwrap()
+                .insert("annotations".to_owned(), Value::Object(annotations));
+        }
+        out.push(seg);
+    }
 }
 
 fn notion_text_segments(text: &str) -> Vec<Value> {

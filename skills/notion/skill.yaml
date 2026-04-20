@@ -49,7 +49,17 @@ tools:
       allowed_tools: [notion_fetch]
   - tool_id: notion_capture_note
     kind: lua
-    description: Create a new Notion page under a parent page or data source using a title and optional plain-text body.
+    description: >
+      Create a new Notion page under a parent page or data source.
+      The content field accepts Markdown-like syntax converted into native Notion blocks.
+      Block types: headings (# / ## / ###), bullet lists (- or *), numbered lists (1. 2. …),
+      to-do items (- [ ] / - [x]), blockquotes (>), fenced code blocks (```lang … ```),
+      horizontal dividers (---).
+      Nesting: indent a line by 2 spaces (or a tab) to make it a child of the preceding
+      list item, quote, or paragraph — use this for sub-bullets under numbered items.
+      A blank line resets the nesting context.
+      Inline: **bold**, *italic*, `code`, ~~strikethrough~~, ***bold italic***,
+      [link text](url), {color:text} / {color_background:text}.
     source_path: notion_capture_note.lua
     input_schema:
       type: object
@@ -63,6 +73,17 @@ tools:
           type: string
         content:
           type: [string, "null"]
+          description: >
+            Markdown-formatted page body.
+            Block types: headings (# H1, ## H2, ### H3), bullet list (- item or * item),
+            numbered list (1. item), to-do (- [ ] unchecked, - [x] checked),
+            blockquote (> text), fenced code block (```lang … ```), divider (---).
+            Nesting: indent by 2 spaces or a tab to nest a block under the previous list item,
+            quote, or paragraph. Multiple consecutive indented lines go under the same parent.
+            Blank line resets nesting.
+            Inline: **bold**, *italic*, `code`, ~~strikethrough~~, ***bold italic***,
+            [link text](url), {color:text} (colors: gray, red, blue, green, yellow, orange,
+            pink, purple, brown, default, or any with _background suffix).
       required: [parent_kind, parent_ref, title, content]
       additionalProperties: false
     output_schema:
