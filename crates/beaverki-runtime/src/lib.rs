@@ -44,6 +44,7 @@ pub use self::types::{
     MemoryInspection, RemoteApprovalActionOutcome, ScriptInspection, SessionLifecycleExecution,
     TaskInspection, WorkflowDefinitionInput, WorkflowInspection, WorkflowStageInput,
 };
+pub use self::workflow::parse_workflow_stage_config;
 
 use self::connector_support::assistant_reply_for_context;
 use self::delivery::{RuntimeHouseholdDeliveryDelegate, tool_error_to_anyhow};

@@ -15,9 +15,12 @@ use beaverki_models::OpenAiProvider;
 use beaverki_policy::{is_builtin_role, visible_memory_scopes};
 use beaverki_runtime::{
     DaemonClient, Runtime, RuntimeDaemon, WorkflowDefinitionInput, latest_daemon_status,
+    parse_workflow_stage_config,
 };
 use clap::{Args, Parser, Subcommand};
 use dialoguer::{Input, Password};
+use owo_colors::{OwoColorize, Style};
+use serde_json::Value;
 use tokio::time::{self, Duration};
 use tracing_subscriber::EnvFilter;
 
@@ -2005,75 +2008,279 @@ fn print_script_inspection(inspection: &beaverki_runtime::ScriptInspection) {
 }
 
 fn print_workflow_inspection(inspection: &beaverki_runtime::WorkflowInspection) {
-    println!("Workflow ID: {}", inspection.workflow.workflow_id);
-    println!("Name: {}", inspection.workflow.name);
-    println!("Status: {}", inspection.workflow.status);
-    println!("Safety status: {}", inspection.workflow.safety_status);
+    let workflow = &inspection.workflow;
+
     println!(
-        "Current version: v{}",
-        inspection.workflow.current_version_number
+        "{} {} {}",
+        "Workflow".bold(),
+        workflow.name.bold().bright_white(),
+        format!("({})", workflow.workflow_id).dimmed()
     );
-    if let Some(summary) = inspection.workflow.safety_summary.as_deref() {
-        println!("Safety summary: {summary}");
+    if let Some(description) = workflow.description.as_deref() {
+        println!("{}", description.dimmed());
     }
-    if let Some(task_id) = inspection.workflow.created_from_task_id.as_deref() {
-        println!("Created from task: {task_id}");
+    println!();
+    print_labeled_value("Status", style_status(&workflow.status, true));
+    print_labeled_value("Safety", style_status(&workflow.safety_status, false));
+    print_labeled_value(
+        "Version",
+        format!("v{}", workflow.current_version_number)
+            .bright_white()
+            .to_string(),
+    );
+    print_labeled_value("Created", workflow.created_at.as_str().to_owned());
+    print_labeled_value("Updated", workflow.updated_at.as_str().to_owned());
+    if let Some(task_id) = workflow.created_from_task_id.as_deref() {
+        print_labeled_value("Created from task", task_id.to_owned());
+    }
+    if let Some(summary) = workflow.safety_summary.as_deref() {
+        print_labeled_value("Safety summary", summary.to_owned());
     }
 
-    println!("\nStages:");
+    println!();
+    println!("{}", "Stages".bold().underline());
     for stage in &inspection.stages {
+        let config = parse_workflow_stage_config(&stage.stage_config_json).ok();
+        let stage_title = stage.stage_label.as_deref().unwrap_or("(unnamed)");
         println!(
-            "- [{}] {} kind={} artifact={}",
-            stage.stage_index,
-            stage.stage_label.as_deref().unwrap_or("(unnamed)"),
-            stage.stage_kind,
-            stage.artifact_ref.as_deref().unwrap_or("-")
+            "{} {} {}",
+            format!("Stage {:02}", stage.stage_index + 1)
+                .bold()
+                .bright_blue(),
+            stage_title.bold(),
+            format!("[{}]", stage.stage_kind).dimmed()
         );
-        println!("  config={}", stage.stage_config_json);
+        if let Some(artifact_ref) = stage.artifact_ref.as_deref() {
+            print_indented_value("artifact", artifact_ref);
+        }
+        if let Some(config) = config.as_ref() {
+            print_stage_summary(&stage.stage_kind, config);
+            print_stage_extra_config(&stage.stage_kind, config);
+        } else {
+            print_indented_value("config", stage.stage_config_json.as_str());
+        }
+        println!();
     }
 
     if !inspection.reviews.is_empty() {
-        println!("\nReviews:");
+        println!("{}", "Reviews".bold().underline());
         for review in &inspection.reviews {
             print_workflow_review_details(review);
         }
+        println!();
     }
 
     if !inspection.versions.is_empty() {
-        println!("\nVersions:");
+        println!("{}", "Versions".bold().underline());
         for version in &inspection.versions {
             println!(
-                "- v{} name={} created_at={}",
-                version.version_number, version.name, version.created_at
+                "{} {} {}",
+                format!("v{}", version.version_number)
+                    .bold()
+                    .bright_magenta(),
+                version.name.as_str(),
+                format!("({})", version.created_at).dimmed()
             );
+            if let Some(description) = version.description.as_deref() {
+                print_indented_value("description", description);
+            }
         }
+        println!();
     }
 
     if !inspection.schedules.is_empty() {
-        println!("\nSchedules:");
+        println!("{}", "Schedules".bold().underline());
         for schedule in &inspection.schedules {
             println!(
-                "- {} cron={} enabled={} next_run_at={}",
+                "{} {}",
+                if schedule.enabled != 0 {
+                    "●".green().to_string()
+                } else {
+                    "○".dimmed().to_string()
+                },
                 schedule.schedule_id,
-                schedule.cron_expr,
-                if schedule.enabled != 0 { "yes" } else { "no" },
-                schedule.next_run_at
             );
+            print_indented_value("cron", &schedule.cron_expr);
+            print_indented_value(
+                "status",
+                if schedule.enabled != 0 {
+                    "enabled"
+                } else {
+                    "disabled"
+                },
+            );
+            print_indented_value("next run", &schedule.next_run_at);
         }
+        println!();
     }
 
     if !inspection.runs.is_empty() {
-        println!("\nRuns:");
+        println!("{}", "Runs".bold().underline());
         for run in &inspection.runs {
             println!(
-                "- {} state={} stage={} wake_at={} block_reason={}",
-                run.workflow_run_id,
-                run.state,
-                run.current_stage_index,
-                run.wake_at.as_deref().unwrap_or("-"),
-                run.block_reason.as_deref().unwrap_or("-")
+                "{} {} {}",
+                "Run".bold().bright_cyan(),
+                run.workflow_run_id.as_str(),
+                style_status(&run.state, true)
             );
+            print_indented_value("stage", &format!("{}", run.current_stage_index + 1));
+            print_indented_value("started", &run.started_at);
+            if let Some(completed_at) = run.completed_at.as_deref() {
+                print_indented_value("completed", completed_at);
+            }
+            if let Some(wake_at) = run.wake_at.as_deref() {
+                print_indented_value("wake at", wake_at);
+            }
+            if let Some(block_reason) = run.block_reason.as_deref() {
+                print_indented_value("blocked", block_reason);
+            }
+            if let Some(last_error) = run.last_error.as_deref() {
+                print_indented_value("last error", last_error);
+            }
+            print_indented_value("retries", &run.retry_count.to_string());
         }
+    }
+}
+
+fn style_status(status: &str, prominent: bool) -> String {
+    let normalized = status.trim().to_ascii_lowercase();
+    let style = match normalized.as_str() {
+        "active" | "enabled" | "approved" | "completed" | "success" | "succeeded" => {
+            Style::new().green().bold()
+        }
+        "pending" | "draft" | "queued" | "running" | "waiting" | "blocked" => {
+            Style::new().yellow().bold()
+        }
+        "disabled" | "rejected" | "failed" | "error" | "denied" => Style::new().red().bold(),
+        _ if prominent => Style::new().bright_blue().bold(),
+        _ => Style::new().cyan(),
+    };
+    style.style(status).to_string()
+}
+
+fn print_labeled_value(label: &str, value: String) {
+    println!("{:>16}  {}", format!("{label}:").dimmed(), value);
+}
+
+fn print_indented_value(label: &str, value: &str) {
+    for (index, line) in value.lines().enumerate() {
+        if index == 0 {
+            println!("  {:<12} {}", format!("{label}:").dimmed(), line);
+        } else {
+            println!("  {:<12} {}", "", line);
+        }
+    }
+}
+
+fn print_stage_summary(stage_kind: &str, config: &Value) {
+    match stage_kind {
+        "agent_task" => {
+            if let Some(prompt) = config.get("prompt").and_then(Value::as_str) {
+                print_indented_value("prompt", prompt.trim());
+            }
+            if let Some(role_id) = config.get("role_id").and_then(Value::as_str) {
+                print_indented_value("role", role_id);
+            }
+            if let Some(model) = config.get("model").and_then(Value::as_str) {
+                print_indented_value("model", model);
+            }
+        }
+        "user_notify" => {
+            if let Some(recipient) = config.get("recipient").and_then(Value::as_str) {
+                print_indented_value("recipient", recipient);
+            }
+            if let Some(message) = config
+                .get("message_template")
+                .or_else(|| config.get("message"))
+                .and_then(Value::as_str)
+            {
+                print_indented_value("message", message.trim());
+            }
+        }
+        "lua_script" | "lua_tool" => {
+            if let Some(entrypoint) = config.get("entrypoint").and_then(Value::as_str) {
+                print_indented_value("entrypoint", entrypoint);
+            }
+            if let Some(tool_name) = config.get("tool_name").and_then(Value::as_str) {
+                print_indented_value("tool", tool_name);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn print_stage_extra_config(stage_kind: &str, config: &Value) {
+    let Some(map) = config.as_object() else {
+        if !config.is_null() {
+            print_indented_value("config", &render_json_inline(config));
+        }
+        return;
+    };
+
+    let hidden_keys: &[&str] = match stage_kind {
+        "agent_task" => &["prompt", "role_id", "model"],
+        "user_notify" => &["recipient", "message_template", "message"],
+        "lua_script" => &["entrypoint"],
+        "lua_tool" => &["entrypoint", "tool_name"],
+        _ => &[],
+    };
+
+    let extras = map
+        .iter()
+        .filter(|(key, _)| !hidden_keys.contains(&key.as_str()))
+        .collect::<Vec<_>>();
+
+    if extras.is_empty() {
+        return;
+    }
+
+    println!("  {}", "config".dimmed());
+    for (key, value) in extras {
+        print_json_value_with_label(4, key, value);
+    }
+}
+
+fn print_json_value_with_label(indent: usize, label: &str, value: &Value) {
+    let prefix = " ".repeat(indent);
+    match value {
+        Value::Object(map) if !map.is_empty() => {
+            println!("{prefix}{} {}", format!("{label}:").dimmed(), "{".dimmed());
+            for (child_key, child_value) in map {
+                print_json_value_with_label(indent + 2, child_key, child_value);
+            }
+            println!("{prefix}{}", "}".dimmed());
+        }
+        Value::Array(items) if !items.is_empty() => {
+            println!("{prefix}{} {}", format!("{label}:").dimmed(), "[".dimmed());
+            for item in items {
+                match item {
+                    Value::Object(map) if !map.is_empty() => {
+                        println!("{}{}", " ".repeat(indent + 2), "{".dimmed());
+                        for (child_key, child_value) in map {
+                            print_json_value_with_label(indent + 4, child_key, child_value);
+                        }
+                        println!("{}{}", " ".repeat(indent + 2), "}".dimmed());
+                    }
+                    _ => println!("{}{}", " ".repeat(indent + 2), render_json_inline(item)),
+                }
+            }
+            println!("{prefix}{}", "]".dimmed());
+        }
+        _ => println!(
+            "{prefix}{} {}",
+            format!("{label}:").dimmed(),
+            render_json_inline(value)
+        ),
+    }
+}
+
+fn render_json_inline(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        Value::Array(_) | Value::Object(_) => {
+            serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
+        }
+        _ => value.to_string(),
     }
 }
 
@@ -2111,9 +2318,13 @@ fn print_script_review_details(review: &beaverki_db::ScriptReviewRow) {
 
 fn print_workflow_review_details(review: &beaverki_db::WorkflowReviewRow) {
     println!(
-        "- {} verdict={} risk={} summary={}",
-        review.review_id, review.verdict, review.risk_level, review.summary_text
+        "{} {} {} {}",
+        "Review".bold().bright_magenta(),
+        review.review_id.bold().bright_white(),
+        format!("verdict={}", review.verdict).bold().to_string(),
+        format!("risk={}", review.risk_level).yellow().to_string(),
     );
+    print_indented_value("summary", &review.summary_text);
 
     let findings_json = match serde_json::from_str::<serde_json::Value>(&review.findings_json) {
         Ok(value) => value,

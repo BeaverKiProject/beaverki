@@ -5182,6 +5182,7 @@ Use Lua tools when recurring or structured automation materially helps. Writing 
 Use workflow tools for staged recurring automation. Reuse the same workflow_id when revising a workflow so BeaverKI creates a new workflow version instead of inventing unrelated workflows. Safety-approved workflows can be activated directly, and once active they can be scheduled without an extra approval step.
 When writing workflow definitions, treat `agent_task` prompts as durable prompt templates rather than short notes. If a stage has multiple rules, scope boundaries, or output-format requirements, encode them in readable multi-line text with explicit paragraphs or lists inside `config.prompt` instead of flattening them into one dense sentence.
 When a user is building or debugging a workflow, inspect existing state before proposing changes: use workflow_get for the current definition, workflow_run_list to see recent runs, and workflow_run_get to inspect persisted artifacts, final results, retry state, and block reasons for a specific run.
+When a user asks for a workflow overview, summary, or stage-by-stage explanation, use workflow_get and present both a concise overall summary and a readable stage breakdown grounded in the fetched definition.
 If a workflow run failed or blocked, prefer reading the run state and artifacts first, then revise the workflow with workflow_write using the same workflow_id, and only then suggest activation, replay, or rescheduling as needed.
 Never claim a workflow was created, revised, activated, scheduled, replayed, or successfully completed unless the corresponding workflow tool returned success in this task.
 Use memory_read before updating existing mutable memory or when you need to confirm the current canonical value under a subject key.
@@ -7756,6 +7757,7 @@ mod tests {
         assert!(prompt.contains("Reuse the same workflow_id when revising a workflow"));
         assert!(prompt.contains("workflow_run_list"));
         assert!(prompt.contains("workflow_run_get"));
+        assert!(prompt.contains("workflow overview, summary, or stage-by-stage explanation"));
         assert!(prompt.contains("Use memory_read before updating existing mutable memory"));
         assert!(prompt.contains("Use memory_write for mutable durable scoped state"));
         assert!(prompt.contains("Automatic memory retrieval for the current conversation may be narrower than your role-based memory tool access"));
@@ -7780,9 +7782,11 @@ mod tests {
             schema["properties"]["stages"]["items"]["properties"]["config"]["type"],
             json!(["string", "null"])
         );
-        assert!(definition
-            .description
-            .contains("prefer readable multi-line prompt text with explicit line breaks"));
+        assert!(
+            definition
+                .description
+                .contains("prefer readable multi-line prompt text with explicit line breaks")
+        );
     }
 
     #[test]
@@ -7795,6 +7799,7 @@ mod tests {
 
         assert!(prompt.contains("treat `agent_task` prompts as durable prompt templates"));
         assert!(prompt.contains("encode them in readable multi-line text with explicit paragraphs or lists inside `config.prompt`"));
+        assert!(prompt.contains("use workflow_get and present both a concise overall summary and a readable stage breakdown"));
     }
 
     #[test]
@@ -7829,6 +7834,124 @@ mod tests {
         ]))
         .expect_err("missing artifact_ref should fail");
         assert!(error.to_string().contains("requires artifact_ref"));
+    }
+
+    #[tokio::test]
+    async fn workflow_overview_requests_can_fetch_definition_and_answer_with_stage_detail() {
+        let provider = FakeProvider::new(vec![
+            ModelTurnResponse {
+                output_items: vec![json!({
+                    "type": "function_call",
+                    "call_id": "call_workflow_get",
+                    "name": "workflow_get",
+                    "arguments": "{\"workflow_id\":\"workflow_news_digest\"}"
+                })],
+                tool_calls: vec![beaverki_models::ModelToolCall {
+                    call_id: "call_workflow_get".to_owned(),
+                    name: "workflow_get".to_owned(),
+                    arguments: json!({
+                        "workflow_id": "workflow_news_digest"
+                    }),
+                }],
+                output_text: String::new(),
+                usage: None,
+            },
+            ModelTurnResponse {
+                output_items: vec![json!({
+                    "type": "message",
+                    "content": [{
+                        "type": "output_text",
+                        "text": "Workflow News Digest is active and safety-approved. It has three stages: 1. Fetch headlines runs the Lua script `script_fetch_headlines`. 2. Summarize headlines asks the agent to condense the top stories into a short digest. 3. Notify owner sends the final digest to Alex."
+                    }]
+                })],
+                tool_calls: vec![],
+                output_text: "Workflow News Digest is active and safety-approved. It has three stages: 1. Fetch headlines runs the Lua script `script_fetch_headlines`. 2. Summarize headlines asks the agent to condense the top stories into a short digest. 3. Notify owner sends the final digest to Alex.".to_owned(),
+                usage: None,
+            },
+        ]);
+        let (db, runner) = test_runner(provider).await;
+        let default_user = db.default_user().await.expect("default").expect("user");
+        let roles = db
+            .list_user_roles(&default_user.user_id)
+            .await
+            .expect("roles")
+            .into_iter()
+            .map(|row| row.role_id)
+            .collect::<Vec<_>>();
+
+        db.create_workflow_definition(
+            NewWorkflowDefinition {
+                workflow_id: Some("workflow_news_digest"),
+                owner_user_id: &default_user.user_id,
+                name: "Workflow News Digest",
+                description: Some("Fetch and summarize a morning news digest."),
+                status: "active",
+                created_from_task_id: Some("task_seed"),
+                safety_status: "approved",
+                safety_summary: Some("approved"),
+            },
+            &[
+                NewWorkflowStage {
+                    stage_id: Some("workflow_stage_fetch"),
+                    stage_kind: "lua_script",
+                    stage_label: Some("Fetch headlines"),
+                    artifact_ref: Some("script_fetch_headlines"),
+                    stage_config_json: json!({
+                        "entrypoint": "fetch_headlines",
+                        "source": "rss"
+                    }),
+                },
+                NewWorkflowStage {
+                    stage_id: Some("workflow_stage_summarize"),
+                    stage_kind: "agent_task",
+                    stage_label: Some("Summarize headlines"),
+                    artifact_ref: None,
+                    stage_config_json: json!({
+                        "prompt": "Summarize the top headlines into a concise morning briefing.",
+                        "model": "gpt-5.4-mini"
+                    }),
+                },
+                NewWorkflowStage {
+                    stage_id: Some("workflow_stage_notify"),
+                    stage_kind: "user_notify",
+                    stage_label: Some("Notify owner"),
+                    artifact_ref: None,
+                    stage_config_json: json!({
+                        "recipient": "Alex",
+                        "message_template": "Morning digest:\n{{last_result}}"
+                    }),
+                },
+            ],
+        )
+        .await
+        .expect("workflow");
+
+        let result = runner
+            .run_task(AgentRequest {
+                owner_user_id: default_user.user_id.clone(),
+                initiating_identity_id: format!("cli:{}", default_user.user_id),
+                primary_agent_id: default_user.primary_agent_id.clone().expect("agent"),
+                assigned_agent_id: default_user.primary_agent_id.clone().expect("agent"),
+                role_ids: roles.clone(),
+                objective: "Give me an overview of workflow workflow_news_digest and show the stages in detail.".to_owned(),
+                scope: MemoryScope::Private,
+                kind: "interactive".to_owned(),
+                parent_task_id: None,
+                task_context: None,
+                visible_scopes: visible_memory_scopes(&roles),
+                memory_mode: AgentMemoryMode::ScopedRetrieval,
+                approved_shell_commands: Vec::new(),
+                approved_automation_actions: Vec::new(),
+            })
+            .await
+            .expect("run");
+
+        assert_eq!(result.task.state, TaskState::Completed.as_str());
+        let answer = result.task.result_text.as_deref().expect("result text");
+        assert!(answer.contains("Workflow News Digest"));
+        assert!(answer.contains("three stages"));
+        assert!(answer.contains("script_fetch_headlines"));
+        assert!(answer.contains("Notify owner"));
     }
 
     #[tokio::test]

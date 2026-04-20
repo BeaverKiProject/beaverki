@@ -51,26 +51,30 @@ pub(super) async fn send_discord_message(
     channel_id: &str,
     content: &str,
 ) -> Result<String> {
-    let message = truncate_reply(content);
-    let response = http_client
-        .post(format!(
-            "{}/channels/{channel_id}/messages",
-            discord_api_base()
-        ))
-        .header("Authorization", format!("Bot {token}"))
-        .json(&json!({ "content": message }))
-        .send()
-        .await
-        .with_context(|| format!("failed to send Discord message to channel {channel_id}"))?
-        .error_for_status()
-        .with_context(|| format!("Discord rejected message for channel {channel_id}"))?;
-    let created = response
-        .json::<DiscordCreatedMessage>()
-        .await
-        .with_context(|| {
-            format!("failed to decode Discord message response for channel {channel_id}")
-        })?;
-    Ok(created.id)
+    let mut last_message_id = None;
+    for message_chunk in split_discord_message_chunks(content) {
+        let response = http_client
+            .post(format!(
+                "{}/channels/{channel_id}/messages",
+                discord_api_base()
+            ))
+            .header("Authorization", format!("Bot {token}"))
+            .json(&json!({ "content": message_chunk }))
+            .send()
+            .await
+            .with_context(|| format!("failed to send Discord message to channel {channel_id}"))?
+            .error_for_status()
+            .with_context(|| format!("Discord rejected message for channel {channel_id}"))?;
+        let created = response
+            .json::<DiscordCreatedMessage>()
+            .await
+            .with_context(|| {
+                format!("failed to decode Discord message response for channel {channel_id}")
+            })?;
+        last_message_id = Some(created.id);
+    }
+
+    Ok(last_message_id.unwrap_or_default())
 }
 
 pub(crate) async fn send_direct_household_message(
@@ -531,6 +535,58 @@ pub(super) fn truncate_reply(reply: &str) -> String {
     }
 }
 
+fn split_discord_message_chunks(message: &str) -> Vec<String> {
+    if message.is_empty() {
+        return vec![String::new()];
+    }
+
+    let mut chunks = Vec::new();
+    let mut remaining = message;
+    while !remaining.is_empty() {
+        if remaining.chars().count() <= DISCORD_MAX_MESSAGE_LEN {
+            chunks.push(remaining.to_owned());
+            break;
+        }
+
+        let split_at = discord_chunk_boundary(remaining);
+        let (chunk, rest) = remaining.split_at(split_at);
+        chunks.push(chunk.to_owned());
+        remaining = rest;
+    }
+
+    chunks
+}
+
+fn discord_chunk_boundary(message: &str) -> usize {
+    let mut last_boundary = 0usize;
+    let mut last_paragraph_boundary = None;
+    let mut last_line_boundary = None;
+    let mut last_space_boundary = None;
+
+    for (idx, ch) in message.char_indices() {
+        let next_idx = idx + ch.len_utf8();
+        if next_idx > DISCORD_MAX_MESSAGE_LEN {
+            break;
+        }
+        last_boundary = next_idx;
+
+        if ch == '\n' {
+            last_line_boundary = Some(next_idx);
+        } else if ch.is_whitespace() {
+            last_space_boundary = Some(next_idx);
+        }
+
+        if message[..next_idx].ends_with("\n\n") {
+            last_paragraph_boundary = Some(next_idx);
+        }
+    }
+
+    last_paragraph_boundary
+        .or(last_line_boundary)
+        .or(last_space_boundary)
+        .unwrap_or(last_boundary)
+}
+
 async fn create_discord_dm_channel(
     http_client: &reqwest::Client,
     token: &str,
@@ -648,4 +704,57 @@ async fn send_discord_typing(
         .error_for_status()
         .with_context(|| format!("Discord rejected typing indicator for channel {channel_id}"))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DISCORD_MAX_MESSAGE_LEN, split_discord_message_chunks, truncate_reply};
+
+    #[test]
+    fn truncate_reply_shortens_oversized_interaction_content() {
+        let reply = "x".repeat(DISCORD_MAX_MESSAGE_LEN + 20);
+        let truncated = truncate_reply(&reply);
+        assert_eq!(truncated.chars().count(), DISCORD_MAX_MESSAGE_LEN + 3);
+        assert!(truncated.ends_with("..."));
+    }
+
+    #[test]
+    fn split_discord_message_chunks_keeps_short_messages_intact() {
+        let message = "Short Discord message.";
+        assert_eq!(
+            split_discord_message_chunks(message),
+            vec![message.to_owned()]
+        );
+    }
+
+    #[test]
+    fn split_discord_message_chunks_splits_long_messages_without_losing_text() {
+        let part_a = "a".repeat(DISCORD_MAX_MESSAGE_LEN - 10);
+        let part_b = "b".repeat(DISCORD_MAX_MESSAGE_LEN - 20);
+        let part_c = "c".repeat(100);
+        let message = format!("{part_a}\n\n{part_b}\n{part_c}");
+
+        let chunks = split_discord_message_chunks(&message);
+        assert!(chunks.len() >= 2);
+        assert!(
+            chunks
+                .iter()
+                .all(|chunk| chunk.chars().count() <= DISCORD_MAX_MESSAGE_LEN)
+        );
+        assert_eq!(chunks.concat(), message);
+    }
+
+    #[test]
+    fn split_discord_message_chunks_handles_unbroken_text() {
+        let message = "x".repeat((DISCORD_MAX_MESSAGE_LEN * 2) + 17);
+        let chunks = split_discord_message_chunks(&message);
+
+        assert_eq!(chunks.len(), 3);
+        assert!(
+            chunks
+                .iter()
+                .all(|chunk| chunk.chars().count() <= DISCORD_MAX_MESSAGE_LEN)
+        );
+        assert_eq!(chunks.concat(), message);
+    }
 }

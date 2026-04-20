@@ -8,6 +8,10 @@ pub(crate) fn parse_json_field(raw: &str, label: &str) -> Result<Value> {
     serde_json::from_str(raw).with_context(|| format!("failed to parse {label}"))
 }
 
+pub fn parse_workflow_stage_config(raw: &str) -> Result<Value> {
+    parse_json_field(raw, "workflow stage config")
+}
+
 pub(crate) fn validate_workflow_definition_input(
     definition: &WorkflowDefinitionInput,
 ) -> Result<()> {
