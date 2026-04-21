@@ -797,7 +797,11 @@ fn notion_children_from_text(content: &str) -> Vec<Value> {
         // Fenced code block — always top-level; clears parent context
         if line.starts_with("```") || line.starts_with("~~~") {
             last_top_idx = None;
-            let fence = if line.starts_with("```") { "```" } else { "~~~" };
+            let fence = if line.starts_with("```") {
+                "```"
+            } else {
+                "~~~"
+            };
             let lang = line.trim_start_matches('`').trim_start_matches('~').trim();
             let mut code_lines: Vec<&str> = Vec::new();
             i += 1;
@@ -854,25 +858,31 @@ fn notion_children_from_text(content: &str) -> Vec<Value> {
         }
 
         // Single-line block types
-        let block: Option<Value> =
-            if let Some(text) = line.strip_prefix("- [ ] ").or_else(|| line.strip_prefix("* [ ] ")) {
-                Some(json!({"object":"block","type":"to_do","to_do":{"checked":false,"rich_text":notion_rich_text_segments(text)}}))
-            } else if let Some(text) = line
-                .strip_prefix("- [x] ")
-                .or_else(|| line.strip_prefix("- [X] "))
-                .or_else(|| line.strip_prefix("* [x] "))
-                .or_else(|| line.strip_prefix("* [X] "))
-            {
-                Some(json!({"object":"block","type":"to_do","to_do":{"checked":true,"rich_text":notion_rich_text_segments(text)}}))
-            } else if let Some(text) = line.strip_prefix("- ").or_else(|| line.strip_prefix("* ")) {
-                Some(make_rich_block("bulleted_list_item", text))
-            } else if let Some(text) = strip_numbered_list_prefix(line) {
-                Some(make_rich_block("numbered_list_item", text))
-            } else if let Some(text) = line.strip_prefix("> ") {
-                Some(make_rich_block("quote", text))
-            } else {
-                None
-            };
+        let block: Option<Value> = if let Some(text) = line
+            .strip_prefix("- [ ] ")
+            .or_else(|| line.strip_prefix("* [ ] "))
+        {
+            Some(
+                json!({"object":"block","type":"to_do","to_do":{"checked":false,"rich_text":notion_rich_text_segments(text)}}),
+            )
+        } else if let Some(text) = line
+            .strip_prefix("- [x] ")
+            .or_else(|| line.strip_prefix("- [X] "))
+            .or_else(|| line.strip_prefix("* [x] "))
+            .or_else(|| line.strip_prefix("* [X] "))
+        {
+            Some(
+                json!({"object":"block","type":"to_do","to_do":{"checked":true,"rich_text":notion_rich_text_segments(text)}}),
+            )
+        } else if let Some(text) = line.strip_prefix("- ").or_else(|| line.strip_prefix("* ")) {
+            Some(make_rich_block("bulleted_list_item", text))
+        } else if let Some(text) = strip_numbered_list_prefix(line) {
+            Some(make_rich_block("numbered_list_item", text))
+        } else if let Some(text) = line.strip_prefix("> ") {
+            Some(make_rich_block("quote", text))
+        } else {
+            None
+        };
 
         if let Some(b) = block {
             push_or_nest(&mut children, &mut last_top_idx, b, is_indented);
@@ -972,10 +982,10 @@ fn strip_one_indent(line: &str) -> (bool, &str) {
 
 fn make_rich_block(block_type: &str, text: &str) -> Value {
     let mut block = json!({"object": "block", "type": block_type});
-    block
-        .as_object_mut()
-        .unwrap()
-        .insert(block_type.to_owned(), json!({"rich_text": notion_rich_text_segments(text)}));
+    block.as_object_mut().unwrap().insert(
+        block_type.to_owned(),
+        json!({"rich_text": notion_rich_text_segments(text)}),
+    );
     block
 }
 

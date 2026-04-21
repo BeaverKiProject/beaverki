@@ -3,6 +3,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 #[cfg(test)]
+use std::collections::HashMap;
+#[cfg(test)]
 use std::sync::{Mutex, OnceLock};
 
 use anyhow::{Context, Result};
@@ -15,8 +17,8 @@ use crate::RuntimeDaemon;
 
 use super::models::{
     DiscordCreateDmResponse, DiscordCreatedMessage, DiscordCurrentUser,
-    DiscordDirectDeliveryResult, DiscordRateLimitBody, DiscordRegisteredCommand,
-    DiscordRegisteredCommandOption,
+    DiscordDirectDeliveryResult, DiscordFetchedMessage, DiscordRateLimitBody,
+    DiscordRegisteredCommand, DiscordRegisteredCommandOption,
 };
 
 const DISCORD_API_BASE: &str = "https://discord.com/api/v10";
@@ -25,6 +27,27 @@ const DISCORD_TYPING_REFRESH_INTERVAL: Duration = Duration::from_secs(8);
 
 #[cfg(test)]
 static TEST_DIRECT_SEND_CAPTURE: OnceLock<Mutex<Option<Arc<Mutex<Vec<String>>>>>> = OnceLock::new();
+#[cfg(test)]
+static TEST_HISTORY_CAPTURE: OnceLock<Mutex<Option<TestHistoryCapture>>> = OnceLock::new();
+
+pub(crate) struct DiscordHistoryQuery<'a> {
+    pub(crate) limit: u16,
+    pub(crate) before_message_id: Option<&'a str>,
+    pub(crate) after_message_id: Option<&'a str>,
+    pub(crate) around_message_id: Option<&'a str>,
+    pub(crate) addressed_to_bot_only: bool,
+}
+
+pub(crate) struct DiscordFetchedHistory {
+    pub(crate) messages: Vec<DiscordFetchedMessage>,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct TestHistoryCapture {
+    bot_user_id: Option<String>,
+    channel_messages: HashMap<String, Vec<DiscordFetchedMessage>>,
+}
 
 fn discord_api_base() -> String {
     DISCORD_API_BASE.to_owned()
@@ -36,6 +59,28 @@ pub(crate) fn set_test_direct_send_capture(value: Option<Arc<Mutex<Vec<String>>>
         .get_or_init(|| Mutex::new(None))
         .lock()
         .expect("discord direct send capture lock") = value;
+}
+
+#[cfg(test)]
+pub(crate) fn set_test_history_capture(
+    bot_user_id: Option<String>,
+    channel_messages: HashMap<String, Vec<DiscordFetchedMessage>>,
+) {
+    *TEST_HISTORY_CAPTURE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .expect("discord history capture lock") = Some(TestHistoryCapture {
+        bot_user_id,
+        channel_messages,
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn clear_test_history_capture() {
+    *TEST_HISTORY_CAPTURE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .expect("discord history capture lock") = None;
 }
 
 pub(crate) fn build_discord_http_client() -> Result<reqwest::Client> {
@@ -184,6 +229,17 @@ pub(super) async fn fetch_discord_current_user_id(
     http_client: &reqwest::Client,
     token: &str,
 ) -> Result<String> {
+    #[cfg(test)]
+    if let Some(capture) = TEST_HISTORY_CAPTURE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .expect("discord history capture lock")
+        .clone()
+        && let Some(bot_user_id) = capture.bot_user_id
+    {
+        return Ok(bot_user_id);
+    }
+
     let current_user = http_client
         .get(format!("{}/users/@me", discord_api_base()))
         .header("Authorization", format!("Bot {token}"))
@@ -196,6 +252,68 @@ pub(super) async fn fetch_discord_current_user_id(
         .await
         .context("failed to decode Discord bot identity response")?;
     Ok(current_user.id)
+}
+
+pub(crate) async fn fetch_discord_messages(
+    http_client: &reqwest::Client,
+    token: &str,
+    channel_id: &str,
+    query: &DiscordHistoryQuery<'_>,
+) -> Result<DiscordFetchedHistory> {
+    #[cfg(test)]
+    if let Some(capture) = TEST_HISTORY_CAPTURE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .expect("discord history capture lock")
+        .clone()
+    {
+        let messages = capture
+            .channel_messages
+            .get(channel_id)
+            .cloned()
+            .unwrap_or_default();
+        return Ok(DiscordFetchedHistory {
+            messages: filter_discord_messages(messages, query, capture.bot_user_id.as_deref()),
+        });
+    }
+
+    let mut request = http_client
+        .get(format!(
+            "{}/channels/{channel_id}/messages",
+            discord_api_base()
+        ))
+        .header("Authorization", format!("Bot {token}"))
+        .query(&[("limit", query.limit.to_string())]);
+    if let Some(before_message_id) = query.before_message_id {
+        request = request.query(&[("before", before_message_id)]);
+    }
+    if let Some(after_message_id) = query.after_message_id {
+        request = request.query(&[("after", after_message_id)]);
+    }
+    if let Some(around_message_id) = query.around_message_id {
+        request = request.query(&[("around", around_message_id)]);
+    }
+
+    let mut messages = request
+        .send()
+        .await
+        .with_context(|| format!("failed to fetch Discord messages for channel {channel_id}"))?
+        .error_for_status()
+        .with_context(|| format!("Discord rejected history request for channel {channel_id}"))?
+        .json::<Vec<DiscordFetchedMessage>>()
+        .await
+        .with_context(|| format!("failed to decode Discord history for channel {channel_id}"))?;
+    messages.reverse();
+
+    let bot_user_id = if query.addressed_to_bot_only {
+        Some(fetch_discord_current_user_id(http_client, token).await?)
+    } else {
+        None
+    };
+
+    Ok(DiscordFetchedHistory {
+        messages: filter_discord_messages(messages, query, bot_user_id.as_deref()),
+    })
 }
 
 pub(super) async fn send_discord_interaction_callback(
@@ -706,9 +824,42 @@ async fn send_discord_typing(
     Ok(())
 }
 
+fn filter_discord_messages(
+    messages: Vec<DiscordFetchedMessage>,
+    query: &DiscordHistoryQuery<'_>,
+    bot_user_id: Option<&str>,
+) -> Vec<DiscordFetchedMessage> {
+    let filtered = if query.addressed_to_bot_only {
+        let Some(bot_user_id) = bot_user_id else {
+            return Vec::new();
+        };
+        messages
+            .into_iter()
+            .filter(|message| discord_message_addresses_bot(message, bot_user_id))
+            .collect::<Vec<_>>()
+    } else {
+        messages
+    };
+
+    filtered
+        .into_iter()
+        .take(usize::from(query.limit))
+        .collect::<Vec<_>>()
+}
+
+fn discord_message_addresses_bot(message: &DiscordFetchedMessage, bot_user_id: &str) -> bool {
+    let direct_mention = format!("<@{bot_user_id}>");
+    let nickname_mention = format!("<@!{bot_user_id}>");
+    message.content.contains(&direct_mention) || message.content.contains(&nickname_mention)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{DISCORD_MAX_MESSAGE_LEN, split_discord_message_chunks, truncate_reply};
+    use super::{
+        DISCORD_MAX_MESSAGE_LEN, DiscordFetchedMessage, DiscordHistoryQuery,
+        filter_discord_messages, split_discord_message_chunks, truncate_reply,
+    };
+    use crate::discord::models::{DiscordAuthor, DiscordReferencedMessage};
 
     #[test]
     fn truncate_reply_shortens_oversized_interaction_content() {
@@ -756,5 +907,51 @@ mod tests {
                 .all(|chunk| chunk.chars().count() <= DISCORD_MAX_MESSAGE_LEN)
         );
         assert_eq!(chunks.concat(), message);
+    }
+
+    #[test]
+    fn filter_discord_messages_can_limit_to_messages_addressed_to_bot() {
+        let messages = vec![
+            DiscordFetchedMessage {
+                id: "1".to_owned(),
+                channel_id: "room-1".to_owned(),
+                content: "hello everyone".to_owned(),
+                timestamp: Some("2026-04-21T10:00:00Z".to_owned()),
+                author: DiscordAuthor {
+                    id: "user-1".to_owned(),
+                    bot: Some(false),
+                    username: Some("alex".to_owned()),
+                    global_name: Some("Alex".to_owned()),
+                },
+                referenced_message: None,
+            },
+            DiscordFetchedMessage {
+                id: "2".to_owned(),
+                channel_id: "room-1".to_owned(),
+                content: "<@bot-1> can you help?".to_owned(),
+                timestamp: Some("2026-04-21T10:01:00Z".to_owned()),
+                author: DiscordAuthor {
+                    id: "user-2".to_owned(),
+                    bot: Some(false),
+                    username: Some("casey".to_owned()),
+                    global_name: Some("Casey".to_owned()),
+                },
+                referenced_message: Some(DiscordReferencedMessage { id: "1".to_owned() }),
+            },
+        ];
+        let filtered = filter_discord_messages(
+            messages,
+            &DiscordHistoryQuery {
+                limit: 10,
+                before_message_id: None,
+                after_message_id: None,
+                around_message_id: None,
+                addressed_to_bot_only: true,
+            },
+            Some("bot-1"),
+        );
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].id, "2");
     }
 }

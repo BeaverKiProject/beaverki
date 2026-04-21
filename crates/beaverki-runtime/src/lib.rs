@@ -31,6 +31,7 @@ mod connector_support;
 mod daemon;
 mod delivery;
 mod discord;
+mod history;
 mod secrets;
 mod session;
 mod types;
@@ -48,6 +49,7 @@ pub use self::workflow::parse_workflow_stage_config;
 
 use self::connector_support::assistant_reply_for_context;
 use self::delivery::{RuntimeHouseholdDeliveryDelegate, tool_error_to_anyhow};
+use self::history::RuntimeConnectorHistoryDelegate;
 use self::secrets::{load_discord_bot_token, load_notion_api_token, load_provider};
 use self::session::{
     CLI_CONVERSATION_HISTORY_LIMIT, CliConversationExchange, CliConversationStatus,
@@ -218,6 +220,11 @@ impl Runtime {
             runtime_actor_id: config.runtime.instance_id.clone(),
             discord_bot_token: discord_bot_token.clone(),
         });
+        let connector_history_delegate = Arc::new(RuntimeConnectorHistoryDelegate {
+            db: db.clone(),
+            runtime_actor_id: config.runtime.instance_id.clone(),
+            discord_bot_token: discord_bot_token.clone(),
+        });
         let builtin = builtin_registry();
         let builtin_tool_names = builtin
             .definitions()
@@ -241,6 +248,7 @@ impl Runtime {
             builtin,
             tool_context,
             Some(household_delivery_delegate),
+            Some(connector_history_delegate),
             usize::from(config.runtime.defaults.max_agent_steps),
         );
 
@@ -4191,6 +4199,7 @@ mod tests {
             default_user,
             Arc::new(FakeProvider::new(responses)),
             discord_bot_token,
+            None,
         )
         .expect("runtime");
         (tempdir, runtime)
@@ -4689,6 +4698,153 @@ mod tests {
             .as_deref()
             .expect("dm context");
         assert!(!context.contains("First channel message"));
+    }
+
+    #[tokio::test]
+    async fn discord_connector_history_tool_reads_bounded_channel_history() {
+        let _guard = direct_send_test_guard();
+        let (_tempdir, mut runtime) = test_runtime_with_discord_token(
+            vec![
+                ModelTurnResponse {
+                    output_items: vec![json!({
+                        "type": "function_call",
+                        "call_id": "call_connector_history",
+                        "name": "connector_history_read",
+                        "arguments": "{\"limit\":2,\"before_message_id\":null,\"after_message_id\":null,\"around_message_id\":null,\"addressed_to_bot_only\":false}"
+                    })],
+                    tool_calls: vec![beaverki_models::ModelToolCall {
+                        call_id: "call_connector_history".to_owned(),
+                        name: "connector_history_read".to_owned(),
+                        arguments: json!({
+                            "limit": 2,
+                            "before_message_id": Value::Null,
+                            "after_message_id": Value::Null,
+                            "around_message_id": Value::Null,
+                            "addressed_to_bot_only": false,
+                        }),
+                    }],
+                    output_text: String::new(),
+                    usage: None,
+                },
+                ModelTurnResponse {
+                    output_items: vec![json!({
+                        "type": "message",
+                        "content": [{
+                            "type": "output_text",
+                            "text": "I checked the channel history."
+                        }]
+                    })],
+                    tool_calls: vec![],
+                    output_text: "I checked the channel history.".to_owned(),
+                    usage: None,
+                },
+            ],
+            Some("discord-test-token".to_owned()),
+        )
+        .await;
+        runtime.config.integrations.discord.allowed_channels = vec![DiscordAllowedChannel {
+            channel_id: "room-1".to_owned(),
+            mode: DiscordChannelMode::Household,
+        }];
+        runtime.config.integrations.discord.task_wait_timeout_secs = 0;
+        runtime
+            .db
+            .upsert_connector_identity(
+                "discord",
+                "discord-user-history",
+                Some("room-1"),
+                "user_alex",
+                "authenticated_message",
+            )
+            .await
+            .expect("mapping");
+        crate::discord::set_test_history_capture(
+            None,
+            std::collections::HashMap::from([(
+                "room-1".to_owned(),
+                vec![
+                    crate::discord::DiscordFetchedMessage {
+                        id: "room-msg-1".to_owned(),
+                        channel_id: "room-1".to_owned(),
+                        content: "Earlier room message".to_owned(),
+                        timestamp: Some("2026-04-21T10:00:00Z".to_owned()),
+                        author: crate::discord::DiscordAuthorSummary {
+                            id: "discord-user-a".to_owned(),
+                            bot: Some(false),
+                            username: Some("alex".to_owned()),
+                            global_name: Some("Alex".to_owned()),
+                        },
+                        referenced_message: None,
+                    },
+                    crate::discord::DiscordFetchedMessage {
+                        id: "room-msg-2".to_owned(),
+                        channel_id: "room-1".to_owned(),
+                        content: "Second room message".to_owned(),
+                        timestamp: Some("2026-04-21T10:01:00Z".to_owned()),
+                        author: crate::discord::DiscordAuthorSummary {
+                            id: "discord-user-b".to_owned(),
+                            bot: Some(false),
+                            username: Some("casey".to_owned()),
+                            global_name: Some("Casey".to_owned()),
+                        },
+                        referenced_message: Some(crate::discord::DiscordReferencedMessage {
+                            id: "room-msg-1".to_owned(),
+                        }),
+                    },
+                ],
+            )]),
+        );
+        let db = runtime.db.clone();
+        let daemon = RuntimeDaemon::new(runtime);
+
+        let reply = daemon
+            .handle_connector_message(ConnectorMessageRequest {
+                connector_type: "discord".to_owned(),
+                external_user_id: "discord-user-history".to_owned(),
+                external_display_name: Some("Alex".to_owned()),
+                channel_id: "room-1".to_owned(),
+                message_id: "room-msg-current".to_owned(),
+                content: "!bk what was said earlier?".to_owned(),
+                is_direct_message: false,
+            })
+            .await
+            .expect("message");
+        assert!(reply.accepted);
+        daemon
+            .runtime
+            .execute_next_runnable_task()
+            .await
+            .expect("execute task")
+            .expect("task result");
+
+        let task = db
+            .list_recent_interactive_tasks_for_owner("user_alex", 1)
+            .await
+            .expect("recent task")
+            .into_iter()
+            .next()
+            .expect("task");
+        assert_eq!(
+            task.result_text.as_deref(),
+            Some("I checked the channel history.")
+        );
+        let invocations = db
+            .fetch_tool_invocations_for_owner("user_alex", &task.task_id)
+            .await
+            .expect("tool invocations");
+        let invocation = invocations
+            .iter()
+            .find(|invocation| invocation.tool_name == "connector_history_read")
+            .expect("history invocation");
+        assert!(
+            invocation
+                .response_json
+                .as_deref()
+                .expect("response json")
+                .contains("Earlier room message")
+        );
+
+        crate::discord::clear_test_history_capture();
     }
 
     #[tokio::test]

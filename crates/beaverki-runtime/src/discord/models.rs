@@ -68,7 +68,7 @@ pub(super) struct DiscordRateLimitBody {
     pub(super) retry_after: Option<f64>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub(super) struct DiscordMessageCreate {
     pub(super) id: String,
     pub(super) channel_id: String,
@@ -77,12 +77,27 @@ pub(super) struct DiscordMessageCreate {
     pub(super) author: DiscordAuthor,
 }
 
-#[derive(Debug, Deserialize)]
-pub(super) struct DiscordAuthor {
-    pub(super) id: String,
-    pub(super) bot: Option<bool>,
-    pub(super) username: Option<String>,
-    pub(super) global_name: Option<String>,
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct DiscordAuthor {
+    pub(crate) id: String,
+    pub(crate) bot: Option<bool>,
+    pub(crate) username: Option<String>,
+    pub(crate) global_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct DiscordFetchedMessage {
+    pub(crate) id: String,
+    pub(crate) channel_id: String,
+    pub(crate) content: String,
+    pub(crate) timestamp: Option<String>,
+    pub(crate) author: DiscordAuthor,
+    pub(crate) referenced_message: Option<DiscordReferencedMessage>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct DiscordReferencedMessage {
+    pub(crate) id: String,
 }
 
 #[derive(Debug, Deserialize)]

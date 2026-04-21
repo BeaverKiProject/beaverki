@@ -41,12 +41,18 @@ use self::interactions::{
 };
 use self::models::DiscordInteractionCreate;
 
+pub(crate) use self::api::{DiscordHistoryQuery, fetch_discord_messages};
 pub(crate) use self::api::{build_discord_http_client, send_direct_household_message};
 pub(crate) use self::gateway::run_discord_loop;
+pub(crate) use self::models::DiscordAuthor as DiscordAuthorSummary;
 pub(crate) use self::models::DiscordDirectDeliveryResult;
+#[cfg(test)]
+pub(crate) use self::models::{DiscordFetchedMessage, DiscordReferencedMessage};
 
 #[cfg(test)]
 pub(crate) use self::api::set_test_direct_send_capture;
+#[cfg(test)]
+pub(crate) use self::api::{clear_test_history_capture, set_test_history_capture};
 
 const DISCORD_CONVERSATION_HISTORY_LIMIT: i64 = 4;
 const DISCORD_ACTIVE_CONVERSATION_WINDOW_SECS: i64 = 45 * 60;
