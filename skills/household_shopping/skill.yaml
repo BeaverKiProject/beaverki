@@ -1,0 +1,111 @@
+tools:
+  - tool_id: shopping_list_get
+    kind: lua
+    description: >
+      Read a household shopping list stored on a shared Notion page and return the current list items.
+      This focuses on to-do and list-style blocks so the agent can reason over a practical shopping list
+      without parsing the whole page manually.
+    source_path: shopping_list_get.lua
+    input_schema:
+      type: object
+      properties:
+        page_ref:
+          type: [string, "null"]
+        page_query:
+          type: [string, "null"]
+        page_title_hint:
+          type: [string, "null"]
+        search_page_size:
+          type: [integer, "null"]
+          minimum: 1
+          maximum: 100
+        include_checked:
+          type: [boolean, "null"]
+        page_size:
+          type: [integer, "null"]
+          minimum: 1
+          maximum: 100
+      required: [page_ref, page_query, page_title_hint, search_page_size, include_checked, page_size]
+      additionalProperties: false
+    output_schema:
+      type: object
+      properties:
+        page_ref:
+          type: string
+        page_id:
+          type: string
+        page_title:
+          type: string
+        resolved_via:
+          type: string
+        search_query:
+          type: [string, "null"]
+        item_count:
+          type: integer
+        items:
+          type: array
+          items:
+            type: object
+            properties:
+              block_id:
+                type: [string, "null"]
+              text:
+                type: string
+              checked:
+                type: boolean
+              kind:
+                type: string
+            required: [block_id, text, checked, kind]
+            additionalProperties: false
+      required: [page_ref, page_id, page_title, resolved_via, search_query, item_count, items]
+      additionalProperties: false
+    capability_profile:
+      allowed_tools: [notion_search, notion_fetch]
+  - tool_id: shopping_list_add_items
+    kind: lua
+    description: >
+      Append one or more unchecked shopping-list items to a shared Notion page using native Notion to-do blocks.
+      If no page_ref is provided, BeaverKi searches Notion for the most likely shopping-list page first.
+    source_path: shopping_list_add_items.lua
+    input_schema:
+      type: object
+      properties:
+        page_ref:
+          type: [string, "null"]
+        page_query:
+          type: [string, "null"]
+        page_title_hint:
+          type: [string, "null"]
+        search_page_size:
+          type: [integer, "null"]
+          minimum: 1
+          maximum: 100
+        items:
+          type: array
+          items:
+            type: string
+      required: [page_ref, page_query, page_title_hint, search_page_size, items]
+      additionalProperties: false
+    output_schema:
+      type: object
+      properties:
+        page_ref:
+          type: string
+        resolved_via:
+          type: string
+        search_query:
+          type: [string, "null"]
+        added_count:
+          type: integer
+        items:
+          type: array
+          items:
+            type: string
+        appended_block_ids:
+          type: array
+          items:
+            type: [string, "null"]
+      required: [page_ref, resolved_via, search_query, added_count, items, appended_block_ids]
+      additionalProperties: false
+    capability_profile:
+      allowed_tools: [notion_search, notion_append_block_children]

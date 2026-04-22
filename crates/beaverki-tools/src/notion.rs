@@ -13,6 +13,7 @@ const MAX_PAGE_SIZE: u64 = 100;
 const MAX_FETCH_BLOCKS: usize = 100;
 const MAX_CREATE_BLOCKS: usize = 50;
 const MAX_BLOCK_TEXT_CHARS: usize = 1_800;
+const MAX_APPEND_BLOCKS: usize = 100;
 
 #[derive(Clone)]
 struct NotionClientConfig {
@@ -371,6 +372,259 @@ impl Tool for NotionCreatePageTool {
     }
 }
 
+pub struct NotionUpdatePageTool;
+
+#[async_trait]
+impl Tool for NotionUpdatePageTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "notion_update_page".to_owned(),
+            description: "Update properties on an existing Notion page using the configured Notion integration. Property values are normalized against the page's current schema.".to_owned(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "ref": { "type": "string" },
+                    "properties_json": { "type": "string" }
+                },
+                "required": ["ref", "properties_json"],
+                "additionalProperties": false
+            }),
+        }
+    }
+
+    async fn call(
+        &self,
+        input: Value,
+        context: &ToolContext,
+    ) -> std::result::Result<ToolOutput, ToolError> {
+        let config = notion_client_config(context).map_err(ToolError::Failed)?;
+        let reference = input
+            .get("ref")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .ok_or_else(|| ToolError::Failed(anyhow!("notion_update_page requires ref")))?;
+        let raw_updates = input
+            .get("properties_json")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                ToolError::Failed(anyhow!("notion_update_page requires properties_json"))
+            })?;
+        let updates = serde_json::from_str::<Value>(raw_updates)
+            .map_err(|error| {
+                ToolError::Failed(anyhow!(
+                    "notion_update_page properties_json must be valid JSON: {error}"
+                ))
+            })?
+            .as_object()
+            .cloned()
+            .ok_or_else(|| {
+                ToolError::Failed(anyhow!(
+                    "notion_update_page properties_json must decode to a JSON object"
+                ))
+            })?;
+        if updates.is_empty() {
+            return Err(ToolError::Failed(anyhow!(
+                "notion_update_page requires at least one property update"
+            )));
+        }
+
+        let page_id = notion_id_from_ref(reference).map_err(ToolError::Failed)?;
+        let existing = notion_request_json(Method::GET, &format!("pages/{page_id}"), None, &config)
+            .await
+            .map_err(ToolError::Failed)?;
+        let properties = notion_update_properties_payload(existing.get("properties"), &updates)
+            .map_err(ToolError::Failed)?;
+        let updated = notion_request_json(
+            Method::PATCH,
+            &format!("pages/{page_id}"),
+            Some(json!({ "properties": properties })),
+            &config,
+        )
+        .await
+        .map_err(ToolError::Failed)?;
+
+        Ok(ToolOutput {
+            payload: json!({
+                "object": "page",
+                "id": updated.get("id").cloned().unwrap_or(Value::Null),
+                "url": updated.get("url").cloned().unwrap_or(Value::Null),
+                "title": notion_object_title(&updated),
+                "updated_properties": updates.keys().cloned().collect::<Vec<_>>(),
+                "last_edited_time": updated.get("last_edited_time").cloned().unwrap_or(Value::Null),
+                "properties": summarize_properties(updated.get("properties")),
+            }),
+        })
+    }
+}
+
+pub struct NotionAppendBlockChildrenTool;
+
+#[async_trait]
+impl Tool for NotionAppendBlockChildrenTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "notion_append_block_children".to_owned(),
+            description: "Append Markdown-like content blocks to an existing Notion page or block. Uses the same content conversion rules as notion_create_page.".to_owned(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "parent_ref": { "type": "string" },
+                    "content": { "type": "string" },
+                    "position": {
+                        "type": ["string", "null"],
+                        "enum": ["start", "end", "after_block", null]
+                    },
+                    "after_block_ref": { "type": ["string", "null"] }
+                },
+                "required": ["parent_ref", "content", "position", "after_block_ref"],
+                "additionalProperties": false
+            }),
+        }
+    }
+
+    async fn call(
+        &self,
+        input: Value,
+        context: &ToolContext,
+    ) -> std::result::Result<ToolOutput, ToolError> {
+        let config = notion_client_config(context).map_err(ToolError::Failed)?;
+        let parent_ref = input
+            .get("parent_ref")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .ok_or_else(|| {
+                ToolError::Failed(anyhow!("notion_append_block_children requires parent_ref"))
+            })?;
+        let content = input
+            .get("content")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                ToolError::Failed(anyhow!("notion_append_block_children requires content"))
+            })?;
+        let position = input.get("position").and_then(Value::as_str);
+        let after_block_ref = input.get("after_block_ref").and_then(Value::as_str);
+
+        let parent_id = notion_id_from_ref(parent_ref).map_err(ToolError::Failed)?;
+        let mut children = notion_children_from_text(content);
+        if children.is_empty() {
+            return Err(ToolError::Failed(anyhow!(
+                "notion_append_block_children requires content that produces at least one block"
+            )));
+        }
+        if children.len() > MAX_APPEND_BLOCKS {
+            children.truncate(MAX_APPEND_BLOCKS);
+        }
+
+        let mut body = json!({ "children": children });
+        if let Some(insert_position) =
+            notion_append_position(position, after_block_ref).map_err(ToolError::Failed)?
+        {
+            body["position"] = insert_position;
+        }
+
+        let response = notion_request_json(
+            Method::PATCH,
+            &format!("blocks/{parent_id}/children"),
+            Some(body),
+            &config,
+        )
+        .await
+        .map_err(ToolError::Failed)?;
+        let appended = response
+            .get("results")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+
+        Ok(ToolOutput {
+            payload: json!({
+                "object": "block_list",
+                "parent_id": parent_id,
+                "appended_count": appended.len(),
+                "appended_block_ids": appended
+                    .iter()
+                    .filter_map(|item| item.get("id").cloned())
+                    .collect::<Vec<_>>(),
+                "has_more": response.get("has_more").cloned().unwrap_or(Value::Bool(false)),
+                "next_cursor": response.get("next_cursor").cloned().unwrap_or(Value::Null),
+            }),
+        })
+    }
+}
+
+pub struct NotionCreateCommentTool;
+
+#[async_trait]
+impl Tool for NotionCreateCommentTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "notion_create_comment".to_owned(),
+            description: "Create a comment on a Notion page or block using the configured Notion integration.".to_owned(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "parent_kind": {
+                        "type": "string",
+                        "enum": ["page", "block"]
+                    },
+                    "parent_ref": { "type": "string" },
+                    "content": { "type": "string" }
+                },
+                "required": ["parent_kind", "parent_ref", "content"],
+                "additionalProperties": false
+            }),
+        }
+    }
+
+    async fn call(
+        &self,
+        input: Value,
+        context: &ToolContext,
+    ) -> std::result::Result<ToolOutput, ToolError> {
+        let config = notion_client_config(context).map_err(ToolError::Failed)?;
+        let parent_kind = input
+            .get("parent_kind")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .ok_or_else(|| {
+                ToolError::Failed(anyhow!("notion_create_comment requires parent_kind"))
+            })?;
+        let parent_ref = input
+            .get("parent_ref")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .ok_or_else(|| {
+                ToolError::Failed(anyhow!("notion_create_comment requires parent_ref"))
+            })?;
+        let content = input
+            .get("content")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| ToolError::Failed(anyhow!("notion_create_comment requires content")))?;
+
+        let parent_id = notion_id_from_ref(parent_ref).map_err(ToolError::Failed)?;
+        let parent = notion_comment_parent(parent_kind, &parent_id).map_err(ToolError::Failed)?;
+        let created = notion_request_json(
+            Method::POST,
+            "comments",
+            Some(json!({
+                "parent": parent,
+                "rich_text": notion_rich_text_segments(content),
+            })),
+            &config,
+        )
+        .await
+        .map_err(ToolError::Failed)?;
+
+        Ok(ToolOutput {
+            payload: normalize_comment_result(&created),
+        })
+    }
+}
+
 fn notion_client_config(context: &ToolContext) -> Result<NotionClientConfig> {
     let api_token = context
         .notion_api_token
@@ -396,6 +650,251 @@ fn notion_client_config(context: &ToolContext) -> Result<NotionClientConfig> {
 
 fn notion_page_size(value: Option<u64>) -> u64 {
     value.unwrap_or(DEFAULT_PAGE_SIZE).clamp(1, MAX_PAGE_SIZE)
+}
+
+fn notion_update_properties_payload(
+    existing_properties: Option<&Value>,
+    updates: &Map<String, Value>,
+) -> Result<Value> {
+    let existing = existing_properties
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow!("Notion page response is missing properties"))?;
+    let mut normalized = Map::new();
+    for (name, value) in updates {
+        let property = existing.get(name).ok_or_else(|| {
+            anyhow!(
+                "Notion page has no property named '{}'; available properties: {}",
+                name,
+                notion_property_names(existing)
+            )
+        })?;
+        normalized.insert(
+            name.clone(),
+            normalize_page_property_update(name, property, value)?,
+        );
+    }
+    Ok(Value::Object(normalized))
+}
+
+fn notion_property_names(properties: &Map<String, Value>) -> String {
+    let mut names = properties.keys().cloned().collect::<Vec<_>>();
+    names.sort();
+    names.join(", ")
+}
+
+fn normalize_page_property_update(
+    property_name: &str,
+    existing_property: &Value,
+    value: &Value,
+) -> Result<Value> {
+    let property_type = existing_property
+        .get("type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("property '{}' is missing a type", property_name))?;
+
+    match property_type {
+        "title" => Ok(json!({
+            "title": normalize_rich_text_input(value, property_name, false)?
+        })),
+        "rich_text" => Ok(json!({
+            "rich_text": normalize_rich_text_input(value, property_name, true)?
+        })),
+        "number" => {
+            if value.is_number() || value.is_null() {
+                Ok(json!({ "number": value.clone() }))
+            } else {
+                bail!("property '{}' expects a number or null", property_name);
+            }
+        }
+        "select" => Ok(json!({
+            "select": normalize_named_select_value(value, property_name)?
+        })),
+        "status" => Ok(json!({
+            "status": normalize_named_select_value(value, property_name)?
+        })),
+        "multi_select" => Ok(json!({
+            "multi_select": normalize_multi_select_value(value, property_name)?
+        })),
+        "checkbox" => {
+            if let Some(flag) = value.as_bool() {
+                Ok(json!({ "checkbox": flag }))
+            } else {
+                bail!("property '{}' expects a boolean", property_name);
+            }
+        }
+        "date" => Ok(json!({
+            "date": normalize_date_value(value, property_name)?
+        })),
+        "url" | "email" | "phone_number" => {
+            if value.is_string() || value.is_null() {
+                Ok(json!({ property_type: value.clone() }))
+            } else {
+                bail!("property '{}' expects a string or null", property_name);
+            }
+        }
+        "people" => Ok(json!({
+            "people": normalize_id_list(value, property_name, "people")?
+        })),
+        "relation" => Ok(json!({
+            "relation": normalize_id_list(value, property_name, "relation")?
+        })),
+        other => bail!(
+            "property '{}' has unsupported or non-editable type '{}'",
+            property_name,
+            other
+        ),
+    }
+}
+
+fn normalize_rich_text_input(
+    value: &Value,
+    property_name: &str,
+    allow_null: bool,
+) -> Result<Value> {
+    if value.is_null() {
+        if allow_null {
+            return Ok(Value::Array(Vec::new()));
+        }
+        bail!("property '{}' cannot be null", property_name);
+    }
+    if let Some(text) = value.as_str() {
+        return Ok(Value::Array(notion_rich_text_segments(text)));
+    }
+    if let Some(items) = value.as_array() {
+        return Ok(Value::Array(items.clone()));
+    }
+    if allow_null {
+        bail!(
+            "property '{}' expects a string, null, or a rich_text array",
+            property_name
+        );
+    }
+    bail!(
+        "property '{}' expects a string or a rich_text array",
+        property_name
+    );
+}
+
+fn normalize_named_select_value(value: &Value, property_name: &str) -> Result<Value> {
+    if value.is_null() {
+        return Ok(Value::Null);
+    }
+    if let Some(name) = value.as_str() {
+        return Ok(json!({ "name": name }));
+    }
+    if let Some(object) = value.as_object() {
+        if object.contains_key("name") || object.contains_key("id") {
+            return Ok(Value::Object(object.clone()));
+        }
+    }
+    bail!(
+        "property '{}' expects a string, null, or an object with 'name'/'id'",
+        property_name
+    );
+}
+
+fn normalize_multi_select_value(value: &Value, property_name: &str) -> Result<Value> {
+    let Some(items) = value.as_array() else {
+        bail!("property '{}' expects an array", property_name);
+    };
+    let mut normalized = Vec::new();
+    for item in items {
+        if let Some(name) = item.as_str() {
+            normalized.push(json!({ "name": name }));
+            continue;
+        }
+        if let Some(object) = item.as_object()
+            && (object.contains_key("name") || object.contains_key("id"))
+        {
+            normalized.push(Value::Object(object.clone()));
+            continue;
+        }
+        bail!(
+            "property '{}' expects multi_select entries to be strings or objects with 'name'/'id'",
+            property_name
+        );
+    }
+    Ok(Value::Array(normalized))
+}
+
+fn normalize_date_value(value: &Value, property_name: &str) -> Result<Value> {
+    if value.is_null() {
+        return Ok(Value::Null);
+    }
+    if let Some(start) = value.as_str() {
+        return Ok(json!({ "start": start }));
+    }
+    if let Some(object) = value.as_object() {
+        return Ok(Value::Object(object.clone()));
+    }
+    bail!(
+        "property '{}' expects a string date, null, or a Notion date object",
+        property_name
+    );
+}
+
+fn normalize_id_list(value: &Value, property_name: &str, key: &str) -> Result<Value> {
+    let Some(items) = value.as_array() else {
+        bail!("property '{}' expects an array", property_name);
+    };
+    let mut normalized = Vec::new();
+    for item in items {
+        if let Some(id) = item.as_str() {
+            normalized.push(json!({ "id": notion_id_from_ref(id)? }));
+            continue;
+        }
+        if let Some(object) = item.as_object()
+            && let Some(id) = object.get("id").and_then(Value::as_str)
+        {
+            normalized.push(json!({ "id": notion_id_from_ref(id)? }));
+            continue;
+        }
+        bail!(
+            "property '{}' expects {} entries to be strings or objects with 'id'",
+            property_name,
+            key
+        );
+    }
+    Ok(Value::Array(normalized))
+}
+
+fn notion_append_position(
+    position: Option<&str>,
+    after_block_ref: Option<&str>,
+) -> Result<Option<Value>> {
+    match position.unwrap_or("end") {
+        "end" => {
+            if after_block_ref.is_some() {
+                bail!("after_block_ref requires position 'after_block'");
+            }
+            Ok(None)
+        }
+        "start" => {
+            if after_block_ref.is_some() {
+                bail!("after_block_ref requires position 'after_block'");
+            }
+            Ok(Some(json!({ "type": "start" })))
+        }
+        "after_block" => {
+            let after_block_ref = after_block_ref
+                .ok_or_else(|| anyhow!("position 'after_block' requires after_block_ref"))?;
+            Ok(Some(json!({
+                "type": "after_block",
+                "after_block": {
+                    "id": notion_id_from_ref(after_block_ref)?
+                }
+            })))
+        }
+        other => bail!("unsupported append position '{other}'"),
+    }
+}
+
+fn notion_comment_parent(parent_kind: &str, parent_id: &str) -> Result<Value> {
+    match parent_kind {
+        "page" => Ok(json!({ "page_id": parent_id })),
+        "block" => Ok(json!({ "block_id": parent_id })),
+        other => bail!("unsupported notion_create_comment parent_kind '{other}'"),
+    }
 }
 
 async fn notion_request_json(
@@ -531,6 +1030,19 @@ fn normalize_data_source_result(data_source: &Value) -> Value {
         "last_edited_time": data_source.get("last_edited_time").cloned().unwrap_or(Value::Null),
         "title_property": data_source_title_property_name(data_source),
         "properties": summarize_data_source_properties(data_source.get("properties")),
+    })
+}
+
+fn normalize_comment_result(comment: &Value) -> Value {
+    json!({
+        "object": "comment",
+        "id": comment.get("id").cloned().unwrap_or(Value::Null),
+        "discussion_id": comment.get("discussion_id").cloned().unwrap_or(Value::Null),
+        "parent": comment.get("parent").cloned().unwrap_or(Value::Null),
+        "created_time": comment.get("created_time").cloned().unwrap_or(Value::Null),
+        "last_edited_time": comment.get("last_edited_time").cloned().unwrap_or(Value::Null),
+        "text": notion_rich_text_field(comment.get("rich_text")),
+        "rich_text": comment.get("rich_text").cloned().unwrap_or(Value::Null),
     })
 }
 
@@ -1329,5 +1841,136 @@ mod tests {
         let content = "a".repeat(MAX_BLOCK_TEXT_CHARS + 5);
         let children = notion_children_from_text(&content);
         assert_eq!(children.len(), 2);
+    }
+
+    #[test]
+    fn normalizes_page_property_updates_from_page_schema() {
+        let existing = json!({
+            "Title": { "id": "title", "type": "title", "title": [] },
+            "Status": { "id": "status", "type": "status", "status": null },
+            "Done": { "id": "done", "type": "checkbox", "checkbox": false },
+            "Tags": { "id": "tags", "type": "multi_select", "multi_select": [] },
+            "Due": { "id": "due", "type": "date", "date": null },
+            "Related": { "id": "rel", "type": "relation", "relation": [] }
+        });
+        let updates = json!({
+            "Title": "Pick up groceries",
+            "Status": "In Progress",
+            "Done": true,
+            "Tags": ["shopping", "errands"],
+            "Due": "2026-04-22",
+            "Related": ["be633bf1dfa0436db259571129a590e5"]
+        });
+
+        let payload = notion_update_properties_payload(
+            Some(&existing),
+            updates.as_object().expect("update object"),
+        )
+        .expect("payload");
+
+        assert_eq!(
+            payload,
+            json!({
+                "Title": { "title": notion_rich_text_segments("Pick up groceries") },
+                "Status": { "status": { "name": "In Progress" } },
+                "Done": { "checkbox": true },
+                "Tags": {
+                    "multi_select": [
+                        { "name": "shopping" },
+                        { "name": "errands" }
+                    ]
+                },
+                "Due": { "date": { "start": "2026-04-22" } },
+                "Related": {
+                    "relation": [
+                        { "id": "be633bf1-dfa0-436d-b259-571129a590e5" }
+                    ]
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_page_property_updates() {
+        let existing = json!({
+            "Title": { "id": "title", "type": "title", "title": [] }
+        });
+        let updates = json!({
+            "Missing": "value"
+        });
+
+        let error = notion_update_properties_payload(
+            Some(&existing),
+            updates.as_object().expect("update object"),
+        )
+        .expect_err("should reject unknown property");
+
+        assert!(error.to_string().contains("Missing"));
+        assert!(error.to_string().contains("Title"));
+    }
+
+    #[test]
+    fn builds_append_position_after_block() {
+        let position = notion_append_position(
+            Some("after_block"),
+            Some("https://www.notion.so/My-Page-be633bf1dfa0436db259571129a590e5"),
+        )
+        .expect("position");
+
+        assert_eq!(
+            position,
+            Some(json!({
+                "type": "after_block",
+                "after_block": {
+                    "id": "be633bf1-dfa0-436d-b259-571129a590e5"
+                }
+            }))
+        );
+    }
+
+    #[test]
+    fn parses_properties_json_for_update_flow() {
+        let decoded: Value =
+            serde_json::from_str(r#"{"Title":"Household Inbox","Status":"Done","Done":true}"#)
+                .expect("valid json");
+        let payload = notion_update_properties_payload(
+            Some(&json!({
+                "Title": { "id": "title", "type": "title", "title": [] },
+                "Status": { "id": "status", "type": "status", "status": null },
+                "Done": { "id": "done", "type": "checkbox", "checkbox": false }
+            })),
+            decoded.as_object().expect("object"),
+        )
+        .expect("payload");
+
+        assert_eq!(
+            payload,
+            json!({
+                "Title": { "title": notion_rich_text_segments("Household Inbox") },
+                "Status": { "status": { "name": "Done" } },
+                "Done": { "checkbox": true }
+            })
+        );
+    }
+
+    #[test]
+    fn builds_comment_parent_and_normalizes_comment_response() {
+        let parent =
+            notion_comment_parent("page", "be633bf1-dfa0-436d-b259-571129a590e5").expect("parent");
+        assert_eq!(
+            parent,
+            json!({ "page_id": "be633bf1-dfa0-436d-b259-571129a590e5" })
+        );
+
+        let normalized = normalize_comment_result(&json!({
+            "object": "comment",
+            "id": "comment_123",
+            "discussion_id": "discussion_456",
+            "parent": parent,
+            "created_time": "2026-04-21T10:05:00.000Z",
+            "rich_text": [{ "plain_text": "Please buy oat milk" }]
+        }));
+        assert_eq!(normalized["id"], json!("comment_123"));
+        assert_eq!(normalized["text"], json!("Please buy oat milk"));
     }
 }

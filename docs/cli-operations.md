@@ -332,8 +332,8 @@ cargo run -p beaverki-cli -- integration notion configure \
 
 Once enabled, the agent can use:
 
-- built-in tools: `notion_search`, `notion_fetch`, `notion_create_page`
-- packaged skill wrappers from `skills/notion`: `notion_workspace_search`, `notion_read_entry`, `notion_capture_note`
+- built-in tools: `notion_search`, `notion_fetch`, `notion_create_page`, `notion_update_page`, `notion_append_block_children`, `notion_create_comment`
+- packaged skill wrappers from `skills/notion`: `notion_workspace_search`, `notion_read_entry`, `notion_capture_note`, `notion_update_entry`, `notion_append_content`, `notion_comment`
 
 ## Lua Automation And Schedules
 

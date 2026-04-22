@@ -401,6 +401,16 @@ pub async fn execute_lua_script(input: LuaExecutionInput) -> Result<LuaExecution
         .map_err(lua_to_anyhow)?;
 
     {
+        let function = lua
+            .create_function(|lua, value: LuaValue| {
+                let payload: Value = lua.from_value(value).map_err(mlua::Error::external)?;
+                serde_json::to_string(&payload).map_err(mlua::Error::external)
+            })
+            .map_err(lua_to_anyhow)?;
+        ctx.set("json_encode", function).map_err(lua_to_anyhow)?;
+    }
+
+    {
         let db = db.clone();
         let owner_user_id = owner_user_id.clone();
         let visible_scopes = visible_scopes.clone();

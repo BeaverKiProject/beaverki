@@ -9166,6 +9166,151 @@ end"#,
         assert_eq!(output.payload["greeting"], json!("hi Alex"));
     }
 
+    #[tokio::test]
+    async fn filesystem_packaged_lua_tool_can_json_encode_input() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let skills_dir = tempdir.path().join("skills").join("demo");
+        std::fs::create_dir_all(&skills_dir).expect("skills dir");
+        std::fs::write(
+            skills_dir.join("skill.yaml"),
+            r#"tools:
+  - tool_id: packaged_json_encode
+    kind: lua
+    description: Encode a payload object as JSON.
+    source_text: |
+      return function(ctx)
+          return { encoded = ctx.json_encode(ctx.input.payload) }
+      end
+    input_schema:
+      type: object
+      properties:
+        payload:
+          type: object
+          properties:
+            status:
+              type: string
+          required: [status]
+          additionalProperties: false
+      required: [payload]
+      additionalProperties: false
+    output_schema:
+      type: object
+      properties:
+        encoded:
+          type: string
+      required: [encoded]
+      additionalProperties: false
+"#,
+        )
+        .expect("write manifest");
+
+        let db_path = tempdir.path().join("test.db");
+        let db = Database::connect(&db_path).await.expect("connect");
+        db.bootstrap_single_user("Alex").await.expect("bootstrap");
+        let provider = Arc::new(FakeProvider::new(vec![])) as Arc<dyn ModelProvider>;
+        let runner = PrimaryAgentRunner::new(
+            db.clone(),
+            MemoryStore::new(db.clone()),
+            provider,
+            builtin_registry(),
+            ToolContext::new(
+                tempdir.path().to_path_buf(),
+                vec![tempdir.path().to_path_buf()],
+            ),
+            None,
+            None,
+            6,
+        );
+        let default_user = db.default_user().await.expect("default").expect("user");
+        let roles = db
+            .list_user_roles(&default_user.user_id)
+            .await
+            .expect("roles")
+            .into_iter()
+            .map(|row| row.role_id)
+            .collect::<Vec<_>>();
+        let task = db
+            .create_task_with_params(NewTask {
+                owner_user_id: &default_user.user_id,
+                initiating_identity_id: &format!("cli:{}", default_user.user_id),
+                primary_agent_id: default_user.primary_agent_id.as_deref().expect("agent"),
+                assigned_agent_id: default_user.primary_agent_id.as_deref().expect("agent"),
+                parent_task_id: None,
+                session_id: None,
+                kind: "interactive",
+                objective: "Run packaged Lua tool",
+                context_summary: None,
+                scope: MemoryScope::Private,
+                wake_at: None,
+            })
+            .await
+            .expect("task");
+
+        let loaded = runner
+            .load_registered_lua_tools(&default_user.user_id, &runner.base_tool_context)
+            .await
+            .expect("load tools");
+        let packaged_tool = loaded
+            .into_iter()
+            .find(|tool| tool.tool_id == "packaged_json_encode")
+            .expect("packaged tool");
+
+        let output = runner
+            .handle_registered_lua_tool_call(
+                &task,
+                &AgentRequest {
+                    owner_user_id: default_user.user_id.clone(),
+                    initiating_identity_id: format!("cli:{}", default_user.user_id),
+                    primary_agent_id: default_user.primary_agent_id.clone().expect("agent"),
+                    assigned_agent_id: default_user.primary_agent_id.clone().expect("agent"),
+                    role_ids: roles,
+                    objective: "Run packaged Lua tool".to_owned(),
+                    scope: MemoryScope::Private,
+                    kind: "interactive".to_owned(),
+                    parent_task_id: None,
+                    task_context: None,
+                    visible_scopes: visible_memory_scopes(&["owner".to_owned()]),
+                    memory_mode: AgentMemoryMode::ScopedRetrieval,
+                    approved_shell_commands: Vec::new(),
+                    approved_automation_actions: Vec::new(),
+                },
+                &packaged_tool,
+                json!({ "payload": { "status": "done" } }),
+                &runner.base_tool_context,
+            )
+            .await
+            .expect("tool output");
+
+        assert_eq!(output.payload["encoded"], json!("{\"status\":\"done\"}"));
+    }
+
+    #[test]
+    fn repo_packaged_skills_include_household_shopping_tools() {
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("workspace crates dir")
+            .parent()
+            .expect("workspace root")
+            .to_path_buf();
+        let tool_context = ToolContext::new(repo_root.clone(), vec![repo_root]);
+        let loaded = load_filesystem_lua_tools(&tool_context).expect("load filesystem tools");
+        let tool_ids = loaded
+            .into_iter()
+            .map(|tool| tool.tool_id)
+            .collect::<Vec<_>>();
+
+        assert!(
+            tool_ids
+                .iter()
+                .any(|tool_id| tool_id == "shopping_list_get")
+        );
+        assert!(
+            tool_ids
+                .iter()
+                .any(|tool_id| tool_id == "shopping_list_add_items")
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn lua_defined_tool_surfaces_typed_policy_denial() {
         let (db, runner) = test_runner(FakeProvider::new(vec![])).await;

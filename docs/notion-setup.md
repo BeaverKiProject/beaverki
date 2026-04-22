@@ -94,14 +94,26 @@ When the Notion integration is enabled, BeaverKi exposes these built-in tools to
 - `notion_search`: search pages or data sources shared with the integration
 - `notion_fetch`: fetch a page or data source by Notion URL or ID
 - `notion_create_page`: create a page under a parent page or data source
+- `notion_update_page`: update properties on an existing page using the page's current schema
+- `notion_append_block_children`: append Markdown-like content blocks to an existing page or block
+- `notion_create_comment`: leave a comment on a page or block
 
 This repository also ships a starter packaged skill in `skills/notion` with higher-level wrappers:
 
 - `notion_workspace_search`
 - `notion_read_entry`
 - `notion_capture_note`
+- `notion_update_entry`
+- `notion_append_content`
+- `notion_comment`
 
 Those skill tools are Lua wrappers over the Rust-side Notion capability boundary, which keeps network access and credential handling in the host runtime rather than in Lua.
+
+Practical examples for the new write tools:
+
+- update a household page status or due date without creating a new entry
+- append fresh shopping items or meeting notes to an existing shared page
+- leave review feedback or a follow-up note as a page or block comment
 
 ## 5. Troubleshooting
 
@@ -115,5 +127,8 @@ Those skill tools are Lua wrappers over the Rust-side Notion capability boundary
 - This first cut uses the Notion REST API only.
 - Hosted Notion MCP is not wired into BeaverKi yet.
 - `notion_create_page` can create content under a parent page directly.
+- `notion_update_page` normalizes a practical subset of editable property types based on the target page's existing schema.
+- `notion_append_block_children` uses the same Markdown-like block conversion as `notion_create_page`.
+- `notion_create_comment` currently targets page-level or block-level comments.
 - For data source parents, BeaverKi only auto-populates the title property it can infer from the schema.
 - Advanced property mapping for custom data sources is still follow-up work.

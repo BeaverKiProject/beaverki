@@ -16,7 +16,10 @@ use walkdir::WalkDir;
 
 mod notion;
 
-use self::notion::{NotionCreatePageTool, NotionFetchTool, NotionSearchTool};
+use self::notion::{
+    NotionAppendBlockChildrenTool, NotionCreateCommentTool, NotionCreatePageTool, NotionFetchTool,
+    NotionSearchTool, NotionUpdatePageTool,
+};
 
 #[derive(Debug, Clone)]
 pub struct ToolDefinition {
@@ -484,6 +487,9 @@ pub fn builtin_registry() -> ToolRegistry {
     registry.register(NotionSearchTool);
     registry.register(NotionFetchTool);
     registry.register(NotionCreatePageTool);
+    registry.register(NotionUpdatePageTool);
+    registry.register(NotionAppendBlockChildrenTool);
+    registry.register(NotionCreateCommentTool);
     registry
 }
 
