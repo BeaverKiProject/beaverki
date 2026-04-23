@@ -6,7 +6,10 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use beaverki_config::LoadedConfig;
 use beaverki_core::{TaskState, now_rfc3339};
-use beaverki_db::{ApprovalRow, Database, MemoryRow, RuntimeSessionRow, TaskRow};
+use beaverki_db::{
+    ApprovalRow, Database, MemoryRow, RoleRow, RuntimeSessionRow, ScheduleRow, TaskRow,
+    WorkflowDefinitionRow,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -18,7 +21,10 @@ use tracing::{error, info, warn};
 use crate::connector_support::connector_type_from_events;
 use crate::discord;
 use crate::session::{is_session_reset_command, is_session_status_command, parse_scope};
-use crate::{MemoryInspection, Runtime, TaskInspection};
+use crate::{
+    AutomationCatalog, MemoryInspection, Runtime, SessionSummary, TaskInspection, UserSummary,
+    WorkflowDefinitionInput, WorkflowInspection,
+};
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
 const QUEUE_POLL_INTERVAL: Duration = Duration::from_millis(500);
@@ -81,15 +87,38 @@ impl DaemonStatus {
 pub enum DaemonRequest {
     Ping,
     Status,
+    ListUsers,
+    ListRoles,
+    CreateUser {
+        display_name: String,
+        roles: Vec<String>,
+    },
     RunTask {
         user_id: Option<String>,
         objective: String,
         scope: String,
         wait: bool,
     },
+    ListTasks {
+        user_id: Option<String>,
+        limit: i64,
+    },
     ShowTask {
         user_id: Option<String>,
         task_id: String,
+    },
+    ListSessions {
+        user_id: Option<String>,
+        include_archived: bool,
+        limit: i64,
+    },
+    ResetSession {
+        user_id: Option<String>,
+        session_id: String,
+    },
+    ArchiveSession {
+        user_id: Option<String>,
+        session_id: String,
     },
     ListMemories {
         user_id: Option<String>,
@@ -124,6 +153,51 @@ pub enum DaemonRequest {
         approval_id: String,
         approve: bool,
     },
+    ListAutomationCatalog {
+        user_id: Option<String>,
+    },
+    ShowWorkflow {
+        user_id: Option<String>,
+        workflow_id: String,
+    },
+    UpsertWorkflow {
+        user_id: Option<String>,
+        workflow_id: Option<String>,
+        definition: WorkflowDefinitionInput,
+        intended_behavior_summary: String,
+    },
+    ActivateWorkflow {
+        user_id: Option<String>,
+        workflow_id: String,
+    },
+    DisableWorkflow {
+        user_id: Option<String>,
+        workflow_id: String,
+    },
+    ReplayWorkflow {
+        user_id: Option<String>,
+        workflow_id: String,
+    },
+    DeleteWorkflow {
+        user_id: Option<String>,
+        workflow_id: String,
+    },
+    UpsertWorkflowSchedule {
+        user_id: Option<String>,
+        schedule_id: Option<String>,
+        workflow_id: String,
+        cron_expr: String,
+        enabled: bool,
+    },
+    SetScheduleEnabled {
+        user_id: Option<String>,
+        schedule_id: String,
+        enabled: bool,
+    },
+    DeleteSchedule {
+        user_id: Option<String>,
+        schedule_id: String,
+    },
     SubmitConnectorMessage {
         message: ConnectorMessageRequest,
     },
@@ -135,11 +209,22 @@ pub enum DaemonRequest {
 pub enum DaemonResponse {
     Pong { status: DaemonStatus },
     Status { status: DaemonStatus },
+    Users { users: Vec<UserSummary> },
+    User { user: UserSummary },
+    Roles { roles: Vec<RoleRow> },
     Task { task: TaskRow },
+    Tasks { tasks: Vec<TaskRow> },
     Inspection { inspection: TaskInspection },
+    Sessions { sessions: Vec<SessionSummary> },
+    Session { session: SessionSummary },
     Memory { memory: MemoryInspection },
     Memories { memories: Vec<MemoryRow> },
     Approvals { approvals: Vec<ApprovalRow> },
+    AutomationCatalog { catalog: AutomationCatalog },
+    Workflow { workflow: WorkflowInspection },
+    WorkflowDefinition { workflow: WorkflowDefinitionRow },
+    Schedule { schedule: ScheduleRow },
+    Ack { message: String },
     ConnectorReply { reply: ConnectorMessageReply },
     ShutdownAck { status: DaemonStatus },
 }
@@ -198,6 +283,37 @@ impl DaemonClient {
         }
     }
 
+    pub async fn list_users(&self) -> Result<Vec<UserSummary>> {
+        match self.request(DaemonRequest::ListUsers).await? {
+            DaemonResponse::Users { users } => Ok(users),
+            other => Err(anyhow!("unexpected daemon users response: {other:?}")),
+        }
+    }
+
+    pub async fn list_roles(&self) -> Result<Vec<RoleRow>> {
+        match self.request(DaemonRequest::ListRoles).await? {
+            DaemonResponse::Roles { roles } => Ok(roles),
+            other => Err(anyhow!("unexpected daemon roles response: {other:?}")),
+        }
+    }
+
+    pub async fn create_user(
+        &self,
+        display_name: String,
+        roles: Vec<String>,
+    ) -> Result<UserSummary> {
+        match self
+            .request(DaemonRequest::CreateUser {
+                display_name,
+                roles,
+            })
+            .await?
+        {
+            DaemonResponse::User { user } => Ok(user),
+            other => Err(anyhow!("unexpected daemon user response: {other:?}")),
+        }
+    }
+
     pub async fn run_task(
         &self,
         user_id: Option<String>,
@@ -219,6 +335,16 @@ impl DaemonClient {
         }
     }
 
+    pub async fn list_tasks(&self, user_id: Option<String>, limit: i64) -> Result<Vec<TaskRow>> {
+        match self
+            .request(DaemonRequest::ListTasks { user_id, limit })
+            .await?
+        {
+            DaemonResponse::Tasks { tasks } => Ok(tasks),
+            other => Err(anyhow!("unexpected daemon tasks response: {other:?}")),
+        }
+    }
+
     pub async fn show_task(
         &self,
         user_id: Option<String>,
@@ -230,6 +356,59 @@ impl DaemonClient {
         {
             DaemonResponse::Inspection { inspection } => Ok(inspection),
             other => Err(anyhow!("unexpected daemon inspection response: {other:?}")),
+        }
+    }
+
+    pub async fn list_sessions(
+        &self,
+        user_id: Option<String>,
+        include_archived: bool,
+        limit: i64,
+    ) -> Result<Vec<SessionSummary>> {
+        match self
+            .request(DaemonRequest::ListSessions {
+                user_id,
+                include_archived,
+                limit,
+            })
+            .await?
+        {
+            DaemonResponse::Sessions { sessions } => Ok(sessions),
+            other => Err(anyhow!("unexpected daemon sessions response: {other:?}")),
+        }
+    }
+
+    pub async fn reset_session(
+        &self,
+        user_id: Option<String>,
+        session_id: String,
+    ) -> Result<SessionSummary> {
+        match self
+            .request(DaemonRequest::ResetSession {
+                user_id,
+                session_id,
+            })
+            .await?
+        {
+            DaemonResponse::Session { session } => Ok(session),
+            other => Err(anyhow!("unexpected daemon session response: {other:?}")),
+        }
+    }
+
+    pub async fn archive_session(
+        &self,
+        user_id: Option<String>,
+        session_id: String,
+    ) -> Result<SessionSummary> {
+        match self
+            .request(DaemonRequest::ArchiveSession {
+                user_id,
+                session_id,
+            })
+            .await?
+        {
+            DaemonResponse::Session { session } => Ok(session),
+            other => Err(anyhow!("unexpected daemon session response: {other:?}")),
         }
     }
 
@@ -348,6 +527,185 @@ impl DaemonClient {
         {
             DaemonResponse::Task { task } => Ok(task),
             other => Err(anyhow!("unexpected daemon approval response: {other:?}")),
+        }
+    }
+
+    pub async fn automation_catalog(&self, user_id: Option<String>) -> Result<AutomationCatalog> {
+        match self
+            .request(DaemonRequest::ListAutomationCatalog { user_id })
+            .await?
+        {
+            DaemonResponse::AutomationCatalog { catalog } => Ok(catalog),
+            other => Err(anyhow!("unexpected automation catalog response: {other:?}")),
+        }
+    }
+
+    pub async fn show_workflow(
+        &self,
+        user_id: Option<String>,
+        workflow_id: String,
+    ) -> Result<WorkflowInspection> {
+        match self
+            .request(DaemonRequest::ShowWorkflow {
+                user_id,
+                workflow_id,
+            })
+            .await?
+        {
+            DaemonResponse::Workflow { workflow } => Ok(workflow),
+            other => Err(anyhow!("unexpected workflow response: {other:?}")),
+        }
+    }
+
+    pub async fn upsert_workflow(
+        &self,
+        user_id: Option<String>,
+        workflow_id: Option<String>,
+        definition: WorkflowDefinitionInput,
+        intended_behavior_summary: String,
+    ) -> Result<WorkflowInspection> {
+        match self
+            .request(DaemonRequest::UpsertWorkflow {
+                user_id,
+                workflow_id,
+                definition,
+                intended_behavior_summary,
+            })
+            .await?
+        {
+            DaemonResponse::Workflow { workflow } => Ok(workflow),
+            other => Err(anyhow!("unexpected workflow response: {other:?}")),
+        }
+    }
+
+    pub async fn activate_workflow(
+        &self,
+        user_id: Option<String>,
+        workflow_id: String,
+    ) -> Result<WorkflowDefinitionRow> {
+        match self
+            .request(DaemonRequest::ActivateWorkflow {
+                user_id,
+                workflow_id,
+            })
+            .await?
+        {
+            DaemonResponse::WorkflowDefinition { workflow } => Ok(workflow),
+            other => Err(anyhow!(
+                "unexpected workflow definition response: {other:?}"
+            )),
+        }
+    }
+
+    pub async fn disable_workflow(
+        &self,
+        user_id: Option<String>,
+        workflow_id: String,
+    ) -> Result<WorkflowDefinitionRow> {
+        match self
+            .request(DaemonRequest::DisableWorkflow {
+                user_id,
+                workflow_id,
+            })
+            .await?
+        {
+            DaemonResponse::WorkflowDefinition { workflow } => Ok(workflow),
+            other => Err(anyhow!(
+                "unexpected workflow definition response: {other:?}"
+            )),
+        }
+    }
+
+    pub async fn replay_workflow(
+        &self,
+        user_id: Option<String>,
+        workflow_id: String,
+    ) -> Result<TaskRow> {
+        match self
+            .request(DaemonRequest::ReplayWorkflow {
+                user_id,
+                workflow_id,
+            })
+            .await?
+        {
+            DaemonResponse::Task { task } => Ok(task),
+            other => Err(anyhow!("unexpected workflow replay response: {other:?}")),
+        }
+    }
+
+    pub async fn delete_workflow(
+        &self,
+        user_id: Option<String>,
+        workflow_id: String,
+    ) -> Result<()> {
+        match self
+            .request(DaemonRequest::DeleteWorkflow {
+                user_id,
+                workflow_id,
+            })
+            .await?
+        {
+            DaemonResponse::Ack { .. } => Ok(()),
+            other => Err(anyhow!("unexpected workflow delete response: {other:?}")),
+        }
+    }
+
+    pub async fn upsert_workflow_schedule(
+        &self,
+        user_id: Option<String>,
+        schedule_id: Option<String>,
+        workflow_id: String,
+        cron_expr: String,
+        enabled: bool,
+    ) -> Result<ScheduleRow> {
+        match self
+            .request(DaemonRequest::UpsertWorkflowSchedule {
+                user_id,
+                schedule_id,
+                workflow_id,
+                cron_expr,
+                enabled,
+            })
+            .await?
+        {
+            DaemonResponse::Schedule { schedule } => Ok(schedule),
+            other => Err(anyhow!("unexpected schedule response: {other:?}")),
+        }
+    }
+
+    pub async fn set_schedule_enabled(
+        &self,
+        user_id: Option<String>,
+        schedule_id: String,
+        enabled: bool,
+    ) -> Result<ScheduleRow> {
+        match self
+            .request(DaemonRequest::SetScheduleEnabled {
+                user_id,
+                schedule_id,
+                enabled,
+            })
+            .await?
+        {
+            DaemonResponse::Schedule { schedule } => Ok(schedule),
+            other => Err(anyhow!("unexpected schedule response: {other:?}")),
+        }
+    }
+
+    pub async fn delete_schedule(
+        &self,
+        user_id: Option<String>,
+        schedule_id: String,
+    ) -> Result<()> {
+        match self
+            .request(DaemonRequest::DeleteSchedule {
+                user_id,
+                schedule_id,
+            })
+            .await?
+        {
+            DaemonResponse::Ack { .. } => Ok(()),
+            other => Err(anyhow!("unexpected schedule delete response: {other:?}")),
         }
     }
 
@@ -765,6 +1123,32 @@ impl RuntimeDaemon {
                 },
                 false,
             )),
+            DaemonRequest::ListUsers => Ok((
+                DaemonResponse::Users {
+                    users: self.runtime.list_user_summaries().await?,
+                },
+                false,
+            )),
+            DaemonRequest::ListRoles => Ok((
+                DaemonResponse::Roles {
+                    roles: self.runtime.list_roles().await?,
+                },
+                false,
+            )),
+            DaemonRequest::CreateUser {
+                display_name,
+                roles,
+            } => {
+                let bootstrap = self.runtime.create_user(&display_name, &roles).await?;
+                let user = self
+                    .runtime
+                    .list_user_summaries()
+                    .await?
+                    .into_iter()
+                    .find(|summary| summary.user.user_id == bootstrap.user_id)
+                    .ok_or_else(|| anyhow!("created user '{}' not found", bootstrap.user_id))?;
+                Ok((DaemonResponse::User { user }, false))
+            }
             DaemonRequest::RunTask {
                 user_id,
                 objective,
@@ -848,11 +1232,54 @@ impl RuntimeDaemon {
 
                 Ok((DaemonResponse::Task { task }, false))
             }
+            DaemonRequest::ListTasks { user_id, limit } => Ok((
+                DaemonResponse::Tasks {
+                    tasks: self.runtime.list_tasks(user_id.as_deref(), limit).await?,
+                },
+                false,
+            )),
             DaemonRequest::ShowTask { user_id, task_id } => Ok((
                 DaemonResponse::Inspection {
                     inspection: self
                         .runtime
                         .inspect_task(user_id.as_deref(), &task_id)
+                        .await?,
+                },
+                false,
+            )),
+            DaemonRequest::ListSessions {
+                user_id,
+                include_archived,
+                limit,
+            } => Ok((
+                DaemonResponse::Sessions {
+                    sessions: self
+                        .runtime
+                        .list_sessions(user_id.as_deref(), include_archived, limit)
+                        .await?,
+                },
+                false,
+            )),
+            DaemonRequest::ResetSession {
+                user_id,
+                session_id,
+            } => Ok((
+                DaemonResponse::Session {
+                    session: self
+                        .runtime
+                        .reset_session(user_id.as_deref(), &session_id)
+                        .await?,
+                },
+                false,
+            )),
+            DaemonRequest::ArchiveSession {
+                user_id,
+                session_id,
+            } => Ok((
+                DaemonResponse::Session {
+                    session: self
+                        .runtime
+                        .archive_session(user_id.as_deref(), &session_id)
                         .await?,
                 },
                 false,
@@ -944,6 +1371,145 @@ impl RuntimeDaemon {
                 self.dispatch_connector_follow_up(&task).await?;
                 self.refresh_heartbeat(None).await?;
                 Ok((DaemonResponse::Task { task }, false))
+            }
+            DaemonRequest::ListAutomationCatalog { user_id } => Ok((
+                DaemonResponse::AutomationCatalog {
+                    catalog: self
+                        .runtime
+                        .list_automation_catalog(user_id.as_deref())
+                        .await?,
+                },
+                false,
+            )),
+            DaemonRequest::ShowWorkflow {
+                user_id,
+                workflow_id,
+            } => Ok((
+                DaemonResponse::Workflow {
+                    workflow: self
+                        .runtime
+                        .inspect_workflow_definition(user_id.as_deref(), &workflow_id)
+                        .await?,
+                },
+                false,
+            )),
+            DaemonRequest::UpsertWorkflow {
+                user_id,
+                workflow_id,
+                definition,
+                intended_behavior_summary,
+            } => Ok((
+                DaemonResponse::Workflow {
+                    workflow: self
+                        .runtime
+                        .create_workflow_definition(
+                            user_id.as_deref(),
+                            workflow_id.as_deref(),
+                            definition,
+                            None,
+                            &intended_behavior_summary,
+                        )
+                        .await?,
+                },
+                false,
+            )),
+            DaemonRequest::ActivateWorkflow {
+                user_id,
+                workflow_id,
+            } => Ok((
+                DaemonResponse::WorkflowDefinition {
+                    workflow: self
+                        .runtime
+                        .activate_workflow_definition(user_id.as_deref(), &workflow_id)
+                        .await?,
+                },
+                false,
+            )),
+            DaemonRequest::DisableWorkflow {
+                user_id,
+                workflow_id,
+            } => Ok((
+                DaemonResponse::WorkflowDefinition {
+                    workflow: self
+                        .runtime
+                        .disable_workflow_definition(user_id.as_deref(), &workflow_id)
+                        .await?,
+                },
+                false,
+            )),
+            DaemonRequest::ReplayWorkflow {
+                user_id,
+                workflow_id,
+            } => {
+                let task = self
+                    .runtime
+                    .replay_workflow_definition(user_id.as_deref(), &workflow_id)
+                    .await?;
+                self.wake_worker.notify_one();
+                self.refresh_heartbeat(None).await?;
+                Ok((DaemonResponse::Task { task }, false))
+            }
+            DaemonRequest::DeleteWorkflow {
+                user_id,
+                workflow_id,
+            } => {
+                self.runtime
+                    .delete_workflow_definition(user_id.as_deref(), &workflow_id)
+                    .await?;
+                Ok((
+                    DaemonResponse::Ack {
+                        message: format!("workflow '{workflow_id}' deleted"),
+                    },
+                    false,
+                ))
+            }
+            DaemonRequest::UpsertWorkflowSchedule {
+                user_id,
+                schedule_id,
+                workflow_id,
+                cron_expr,
+                enabled,
+            } => Ok((
+                DaemonResponse::Schedule {
+                    schedule: self
+                        .runtime
+                        .upsert_workflow_schedule(
+                            user_id.as_deref(),
+                            schedule_id.as_deref(),
+                            &workflow_id,
+                            &cron_expr,
+                            enabled,
+                        )
+                        .await?,
+                },
+                false,
+            )),
+            DaemonRequest::SetScheduleEnabled {
+                user_id,
+                schedule_id,
+                enabled,
+            } => Ok((
+                DaemonResponse::Schedule {
+                    schedule: self
+                        .runtime
+                        .set_schedule_enabled(user_id.as_deref(), &schedule_id, enabled)
+                        .await?,
+                },
+                false,
+            )),
+            DaemonRequest::DeleteSchedule {
+                user_id,
+                schedule_id,
+            } => {
+                self.runtime
+                    .delete_schedule(user_id.as_deref(), &schedule_id)
+                    .await?;
+                Ok((
+                    DaemonResponse::Ack {
+                        message: format!("schedule '{schedule_id}' deleted"),
+                    },
+                    false,
+                ))
             }
             DaemonRequest::SubmitConnectorMessage { message } => Ok((
                 DaemonResponse::ConnectorReply {

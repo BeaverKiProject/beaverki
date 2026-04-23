@@ -1,7 +1,7 @@
 use beaverki_db::{
-    ApprovalActionRow, ApprovalRow, MemoryRow, ScheduleRow, ScriptReviewRow, ScriptRow,
-    TaskEventRow, TaskRow, ToolInvocationRow, WorkflowDefinitionRow, WorkflowReviewRow,
-    WorkflowRunRow, WorkflowStageRow, WorkflowVersionRow,
+    ApprovalActionRow, ApprovalRow, ConversationSessionRow, LuaToolRow, MemoryRow, ScheduleRow,
+    ScriptReviewRow, ScriptRow, TaskEventRow, TaskRow, ToolInvocationRow, UserRow,
+    WorkflowDefinitionRow, WorkflowReviewRow, WorkflowRunRow, WorkflowStageRow, WorkflowVersionRow,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -61,6 +61,28 @@ pub struct SessionLifecycleExecution {
     pub policy_id: String,
     pub action: String,
     pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserSummary {
+    pub user: UserRow,
+    pub role_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionSummary {
+    pub session: ConversationSessionRow,
+    pub owner_user_ids: Vec<String>,
+    pub task_count: i64,
+    pub matching_policy_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutomationCatalog {
+    pub scripts: Vec<ScriptRow>,
+    pub lua_tools: Vec<LuaToolRow>,
+    pub workflows: Vec<WorkflowDefinitionRow>,
+    pub schedules: Vec<ScheduleRow>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

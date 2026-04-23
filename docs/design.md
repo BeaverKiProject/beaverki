@@ -35,6 +35,9 @@ The following product-shaping decisions are now assumed for v1:
 - V1 may rely on RBAC and strict tool restrictions rather than requiring a full OS-level sandbox layer from day one.
 - The first provider implementation should be OpenAI, exposed through a setup-assistant provider selection flow with API-token authentication and an optional Codex-style authenticated account flow when OpenAI is chosen.
 - Per-user memory and household memory should be separate first-class scopes.
+- Every model-backed run should resolve a spend envelope before the first provider call so guest or low-trust traffic cannot accidentally consume large amounts of tokens.
+- Connector trust should distinguish between direct messages, trusted shared spaces, and guest-style shared channels rather than treating all remote traffic as equally trusted.
+- Household sharing should support named trusted circles, such as a small Discord server with friends, so a shared remote space can intentionally map into household-style collaboration without opening that scope globally.
 - Agents should be able to create deferred reminders or notifications for other mapped household users, with explicit recipient identity, delivery timing, and policy-gated connector or local delivery.
 - Canonical operational memory should be stored in SQLite, while YAML and Markdown remain useful for configuration, manifests, journals, and exports.
 - Sub-agents should receive only a minimal task slice prepared by the parent agent.
@@ -818,8 +821,44 @@ Contextual policies cover:
 - path restrictions
 - command restrictions
 - rate limits
+- model spend limits and budget exhaustion behavior
 - financial or destructive action thresholds
 - approval escalation rules
+
+### 14.2.1 Spend Governance
+
+RBAC is not enough on its own. BeaverKi also needs explicit spend governance for model usage so a low-trust user, a guest room, or an accidental loop cannot burn through the household budget.
+
+The design should require budget checks at admission time, not only reporting after the fact. In practice each run should resolve a spend profile from:
+
+- the acting user and their roles
+- the connector origin such as DM, trusted shared room, or guest room
+- the task type such as interactive, scheduled, or autonomous
+- the selected model role and tool plan
+
+That spend profile should define:
+
+- maximum prompt tokens and response tokens per request
+- maximum total model tokens per task
+- rolling-window limits such as per minute, per hour, and per day
+- whether the run may spawn sub-agents or continue in the background
+- the required fallback when the budget is exhausted, such as deny, degrade to a cheaper model, or request an adult or owner override
+
+The default posture should fail closed for low-trust contexts. Guests should have small interactive budgets, no privileged autonomy, and no path to silently roll into household-scale spend.
+
+### 14.2.2 Shared Space Model
+
+The current `household` versus `guest` distinction for channels is too coarse for the intended Discord usage. BeaverKi should support named shared spaces that bind a connector surface to a policy and memory model.
+
+A shared space should capture:
+
+- a stable runtime `space_id`
+- the connector origin it applies to, such as a Discord guild or channel
+- whether that space maps to household-style shared context, guest-only context, or a narrower custom scope
+- which mapped identities are considered members of that space
+- which spend profile and approval rules apply inside that space
+
+This allows a small Discord server with trusted friends to be treated as an intentional household-like collaboration space while still keeping unrelated servers, public rooms, or guest channels on much tighter defaults.
 
 ### 14.3 Approval Model
 
@@ -877,6 +916,15 @@ Messaging connectors should support:
 
 Message-originated tasks must carry an authenticated identity and permission scope.
 
+They should also carry connector-context trust metadata such as:
+
+- connector type
+- direct-message versus shared-space origin
+- resolved shared `space_id` if one exists
+- channel or thread identifiers needed for follow-up delivery
+- spend profile chosen for this origin
+- anti-spam and concurrency limits for the origin
+
 Because messaging is a primary control surface, connectors should also support:
 
 - session or thread continuity
@@ -910,6 +958,7 @@ For each material action, record:
 - which agent executed it
 - tool name and arguments summary
 - policy result
+- provider usage and token or cost accounting
 - timestamps
 - outputs or artifact references
 
@@ -1039,7 +1088,8 @@ The core product-shaping questions have been resolved enough to proceed to a tec
 2. How should the setup assistant persist provider credentials securely across macOS, Windows, Linux, and VPS environments?
 3. What is the exact contract between the main agent and the safety agent for script and shell review?
 4. Which OpenAI models should be recommended by default for planner, executor, summarizer, and safety-review roles?
-5. What is the exact Discord identity-mapping and approval UX for multi-user household deployments?
+5. What are the default spend profiles for owner, adult, child, guest, scheduled jobs, and shared-room traffic?
+6. What is the exact Discord identity-mapping, shared-space binding, and approval UX for multi-user household deployments?
 
 ## 23. Immediate Next Step
 

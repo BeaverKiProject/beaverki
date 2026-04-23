@@ -2399,6 +2399,67 @@ impl Database {
         Ok(())
     }
 
+    pub async fn delete_workflow_definition_for_owner(
+        &self,
+        owner_user_id: &str,
+        workflow_id: &str,
+    ) -> Result<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .context("failed to start workflow delete transaction")?;
+        sqlx::query(
+            "DELETE FROM schedules
+             WHERE owner_user_id = ?
+               AND target_type = 'workflow'
+               AND target_id = ?",
+        )
+        .bind(owner_user_id)
+        .bind(workflow_id)
+        .execute(&mut *tx)
+        .await
+        .context("failed to delete workflow schedules")?;
+        sqlx::query("DELETE FROM workflow_stage_versions WHERE workflow_id = ?")
+            .bind(workflow_id)
+            .execute(&mut *tx)
+            .await
+            .context("failed to delete workflow stage versions")?;
+        sqlx::query("DELETE FROM workflow_stages WHERE workflow_id = ?")
+            .bind(workflow_id)
+            .execute(&mut *tx)
+            .await
+            .context("failed to delete workflow stages")?;
+        sqlx::query("DELETE FROM workflow_versions WHERE workflow_id = ?")
+            .bind(workflow_id)
+            .execute(&mut *tx)
+            .await
+            .context("failed to delete workflow versions")?;
+        sqlx::query("DELETE FROM workflow_reviews WHERE workflow_id = ?")
+            .bind(workflow_id)
+            .execute(&mut *tx)
+            .await
+            .context("failed to delete workflow reviews")?;
+        sqlx::query("DELETE FROM workflow_runs WHERE workflow_id = ?")
+            .bind(workflow_id)
+            .execute(&mut *tx)
+            .await
+            .context("failed to delete workflow runs")?;
+        sqlx::query(
+            "DELETE FROM workflow_definitions
+             WHERE owner_user_id = ? AND workflow_id = ?",
+        )
+        .bind(owner_user_id)
+        .bind(workflow_id)
+        .execute(&mut *tx)
+        .await
+        .context("failed to delete workflow definition")?;
+        tx.commit()
+            .await
+            .context("failed to commit workflow delete transaction")?;
+        Ok(())
+    }
+
     pub async fn create_workflow_review(
         &self,
         input: NewWorkflowReview<'_>,
@@ -2710,6 +2771,23 @@ impl Database {
         .execute(&self.pool)
         .await
         .context("failed to update schedule state")?;
+        Ok(())
+    }
+
+    pub async fn delete_schedule_for_owner(
+        &self,
+        owner_user_id: &str,
+        schedule_id: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            "DELETE FROM schedules
+             WHERE owner_user_id = ? AND schedule_id = ?",
+        )
+        .bind(owner_user_id)
+        .bind(schedule_id)
+        .execute(&self.pool)
+        .await
+        .context("failed to delete schedule")?;
         Ok(())
     }
 
