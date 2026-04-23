@@ -25,6 +25,8 @@ pub struct RuntimeConfig {
     pub secret_dir: PathBuf,
     pub database_path: PathBuf,
     pub workspace_root: PathBuf,
+    #[serde(default)]
+    pub skill_search_paths: Vec<PathBuf>,
     pub default_timezone: String,
     pub features: RuntimeFeatures,
     pub defaults: RuntimeDefaults,
@@ -383,6 +385,11 @@ impl LoadedConfig {
         runtime.secret_dir = resolve_path(&base_dir, &runtime.secret_dir);
         runtime.database_path = resolve_path(&base_dir, &runtime.database_path);
         runtime.workspace_root = resolve_path(&base_dir, &runtime.workspace_root);
+        runtime.skill_search_paths = runtime
+            .skill_search_paths
+            .into_iter()
+            .map(|path| resolve_path(&base_dir, &path))
+            .collect();
 
         Ok(Self {
             config_dir,
@@ -445,6 +452,7 @@ pub fn write_setup_files(answers: &SetupAnswers) -> Result<SetupArtifacts> {
         secret_dir: answers.secret_dir.clone(),
         database_path: answers.database_path.clone(),
         workspace_root: answers.workspace_root.clone(),
+        skill_search_paths: Vec::new(),
         default_timezone: "UTC".to_owned(),
         features: RuntimeFeatures {
             markdown_exports: true,
@@ -827,6 +835,61 @@ pub fn prompt_passphrase_from_env(env_var: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+pub fn effective_skill_search_paths(runtime: &RuntimeConfig) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+
+    paths.extend(runtime.skill_search_paths.iter().cloned());
+
+    if let Some(env_paths) = std::env::var_os("BEAVERKI_SKILLS_DIRS") {
+        paths.extend(std::env::split_paths(&env_paths));
+    }
+
+    paths.push(runtime.data_dir.join("skills"));
+
+    if let Ok(current_exe) = std::env::current_exe()
+        && let Some(exe_dir) = current_exe.parent()
+    {
+        paths.push(exe_dir.join("../share/beaverki/skills"));
+        paths.push(exe_dir.join("../skills"));
+    }
+
+    #[cfg(unix)]
+    {
+        paths.push(PathBuf::from("/usr/local/share/beaverki/skills"));
+        paths.push(PathBuf::from("/usr/share/beaverki/skills"));
+    }
+
+    if let Ok(current_exe) = std::env::current_exe()
+        && let Some(dev_skills_path) = cargo_dev_skills_path_from_exe(&current_exe)
+    {
+        paths.push(dev_skills_path);
+    }
+
+    dedupe_paths(paths)
+}
+
+fn cargo_dev_skills_path_from_exe(exe_path: &Path) -> Option<PathBuf> {
+    let mut current = exe_path.parent()?;
+    while let Some(parent) = current.parent() {
+        if current.file_name().and_then(|name| name.to_str()) == Some("target") {
+            return Some(parent.join("skills"));
+        }
+        current = parent;
+    }
+    None
+}
+
+fn dedupe_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut deduped = Vec::new();
+    for path in paths {
+        if path.as_os_str().is_empty() || deduped.contains(&path) {
+            continue;
+        }
+        deduped.push(path);
+    }
+    deduped
+}
+
 #[derive(Debug, Clone)]
 pub struct AppPaths {
     pub config_dir: PathBuf,
@@ -880,6 +943,7 @@ mod tests {
                 secret_dir: PathBuf::from("./secrets"),
                 database_path: PathBuf::from("./.beaverki/runtime.db"),
                 workspace_root: PathBuf::from("."),
+                skill_search_paths: Vec::new(),
                 default_timezone: "UTC".to_owned(),
                 features: RuntimeFeatures {
                     markdown_exports: true,
@@ -930,6 +994,49 @@ mod tests {
     }
 
     #[test]
+    fn effective_skill_search_paths_include_runtime_data_and_workspace_roots() {
+        let runtime = RuntimeConfig {
+            version: CURRENT_CONFIG_VERSION,
+            instance_id: "test".to_owned(),
+            mode: "cli".to_owned(),
+            data_dir: PathBuf::from("/tmp/beaverki/data"),
+            state_dir: PathBuf::from("/tmp/beaverki/state"),
+            log_dir: PathBuf::from("/tmp/beaverki/logs"),
+            secret_dir: PathBuf::from("/tmp/beaverki/secrets"),
+            database_path: PathBuf::from("/tmp/beaverki/state/runtime.db"),
+            workspace_root: PathBuf::from("/tmp/beaverki/workspace"),
+            skill_search_paths: vec![PathBuf::from("/opt/beaverki/custom-skills")],
+            default_timezone: "UTC".to_owned(),
+            features: RuntimeFeatures {
+                markdown_exports: true,
+            },
+            defaults: RuntimeDefaults { max_agent_steps: 8 },
+            session_management: SessionManagementConfig::default(),
+        };
+
+        let paths = effective_skill_search_paths(&runtime);
+
+        assert_eq!(paths[0], PathBuf::from("/opt/beaverki/custom-skills"));
+        assert!(paths.contains(&PathBuf::from("/tmp/beaverki/data/skills")));
+        assert!(!paths.contains(&PathBuf::from("/tmp/beaverki/workspace/skills")));
+    }
+
+    #[test]
+    fn cargo_dev_skills_path_detects_workspace_root_from_target_dir() {
+        let exe_path = Path::new("/tmp/beaverki/target/debug/beaverki-cli");
+        assert_eq!(
+            cargo_dev_skills_path_from_exe(exe_path),
+            Some(PathBuf::from("/tmp/beaverki/skills"))
+        );
+    }
+
+    #[test]
+    fn cargo_dev_skills_path_ignores_non_target_installs() {
+        let exe_path = Path::new("/usr/local/bin/beaverki-cli");
+        assert_eq!(cargo_dev_skills_path_from_exe(exe_path), None);
+    }
+
+    #[test]
     fn load_from_dir_migrates_legacy_configs_and_creates_backups() {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let config_dir = tempdir.path().join("config");
@@ -949,6 +1056,8 @@ log_dir: ./logs
 secret_dir: ./secrets
 database_path: ./state/runtime.db
 workspace_root: .
+skill_search_paths:
+  - ./skills-custom
 default_timezone: UTC
 features:
   markdown_exports: true
@@ -991,6 +1100,10 @@ entries:
         );
         assert_eq!(loaded.providers.version, CURRENT_CONFIG_VERSION);
         assert_eq!(loaded.integrations.version, CURRENT_CONFIG_VERSION);
+        assert_eq!(
+            loaded.runtime.skill_search_paths,
+            vec![tempdir.path().join("skills-custom")]
+        );
         assert_eq!(
             loaded.providers.entries[0].models.safety_review,
             default_safety_review_model()
@@ -1060,6 +1173,7 @@ log_dir: ./logs
 secret_dir: ./secrets
 database_path: ./state/runtime.db
 workspace_root: .
+skill_search_paths: []
 default_timezone: UTC
 features:
   markdown_exports: true

@@ -14,8 +14,8 @@ use beaverki_db::{ConversationSessionRow, Database, MemoryRow, UserRow};
 use beaverki_models::OpenAiProvider;
 use beaverki_policy::{is_builtin_role, visible_memory_scopes};
 use beaverki_runtime::{
-    DaemonClient, Runtime, RuntimeDaemon, WorkflowDefinitionInput, latest_daemon_status,
-    parse_workflow_stage_config,
+    DaemonClient, Runtime, RuntimeDaemon, WorkflowDefinitionInput, inspect_installed_skills,
+    latest_daemon_status, parse_workflow_stage_config,
 };
 use clap::{Args, Parser, Subcommand};
 use dialoguer::{Input, Password};
@@ -69,6 +69,10 @@ enum Commands {
     Approval {
         #[command(subcommand)]
         command: Box<ApprovalCommand>,
+    },
+    Skill {
+        #[command(subcommand)]
+        command: Box<SkillCommand>,
     },
     Session {
         #[command(subcommand)]
@@ -201,6 +205,11 @@ enum ApprovalCommand {
     List(ApprovalListArgs),
     Approve(ApprovalResolveArgs),
     Deny(ApprovalResolveArgs),
+}
+
+#[derive(Subcommand)]
+enum SkillCommand {
+    List(ConfigDirArgs),
 }
 
 #[derive(Subcommand)]
@@ -800,6 +809,9 @@ async fn main() -> Result<()> {
             ApprovalCommand::Approve(args) => approval_resolve(args, true).await,
             ApprovalCommand::Deny(args) => approval_resolve(args, false).await,
         },
+        Commands::Skill { command } => match *command {
+            SkillCommand::List(args) => skill_list(args).await,
+        },
         Commands::Session { command } => match *command {
             SessionCommand::List(args) => session_list(args).await,
             SessionCommand::Show(args) => session_show(args).await,
@@ -1338,6 +1350,37 @@ async fn approval_resolve(args: ApprovalResolveArgs, approve: bool) -> Result<()
     );
     if let Some(result_text) = task.result_text {
         println!("\n{result_text}");
+    }
+
+    Ok(())
+}
+
+async fn skill_list(args: ConfigDirArgs) -> Result<()> {
+    let config_dir = resolve_config_dir(args.config_dir)?;
+    let config = LoadedConfig::load_from_dir(&config_dir)?;
+    let report = inspect_installed_skills(&config)?;
+
+    println!("Config dir: {}", config.config_dir.display());
+    println!(
+        "Workspace root: {}",
+        config.runtime.workspace_root.display()
+    );
+    println!("Skill search paths:");
+    for path in &report.search_roots {
+        let status = if path.exists() { "exists" } else { "missing" };
+        println!("- {} ({status})", path.display());
+    }
+
+    if report.tools.is_empty() {
+        println!("\nNo packaged filesystem skills were discovered.");
+        return Ok(());
+    }
+
+    println!("\nDiscovered filesystem skill tools:");
+    for tool in report.tools {
+        println!("- {}: {}", tool.tool_id, tool.description);
+        println!("  manifest: {}", tool.manifest_path.display());
+        println!("  root: {}", tool.search_root.display());
     }
 
     Ok(())

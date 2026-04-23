@@ -25,6 +25,15 @@ Default storage locations are platform-standard:
 
 If you want a non-default config location, pass `--config-dir` to direct CLI commands or set `CONFIG_DIR=/path/to/config` when using `make`.
 
+Packaged filesystem skills are discovered from an ordered search path. By default BeaverKi checks:
+
+- explicit `skill_search_paths` entries in `runtime.yaml`
+- `BEAVERKI_SKILLS_DIRS`
+- `<data_dir>/skills`
+- install-relative locations near the executable such as `../share/beaverki/skills` and `../skills`
+- Unix system locations such as `/usr/local/share/beaverki/skills` and `/usr/share/beaverki/skills`
+- the repository `skills/` directory only when BeaverKi is being run from a Cargo `target/` build during development
+
 ## Make Targets vs Direct CLI
 
 The repository root Makefile wraps the most common commands:
@@ -53,6 +62,12 @@ The local web UI uses its own binary:
 
 ```bash
 cargo run -p beaverki-web -- --config-dir /path/to/config
+```
+
+Inspect the effective packaged skill search paths and discovered filesystem skill tools:
+
+```bash
+cargo run -p beaverki-cli -- skill list
 ```
 
 ## Setup And Model Configuration

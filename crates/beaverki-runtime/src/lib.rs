@@ -1,9 +1,12 @@
 use anyhow::{Context, Result, anyhow, bail};
-use beaverki_agent::{AgentMemoryMode, AgentRequest, AgentResult, PrimaryAgentRunner};
+use beaverki_agent::{
+    AgentMemoryMode, AgentRequest, AgentResult, FilesystemLuaToolInspection, PrimaryAgentRunner,
+    inspect_filesystem_lua_tools,
+};
 use beaverki_automation as automation;
 use beaverki_config::{
     LoadedConfig, SessionLifecycleAction, SessionLifecyclePolicy, SessionPolicyMatchInput,
-    select_session_lifecycle_policy,
+    effective_skill_search_paths, select_session_lifecycle_policy,
 };
 use beaverki_core::{MemoryScope, TaskState, now_rfc3339};
 use beaverki_db::{
@@ -70,6 +73,12 @@ use self::workflow::{
 
 const WORKFLOW_RUN_TASK_KIND: &str = "workflow_run";
 const WORKFLOW_AGENT_STAGE_TASK_KIND: &str = "workflow_agent_stage";
+
+#[derive(Debug, Clone)]
+pub struct InstalledSkillReport {
+    pub search_roots: Vec<PathBuf>,
+    pub tools: Vec<FilesystemLuaToolInspection>,
+}
 
 pub struct Runtime {
     config: LoadedConfig,
@@ -204,6 +213,7 @@ impl Runtime {
         }
         let mut tool_context =
             ToolContext::new(config.runtime.workspace_root.clone(), allowed_roots);
+        tool_context.skill_search_roots = effective_skill_search_paths(&config.runtime);
         tool_context.default_timezone = Some(config.runtime.default_timezone.clone());
         tool_context.browser_interactive_launcher =
             config.integrations.browser.interactive_launcher.clone();
@@ -4225,6 +4235,27 @@ impl Runtime {
     }
 }
 
+pub fn inspect_installed_skills(config: &LoadedConfig) -> Result<InstalledSkillReport> {
+    let search_roots = effective_skill_search_paths(&config.runtime);
+    let mut tool_context = ToolContext::new(
+        config.runtime.workspace_root.clone(),
+        vec![config.runtime.workspace_root.clone()],
+    );
+    tool_context.skill_search_roots = search_roots.clone();
+
+    let reserved_names = builtin_registry()
+        .definitions()
+        .into_iter()
+        .map(|definition| definition.name)
+        .collect::<Vec<_>>();
+    let tools = inspect_filesystem_lua_tools(&tool_context, &reserved_names)?;
+
+    Ok(InstalledSkillReport {
+        search_roots,
+        tools,
+    })
+}
+
 fn approval_action_is_expired(action: &beaverki_db::ApprovalActionRow) -> bool {
     DateTime::parse_from_rfc3339(&action.expires_at)
         .map(|expires_at| expires_at.with_timezone(&Utc) <= Utc::now())
@@ -4428,6 +4459,7 @@ mod tests {
                 secret_dir,
                 database_path: state_dir.join("runtime.db"),
                 workspace_root: tempdir.path().to_path_buf(),
+                skill_search_paths: Vec::new(),
                 default_timezone: "UTC".to_owned(),
                 features: RuntimeFeatures {
                     markdown_exports: true,

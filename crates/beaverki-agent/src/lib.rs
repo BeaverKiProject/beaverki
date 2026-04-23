@@ -205,6 +205,14 @@ enum RegisteredLuaToolSource {
     Filesystem { manifest_path: PathBuf },
 }
 
+#[derive(Debug, Clone)]
+pub struct FilesystemLuaToolInspection {
+    pub tool_id: String,
+    pub description: String,
+    pub manifest_path: PathBuf,
+    pub search_root: PathBuf,
+}
+
 #[derive(Debug, Deserialize, Default)]
 struct SkillManifest {
     #[serde(default)]
@@ -4656,53 +4664,126 @@ fn household_recipient_fuzzy_match(user: &UserRow, normalized_query: &str) -> bo
         || short_user_id.starts_with(normalized_query)
 }
 
-fn load_filesystem_lua_tools(tool_context: &ToolContext) -> Result<Vec<RegisteredLuaTool>> {
-    let skills_root = tool_context.working_dir.join("skills");
-    if !skills_root.exists() {
-        return Ok(Vec::new());
-    }
-
+pub fn inspect_filesystem_lua_tools(
+    tool_context: &ToolContext,
+    reserved_names: &[String],
+) -> Result<Vec<FilesystemLuaToolInspection>> {
+    let reserved_names = reserved_names.iter().cloned().collect::<HashSet<_>>();
+    let mut seen = HashSet::new();
     let mut loaded = Vec::new();
-    for entry in WalkDir::new(&skills_root)
-        .into_iter()
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| entry.file_type().is_file())
-    {
-        let Some(file_name) = entry.path().file_name().and_then(|name| name.to_str()) else {
-            continue;
-        };
-        if !matches!(file_name, "skill.yaml" | "skill.yml") {
+
+    for skills_root in filesystem_skill_roots(tool_context) {
+        if !skills_root.exists() {
             continue;
         }
 
-        let manifest_path = entry.path().to_path_buf();
-        let manifest_text = match fs::read_to_string(&manifest_path) {
-            Ok(text) => text,
-            Err(error) => {
-                warn!(path = %manifest_path.display(), error = %error, "skipping unreadable skill manifest");
-                continue;
-            }
-        };
-        let manifest = match serde_yaml::from_str::<SkillManifest>(&manifest_text) {
-            Ok(manifest) => manifest,
-            Err(error) => {
-                warn!(path = %manifest_path.display(), error = %error, "skipping invalid skill manifest");
-                continue;
-            }
-        };
-
-        for tool_manifest in manifest.tools {
-            match load_filesystem_lua_tool(&manifest_path, tool_manifest) {
-                Ok(Some(tool)) => loaded.push(tool),
-                Ok(None) => {}
+        for manifest_path in skill_manifest_paths(&skills_root) {
+            let manifest_text = match fs::read_to_string(&manifest_path) {
+                Ok(text) => text,
                 Err(error) => {
-                    warn!(path = %manifest_path.display(), error = %error, "skipping invalid packaged Lua tool")
+                    warn!(path = %manifest_path.display(), error = %error, "skipping unreadable skill manifest");
+                    continue;
+                }
+            };
+            let manifest = match serde_yaml::from_str::<SkillManifest>(&manifest_text) {
+                Ok(manifest) => manifest,
+                Err(error) => {
+                    warn!(path = %manifest_path.display(), error = %error, "skipping invalid skill manifest");
+                    continue;
+                }
+            };
+
+            for tool_manifest in manifest.tools {
+                let tool = match load_filesystem_lua_tool(&manifest_path, tool_manifest) {
+                    Ok(Some(tool)) => tool,
+                    Ok(None) => continue,
+                    Err(error) => {
+                        warn!(path = %manifest_path.display(), error = %error, "skipping invalid packaged Lua tool");
+                        continue;
+                    }
+                };
+                if reserved_names.contains(&tool.tool_id) {
+                    warn!(tool_id = %tool.tool_id, "skipping filesystem Lua tool because the name is reserved");
+                    continue;
+                }
+                if !seen.insert(tool.tool_id.clone()) {
+                    warn!(tool_id = %tool.tool_id, "skipping duplicate filesystem Lua tool definition");
+                    continue;
+                }
+                loaded.push(FilesystemLuaToolInspection {
+                    tool_id: tool.tool_id,
+                    description: tool.description,
+                    manifest_path: manifest_path.clone(),
+                    search_root: skills_root.clone(),
+                });
+            }
+        }
+    }
+
+    Ok(loaded)
+}
+
+fn load_filesystem_lua_tools(tool_context: &ToolContext) -> Result<Vec<RegisteredLuaTool>> {
+    let mut loaded = Vec::new();
+    for skills_root in filesystem_skill_roots(tool_context) {
+        if !skills_root.exists() {
+            continue;
+        }
+
+        for manifest_path in skill_manifest_paths(&skills_root) {
+            let manifest_text = match fs::read_to_string(&manifest_path) {
+                Ok(text) => text,
+                Err(error) => {
+                    warn!(path = %manifest_path.display(), error = %error, "skipping unreadable skill manifest");
+                    continue;
+                }
+            };
+            let manifest = match serde_yaml::from_str::<SkillManifest>(&manifest_text) {
+                Ok(manifest) => manifest,
+                Err(error) => {
+                    warn!(path = %manifest_path.display(), error = %error, "skipping invalid skill manifest");
+                    continue;
+                }
+            };
+
+            for tool_manifest in manifest.tools {
+                match load_filesystem_lua_tool(&manifest_path, tool_manifest) {
+                    Ok(Some(tool)) => loaded.push(tool),
+                    Ok(None) => {}
+                    Err(error) => {
+                        warn!(path = %manifest_path.display(), error = %error, "skipping invalid packaged Lua tool")
+                    }
                 }
             }
         }
     }
 
     Ok(loaded)
+}
+
+fn filesystem_skill_roots(tool_context: &ToolContext) -> Vec<PathBuf> {
+    if tool_context.skill_search_roots.is_empty() {
+        return vec![tool_context.working_dir.join("skills")];
+    }
+    tool_context.skill_search_roots.clone()
+}
+
+fn skill_manifest_paths(skills_root: &Path) -> Vec<PathBuf> {
+    let mut manifest_paths = WalkDir::new(skills_root)
+        .into_iter()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_type().is_file())
+        .filter_map(|entry| {
+            let file_name = entry.path().file_name().and_then(|name| name.to_str())?;
+            if matches!(file_name, "skill.yaml" | "skill.yml") {
+                Some(entry.into_path())
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    manifest_paths.sort();
+    manifest_paths
 }
 
 fn load_filesystem_lua_tool(
@@ -9314,6 +9395,51 @@ end"#,
                 .iter()
                 .any(|tool_id| tool_id == "shopping_list_add_items")
         );
+    }
+
+    #[test]
+    fn inspect_filesystem_lua_tools_uses_explicit_search_roots() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let skills_root = tempdir.path().join("custom-skills");
+        let skill_dir = skills_root.join("demo");
+        std::fs::create_dir_all(&skill_dir).expect("skills dir");
+        std::fs::write(
+            skill_dir.join("skill.yaml"),
+            r#"tools:
+  - tool_id: packaged_from_custom_root
+    kind: lua
+    description: Load from an explicit search root.
+    source_text: |
+      return function(ctx)
+          return { ok = true }
+      end
+    input_schema:
+      type: object
+      properties: {}
+      required: []
+      additionalProperties: false
+    output_schema:
+      type: object
+      properties:
+        ok:
+          type: boolean
+      required: [ok]
+      additionalProperties: false
+"#,
+        )
+        .expect("write manifest");
+
+        let mut tool_context = ToolContext::new(
+            tempdir.path().join("workspace"),
+            vec![tempdir.path().to_path_buf()],
+        );
+        tool_context.skill_search_roots = vec![skills_root.clone()];
+
+        let loaded = inspect_filesystem_lua_tools(&tool_context, &[]).expect("inspect");
+
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].tool_id, "packaged_from_custom_root");
+        assert_eq!(loaded[0].search_root, skills_root);
     }
 
     #[tokio::test(flavor = "multi_thread")]

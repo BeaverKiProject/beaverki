@@ -358,6 +358,7 @@ fn type_matches(value: &Value, type_name: &str) -> bool {
 pub struct ToolContext {
     pub working_dir: PathBuf,
     pub allowed_roots: Vec<PathBuf>,
+    pub skill_search_roots: Vec<PathBuf>,
     pub max_output_chars: usize,
     pub approved_shell_commands: Vec<String>,
     pub default_timezone: Option<String>,
@@ -374,6 +375,7 @@ impl ToolContext {
         Self {
             working_dir,
             allowed_roots,
+            skill_search_roots: Vec::new(),
             max_output_chars: 12_000,
             approved_shell_commands: Vec::new(),
             default_timezone: None,
