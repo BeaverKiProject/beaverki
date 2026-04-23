@@ -117,7 +117,23 @@ Releases are driven by Git tags rather than the Cargo workspace version.
 - stable tags use `YYYY-MM-DD.N`
 - beta tags use `YYYY-MM-DD.N-betaX`
 
-Matching tags publish a GitHub Release and package CLI binaries for Linux, macOS, and Windows when those builds succeed.
+Matching tags publish a GitHub Release and package release archives for Linux and macOS.
+
+Each archive includes:
+
+- `beaverki-cli`
+- `beaverki-web`
+- first-party `skills/`
+- `systemd` and `launchd` service templates
+- `packaging/install.sh` for curlable installs
+
+Windows users are expected to run BeaverKi through WSL rather than a first-party native Windows package.
+
+Example install command:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/torlenor/beaverki/master/packaging/install.sh | bash -s -- --tag 2026-04-23.1
+```
 
 ## Repository
 

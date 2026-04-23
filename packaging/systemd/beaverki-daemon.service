@@ -1,0 +1,14 @@
+[Unit]
+Description=BeaverKi local daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=__BEAVERKI_CONFIG_DIR__/beaverki.env
+ExecStart=__BEAVERKI_INSTALL_DIR__/bin/beaverki-cli daemon serve --config-dir __BEAVERKI_CONFIG_DIR__ --passphrase-env BEAVERKI_MASTER_PASSPHRASE
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

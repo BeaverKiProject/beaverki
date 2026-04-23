@@ -154,7 +154,9 @@ Release publication is tag-driven.
 
 - stable release tags use `YYYY-MM-DD.N`
 - beta release tags use `YYYY-MM-DD.N-betaX`
-- tag pushes build release binaries for Linux, Windows, and macOS and attach them to the GitHub Release
+- tag pushes build release archives for Linux and macOS and attach them to the GitHub Release
+- each release archive contains `beaverki-cli`, `beaverki-web`, first-party `skills/`, service templates for `systemd` and `launchd`, and `packaging/install.sh`
+- Windows users are expected to run BeaverKi through WSL rather than a first-party native Windows package
 - Cargo crate versions remain normal semver in `Cargo.toml`; the Git tag is the public release identifier
 
 The current CI workflow intentionally skips clippy until the existing lint failures are addressed.
@@ -168,4 +170,3 @@ After crate scaffolding starts, the next useful repository additions are:
 - `Makefile` or `justfile`
 - `README.md`
 - migration and schema docs
-

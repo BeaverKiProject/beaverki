@@ -46,6 +46,7 @@ make daemon-stop
 make web-ui
 make role-list
 make user-list
+make package-release RELEASE_TAG=2026-04-23.1 PLATFORM_ID=linux-x86_64
 make run-task OBJECTIVE="Inspect the repository and summarize it."
 make show-task TASK_ID=<task-id>
 ```
@@ -68,6 +69,12 @@ Inspect the effective packaged skill search paths and discovered filesystem skil
 
 ```bash
 cargo run -p beaverki-cli -- skill list
+```
+
+For tagged release installs, a curlable installer is available:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/torlenor/beaverki/master/packaging/install.sh | bash -s -- --tag 2026-04-23.1
 ```
 
 ## Setup And Model Configuration

@@ -1,0 +1,13 @@
+[Unit]
+Description=BeaverKi local web UI
+After=beaverki-daemon.service
+Wants=beaverki-daemon.service
+
+[Service]
+Type=simple
+ExecStart=__BEAVERKI_INSTALL_DIR__/bin/beaverki-web --config-dir __BEAVERKI_CONFIG_DIR__ --listen-addr 127.0.0.1:7676
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

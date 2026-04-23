@@ -6,7 +6,7 @@ else
 CONFIG_ARG := --config-dir $(CONFIG_DIR)
 endif
 
-.PHONY: fmt lint test check setup verify-openai show-models set-models daemon-start daemon-run daemon-status daemon-stop web-ui run-task show-task user-list user-add role-list approval-list approval-approve approval-deny
+.PHONY: fmt lint test check setup verify-openai show-models set-models daemon-start daemon-run daemon-status daemon-stop web-ui run-task show-task user-list user-add role-list approval-list approval-approve approval-deny package-release
 
 fmt:
 	cargo fmt --all
@@ -70,3 +70,15 @@ approval-approve:
 
 approval-deny:
 	cargo run -p beaverki-cli -- approval deny $(CONFIG_ARG) $(APPROVAL_ARGS) --approval-id $(APPROVAL_ID)
+
+ifndef RELEASE_TAG
+package-release:
+	$(error RELEASE_TAG is required, e.g. make package-release RELEASE_TAG=2026-04-23.1 PLATFORM_ID=linux-x86_64)
+else ifndef PLATFORM_ID
+package-release:
+	$(error PLATFORM_ID is required, e.g. make package-release RELEASE_TAG=2026-04-23.1 PLATFORM_ID=linux-x86_64)
+else
+package-release:
+	cargo build --release -p beaverki-cli -p beaverki-web
+	bash packaging/build-release-archive.sh "$(RELEASE_TAG)" "$(PLATFORM_ID)"
+endif

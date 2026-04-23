@@ -50,17 +50,14 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            artifact_name: beaverki-cli-linux-x86_64
-            binary_name: beaverki-cli
-            archive_name: beaverki-cli-${{ needs.validate-tag.outputs.release_tag }}-linux-x86_64.tar.gz
-          # - os: windows-latest
-          #   artifact_name: beaverki-cli-windows-x86_64
-          #   binary_name: beaverki-cli.exe
-          #   archive_name: beaverki-cli-${{ needs.validate-tag.outputs.release_tag }}-windows-x86_64.zip
+            artifact_name: beaverki-linux-x86_64
+            platform_id: linux-x86_64
           - os: macos-13
-            artifact_name: beaverki-cli-macos-x86_64
-            binary_name: beaverki-cli
-            archive_name: beaverki-cli-${{ needs.validate-tag.outputs.release_tag }}-macos-x86_64.tar.gz
+            artifact_name: beaverki-macos-x86_64
+            platform_id: macos-x86_64
+          - os: macos-14
+            artifact_name: beaverki-macos-arm64
+            platform_id: macos-arm64
 
     steps:
       - name: Checkout
@@ -72,31 +69,21 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
-      - name: Build release binary
-        run: cargo build --locked --release -p beaverki-cli
+      - name: Build release binaries
+        run: cargo build --locked --release -p beaverki-cli -p beaverki-web
 
-      - name: Package release archive on Unix
-        if: runner.os != 'Windows'
+      - name: Package release archive
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p dist
-          cp "target/release/${{ matrix.binary_name }}" "dist/${{ matrix.binary_name }}"
-          tar -C dist -czf "${{ matrix.archive_name }}" "${{ matrix.binary_name }}"
-
-      - name: Package release archive on Windows
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Copy-Item "target/release/${{ matrix.binary_name }}" "dist/${{ matrix.binary_name }}"
-          Compress-Archive -Path "dist/${{ matrix.binary_name }}" -DestinationPath "${{ matrix.archive_name }}" -Force
+          archive_name="$(bash packaging/build-release-archive.sh "${{ needs.validate-tag.outputs.release_tag }}" "${{ matrix.platform_id }}")"
+          echo "ARCHIVE_NAME=${archive_name}" >> "${GITHUB_ENV}"
 
       - name: Upload packaged artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact_name }}
-          path: ${{ matrix.archive_name }}
+          path: ${{ env.ARCHIVE_NAME }}
           if-no-files-found: error
 
   publish:

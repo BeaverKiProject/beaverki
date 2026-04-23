@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>dev.beaverki.daemon</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/sh</string>
+    <string>-lc</string>
+    <string>set -a; . "__BEAVERKI_CONFIG_DIR__/beaverki.env"; exec "__BEAVERKI_INSTALL_DIR__/bin/beaverki-cli" daemon serve --config-dir "__BEAVERKI_CONFIG_DIR__" --passphrase-env BEAVERKI_MASTER_PASSPHRASE</string>
+  </array>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ProcessType</key>
+  <string>Interactive</string>
+</dict>
+</plist>
