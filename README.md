@@ -34,6 +34,7 @@ BeaverKi already has a usable local runtime foundation. Today the repository inc
 - built-in household roles: `owner`, `adult`, `child`, `guest`, `service`
 - private and household memory scopes enforced at retrieval time
 - CLI-first setup, daemon lifecycle, and task execution
+- a local loopback-only web UI for task, approval, memory, session, and workflow operations
 - shell, filesystem, and browser tools for the primary agent
 - filesystem-packaged Lua skill loading, including a starter Notion skill pack
 - Notion API-backed workspace search, fetch, and page creation tools
@@ -101,7 +102,15 @@ The shortest path is to use the Makefile targets for setup and daily operations,
 
 	Setup creates the owner automatically. Each additional user receives a dedicated user ID and a persistent primary agent.
 
-6. Run a first task to verify the runtime.
+6. Optionally launch the local web UI.
+
+	```bash
+	make web-ui
+	```
+
+	By default the UI listens on `http://127.0.0.1:7676` and talks to the local BeaverKi daemon through its supported daemon API surface. This first slice is intentionally loopback-only for a single-household deployment model. It is not intended for public internet hosting. The UI can submit tasks, resolve approvals, inspect sessions and memory, manage household users, and create or schedule workflows.
+
+7. Run a first task to verify the runtime.
 
 	```bash
 	make run-task OBJECTIVE="Summarize the repository status and list the docs folder."
@@ -109,7 +118,7 @@ The shortest path is to use the Makefile targets for setup and daily operations,
 
 	For a household member other than the owner, pass the generated user ID through `TASK_ARGS`, for example `TASK_ARGS='--user user_casey'`.
 
-7. Inspect the recorded task and any pending approvals.
+8. Inspect the recorded task and any pending approvals.
 
 	```bash
 	make show-task TASK_ID=<task-id>
@@ -118,21 +127,21 @@ The shortest path is to use the Makefile targets for setup and daily operations,
 
 	If a risky action was paused for approval, approve or deny it from the CLI before the task continues.
 
-8. Optionally connect Discord for remote household use.
+9. Optionally connect Discord for remote household use.
 
 	Store a bot token, enable the connector, then map each Discord user ID to a BeaverKi user. Direct messages are accepted by default; guild messages are accepted only from allowlisted channel IDs and should either start with the configured prefix or include a direct bot mention. For the full setup flow, see [Discord Setup Guide](docs/discord-setup.md).
 
-9. Optionally enable the Notion integration and starter skill pack.
+10. Optionally enable the Notion integration and starter skill pack.
 
 	Store a Notion API token, enable the integration, and let the agent use the built-in `notion_*` tools or the packaged `skills/notion` wrappers. For the setup flow and current scope, see [Notion Setup Guide](docs/notion-setup.md).
 
-10. Stop the daemon when you are done.
+11. Stop the daemon when you are done.
 
 	```bash
 	make daemon-stop
 	```
 
-For the direct CLI forms of these commands, model configuration, memory inspection, Discord mapping, and automation commands, see [CLI and Operations Guide](docs/cli-operations.md).
+For the direct CLI forms of these commands, the local web UI, model configuration, memory inspection, Discord mapping, and automation commands, see [CLI and Operations Guide](docs/cli-operations.md).
 
 ## Documentation
 

@@ -18,7 +18,7 @@ use beaverki_memory::MemoryStore;
 use beaverki_models::ModelProvider;
 use beaverki_policy::{
     can_grant_approvals, can_send_household_direct_delivery, can_write_household_memory,
-    visible_memory_scopes,
+    is_builtin_role, visible_memory_scopes,
 };
 use beaverki_tools::{ToolContext, builtin_registry, validate_json_value_against_schema};
 use chrono::{DateTime, Utc};
@@ -42,8 +42,9 @@ pub use self::daemon::{
     DaemonStatus, RuntimeDaemon, latest_daemon_status, load_daemon_client,
 };
 pub use self::types::{
-    MemoryInspection, RemoteApprovalActionOutcome, ScriptInspection, SessionLifecycleExecution,
-    TaskInspection, WorkflowDefinitionInput, WorkflowInspection, WorkflowStageInput,
+    AutomationCatalog, MemoryInspection, RemoteApprovalActionOutcome, ScriptInspection,
+    SessionLifecycleExecution, SessionSummary, TaskInspection, UserSummary,
+    WorkflowDefinitionInput, WorkflowInspection, WorkflowStageInput,
 };
 pub use self::workflow::parse_workflow_stage_config;
 
@@ -684,6 +685,128 @@ impl Runtime {
         limit: i64,
     ) -> Result<Vec<RuntimeHeartbeatRow>> {
         self.db.list_runtime_heartbeats(session_id, limit).await
+    }
+
+    pub async fn list_tasks(&self, user_id: Option<&str>, limit: i64) -> Result<Vec<TaskRow>> {
+        let user = self.resolve_user(user_id).await?;
+        self.db
+            .list_recent_interactive_tasks_for_owner(&user.user_id, limit)
+            .await
+    }
+
+    pub async fn list_sessions(
+        &self,
+        user_id: Option<&str>,
+        include_archived: bool,
+        limit: i64,
+    ) -> Result<Vec<SessionSummary>> {
+        let user = self.resolve_user(user_id).await?;
+        let sessions = self
+            .db
+            .list_conversation_sessions(Some(&user.user_id), include_archived, limit)
+            .await?;
+        let mut summaries = Vec::with_capacity(sessions.len());
+        for session in sessions {
+            let owner_user_ids = self
+                .db
+                .list_session_owner_user_ids(&session.session_id)
+                .await?;
+            let task_count = self.db.count_tasks_for_session(&session.session_id).await?;
+            let matching_policy_id = self
+                .match_session_lifecycle_policy(&session)
+                .map(|policy| policy.policy_id.clone());
+            summaries.push(SessionSummary {
+                session,
+                owner_user_ids,
+                task_count,
+                matching_policy_id,
+            });
+        }
+        Ok(summaries)
+    }
+
+    pub async fn reset_session(
+        &self,
+        operator_user_id: Option<&str>,
+        session_id: &str,
+    ) -> Result<SessionSummary> {
+        self.apply_session_action(operator_user_id, session_id, SessionLifecycleAction::Reset)
+            .await
+    }
+
+    pub async fn archive_session(
+        &self,
+        operator_user_id: Option<&str>,
+        session_id: &str,
+    ) -> Result<SessionSummary> {
+        self.apply_session_action(
+            operator_user_id,
+            session_id,
+            SessionLifecycleAction::Archive,
+        )
+        .await
+    }
+
+    async fn apply_session_action(
+        &self,
+        operator_user_id: Option<&str>,
+        session_id: &str,
+        action: SessionLifecycleAction,
+    ) -> Result<SessionSummary> {
+        let operator = self.resolve_user(operator_user_id).await?;
+        let session = self
+            .db
+            .fetch_conversation_session(session_id)
+            .await?
+            .ok_or_else(|| anyhow!("session '{session_id}' not found"))?;
+        let reason = match action {
+            SessionLifecycleAction::Reset => "manual_reset",
+            SessionLifecycleAction::Archive => "manual_archive",
+        };
+        match action {
+            SessionLifecycleAction::Reset => {
+                self.db
+                    .reset_conversation_session(&session.session_id, reason)
+                    .await?;
+            }
+            SessionLifecycleAction::Archive => {
+                self.db
+                    .archive_conversation_session(&session.session_id, reason)
+                    .await?;
+            }
+        }
+        self.db
+            .record_audit_event(
+                "user",
+                &operator.user_id,
+                "conversation_session_lifecycle_overridden",
+                json!({
+                    "session_id": session.session_id,
+                    "action": action.as_str(),
+                    "reason": reason,
+                }),
+            )
+            .await?;
+
+        let session = self
+            .db
+            .fetch_conversation_session(session_id)
+            .await?
+            .ok_or_else(|| anyhow!("session '{session_id}' disappeared after update"))?;
+        let owner_user_ids = self
+            .db
+            .list_session_owner_user_ids(&session.session_id)
+            .await?;
+        let task_count = self.db.count_tasks_for_session(&session.session_id).await?;
+        let matching_policy_id = self
+            .match_session_lifecycle_policy(&session)
+            .map(|policy| policy.policy_id.clone());
+        Ok(SessionSummary {
+            session,
+            owner_user_ids,
+            task_count,
+            matching_policy_id,
+        })
     }
 
     pub async fn inspect_task(
@@ -1375,6 +1498,60 @@ impl Runtime {
         .await
     }
 
+    pub async fn upsert_workflow_schedule(
+        &self,
+        user_id: Option<&str>,
+        schedule_id: Option<&str>,
+        workflow_id: &str,
+        cron_expr: &str,
+        enabled: bool,
+    ) -> Result<ScheduleRow> {
+        let user = self.resolve_user(user_id).await?;
+        let workflow = self
+            .db
+            .fetch_workflow_definition_for_owner(&user.user_id, workflow_id)
+            .await?
+            .ok_or_else(|| anyhow!("workflow '{workflow_id}' not found"))?;
+        if workflow.status != "active" || workflow.safety_status != "approved" {
+            bail!(
+                "workflow '{}' must be active and approved before scheduling",
+                workflow.workflow_id
+            );
+        }
+        let next_run_at = automation::next_run_after(
+            cron_expr,
+            &now_rfc3339(),
+            Some(self.config.runtime.default_timezone.as_str()),
+        )?;
+        let schedule = self
+            .db
+            .upsert_schedule(NewSchedule {
+                schedule_id,
+                owner_user_id: &user.user_id,
+                target_type: "workflow",
+                target_id: workflow_id,
+                cron_expr,
+                enabled,
+                next_run_at: &next_run_at,
+            })
+            .await?;
+        self.db
+            .record_audit_event(
+                "user",
+                &user.user_id,
+                "schedule_upserted",
+                json!({
+                    "schedule_id": schedule.schedule_id,
+                    "target_type": "workflow",
+                    "target_id": workflow_id,
+                    "cron_expr": cron_expr,
+                    "enabled": enabled,
+                }),
+            )
+            .await?;
+        Ok(schedule)
+    }
+
     async fn create_schedule_for_target(
         &self,
         user_id: Option<&str>,
@@ -1506,6 +1683,59 @@ impl Runtime {
                     schedule.schedule_id
                 )
             })
+    }
+
+    pub async fn delete_schedule(&self, user_id: Option<&str>, schedule_id: &str) -> Result<()> {
+        let user = self.resolve_user(user_id).await?;
+        let schedule = self
+            .db
+            .fetch_schedule_for_owner(&user.user_id, schedule_id)
+            .await?
+            .ok_or_else(|| anyhow!("schedule '{schedule_id}' not found"))?;
+        self.db
+            .delete_schedule_for_owner(&user.user_id, &schedule.schedule_id)
+            .await?;
+        self.db
+            .record_audit_event(
+                "user",
+                &user.user_id,
+                "schedule_deleted",
+                json!({
+                    "schedule_id": schedule.schedule_id,
+                    "target_type": schedule.target_type,
+                    "target_id": schedule.target_id,
+                }),
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn delete_workflow_definition(
+        &self,
+        user_id: Option<&str>,
+        workflow_id: &str,
+    ) -> Result<()> {
+        let user = self.resolve_user(user_id).await?;
+        let workflow = self
+            .db
+            .fetch_workflow_definition_for_owner(&user.user_id, workflow_id)
+            .await?
+            .ok_or_else(|| anyhow!("workflow '{workflow_id}' not found"))?;
+        self.db
+            .delete_workflow_definition_for_owner(&user.user_id, &workflow.workflow_id)
+            .await?;
+        self.db
+            .record_audit_event(
+                "user",
+                &user.user_id,
+                "workflow_deleted",
+                json!({
+                    "workflow_id": workflow.workflow_id,
+                    "name": workflow.name,
+                }),
+            )
+            .await?;
+        Ok(())
     }
 
     pub async fn materialize_due_schedules(&self) -> Result<Vec<TaskRow>> {
@@ -2968,6 +3198,11 @@ impl Runtime {
         display_name: &str,
         roles: &[String],
     ) -> Result<BootstrapState> {
+        for role in roles {
+            if !is_builtin_role(role) {
+                bail!("unsupported role '{role}'");
+            }
+        }
         self.db.create_user(display_name, roles).await
     }
 
@@ -2981,8 +3216,40 @@ impl Runtime {
         Ok(result)
     }
 
+    pub async fn list_user_summaries(&self) -> Result<Vec<UserSummary>> {
+        let users = self.db.list_users().await?;
+        let mut summaries = Vec::with_capacity(users.len());
+        for user in users {
+            let role_ids = self
+                .db
+                .list_user_roles(&user.user_id)
+                .await?
+                .into_iter()
+                .map(|role| role.role_id)
+                .collect();
+            summaries.push(UserSummary { user, role_ids });
+        }
+        Ok(summaries)
+    }
+
     pub async fn list_roles(&self) -> Result<Vec<RoleRow>> {
         self.db.list_roles().await
+    }
+
+    pub async fn list_automation_catalog(
+        &self,
+        user_id: Option<&str>,
+    ) -> Result<AutomationCatalog> {
+        let user = self.resolve_user(user_id).await?;
+        Ok(AutomationCatalog {
+            scripts: self.db.list_scripts_for_owner(&user.user_id).await?,
+            lua_tools: self.db.list_lua_tools_for_owner(&user.user_id).await?,
+            workflows: self
+                .db
+                .list_workflow_definitions_for_owner(&user.user_id)
+                .await?,
+            schedules: self.db.list_schedules_for_owner(&user.user_id).await?,
+        })
     }
 
     pub async fn list_approvals(

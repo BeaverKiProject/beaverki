@@ -34,6 +34,7 @@ make setup
 make daemon-start
 make daemon-status
 make daemon-stop
+make web-ui
 make role-list
 make user-list
 make run-task OBJECTIVE="Inspect the repository and summarize it."
@@ -47,6 +48,12 @@ cargo run -p beaverki-cli -- <subcommand>
 ```
 
 Use the direct CLI form when you need flags that do not have a dedicated Make target.
+
+The local web UI uses its own binary:
+
+```bash
+cargo run -p beaverki-web -- --config-dir /path/to/config
+```
 
 ## Setup And Model Configuration
 
@@ -92,6 +99,39 @@ cargo run -p beaverki-cli -- daemon run
 ```
 
 The runtime reads the master passphrase from `BEAVERKI_MASTER_PASSPHRASE` when available. Otherwise it prompts interactively.
+
+## Local Web UI
+
+Start the BeaverKi daemon first, then launch the local web UI in a separate terminal:
+
+```bash
+make daemon-start
+make web-ui
+```
+
+Or run the web UI directly:
+
+```bash
+cargo run -p beaverki-web -- --config-dir /path/to/config
+```
+
+By default the UI listens on `127.0.0.1:7676`.
+
+Design and access model for the first slice:
+
+- the web UI talks to the BeaverKi daemon through the supported daemon client surface rather than reading SQLite directly
+- the server binds only to a loopback address and rejects non-loopback bind targets
+- anyone with access to the local machine and browser session can operate the local BeaverKi instance through this UI
+- public internet hosting, reverse-proxy hardening, and multi-tenant auth are intentionally out of scope for this slice
+
+Current operator flows in the UI include:
+
+- submit tasks and inspect results
+- inspect and resolve pending approvals
+- inspect and reset or archive sessions
+- inspect recent memory
+- inspect household users and add new users with built-in roles
+- create, edit, activate, disable, replay, delete, and schedule workflows
 
 ## Household Users And Roles
 

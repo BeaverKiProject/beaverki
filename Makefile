@@ -6,7 +6,7 @@ else
 CONFIG_ARG := --config-dir $(CONFIG_DIR)
 endif
 
-.PHONY: fmt lint test check setup verify-openai show-models set-models daemon-start daemon-run daemon-status daemon-stop run-task show-task user-list user-add role-list approval-list approval-approve approval-deny
+.PHONY: fmt lint test check setup verify-openai show-models set-models daemon-start daemon-run daemon-status daemon-stop web-ui run-task show-task user-list user-add role-list approval-list approval-approve approval-deny
 
 fmt:
 	cargo fmt --all
@@ -43,6 +43,9 @@ daemon-status:
 
 daemon-stop:
 	cargo run -p beaverki-cli -- daemon stop $(CONFIG_ARG)
+
+web-ui:
+	cargo run -p beaverki-web -- $(CONFIG_ARG)
 
 run-task:
 	cargo run -p beaverki-cli -- task run $(CONFIG_ARG) $(TASK_ARGS) --objective "$(OBJECTIVE)"

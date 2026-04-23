@@ -320,8 +320,12 @@ integrations:
     allowed_channels:
       - channel_id: "111"
         mode: household
+        space_id: "space_household_discord_friends"
+        policy_profile_id: "trusted_shared_household"
       - channel_id: "222"
         mode: guest
+        space_id: "space_guest_waiting_room"
+        policy_profile_id: "guest_interactive"
     task_wait_timeout_secs: 5
     approval_action_ttl_secs: 900
     approval_dm_only: true
@@ -351,6 +355,28 @@ policies:
     block_on_failed_review: true
   browser:
     headless_enabled: true
+  usage_budgets:
+    profiles:
+      owner_interactive:
+        max_prompt_tokens: 24000
+        max_completion_tokens: 8000
+        max_total_tokens_per_task: 60000
+        max_concurrent_tasks: 4
+        rolling_window:
+          per_hour_tokens: 200000
+          per_day_tokens: 1000000
+        on_exhausted: "deny"
+      guest_interactive:
+        max_prompt_tokens: 4000
+        max_completion_tokens: 1200
+        max_total_tokens_per_task: 6000
+        max_concurrent_tasks: 1
+        rolling_window:
+          per_hour_tokens: 12000
+          per_day_tokens: 30000
+        allow_background_continuation: false
+        allow_subagents: false
+        on_exhausted: "deny"
 ```
 
 ### 5.8 `schedules.yaml`
@@ -530,6 +556,7 @@ CREATE TABLE tasks (
   task_id TEXT PRIMARY KEY,
   owner_user_id TEXT NOT NULL,
   initiating_identity_id TEXT NOT NULL,
+  origin_space_id TEXT,
   primary_agent_id TEXT NOT NULL,
   assigned_agent_id TEXT NOT NULL,
   parent_task_id TEXT,
@@ -538,6 +565,7 @@ CREATE TABLE tasks (
   objective TEXT NOT NULL,
   context_summary TEXT,
   scope TEXT NOT NULL,               -- private | household
+  budget_profile_id TEXT NOT NULL,
   wake_at TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
@@ -750,6 +778,60 @@ CREATE TABLE connector_identities (
 );
 ```
 
+#### `connector_spaces`
+
+```sql
+CREATE TABLE connector_spaces (
+  space_id TEXT PRIMARY KEY,
+  connector_type TEXT NOT NULL,      -- discord
+  external_space_id TEXT NOT NULL,   -- guild id or other connector-native room grouping
+  scope_binding TEXT NOT NULL,       -- private | household | guest | custom
+  policy_profile_id TEXT NOT NULL,
+  status TEXT NOT NULL,              -- active | disabled
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+```
+
+#### `usage_budget_profiles`
+
+```sql
+CREATE TABLE usage_budget_profiles (
+  budget_profile_id TEXT PRIMARY KEY,
+  description TEXT,
+  max_prompt_tokens INTEGER NOT NULL,
+  max_completion_tokens INTEGER NOT NULL,
+  max_total_tokens_per_task INTEGER NOT NULL,
+  max_concurrent_tasks INTEGER NOT NULL,
+  rolling_window_json TEXT NOT NULL,
+  allow_background_continuation INTEGER NOT NULL,
+  allow_subagents INTEGER NOT NULL,
+  on_exhausted TEXT NOT NULL,        -- deny | degrade_model | require_override
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+```
+
+#### `usage_ledger`
+
+```sql
+CREATE TABLE usage_ledger (
+  usage_event_id TEXT PRIMARY KEY,
+  task_id TEXT NOT NULL,
+  actor_user_id TEXT NOT NULL,
+  identity_id TEXT NOT NULL,
+  budget_profile_id TEXT NOT NULL,
+  provider_kind TEXT NOT NULL,
+  model_name TEXT NOT NULL,
+  model_role TEXT NOT NULL,
+  prompt_tokens INTEGER NOT NULL,
+  completion_tokens INTEGER NOT NULL,
+  total_tokens INTEGER NOT NULL,
+  estimated_cost_micros INTEGER,
+  created_at TEXT NOT NULL
+);
+```
+
 ### 7.4 Retrieval Indexes
 
 At minimum:
@@ -759,6 +841,9 @@ At minimum:
 - `tool_invocations(task_id, status)`
 - `scripts(owner_user_id, status, safety_status)`
 - `connector_identities(connector_type, external_user_id)`
+- `connector_spaces(connector_type, external_space_id)`
+- `usage_ledger(actor_user_id, created_at)`
+- `usage_ledger(budget_profile_id, created_at)`
 
 ### 7.5 Markdown Export Layer
 
@@ -828,6 +913,7 @@ Permissions should be grouped as:
 - approval authority
 - connector access
 - memory access
+- spend profile selection and model budget overrides
 
 ### 8.3 Scope Model
 
@@ -837,6 +923,8 @@ At minimum, access checks need:
 - acting agent
 - target scope: private or household
 - connector origin
+- shared space binding if the request comes from a trusted connector room
+- selected spend profile
 - tool category
 
 ### 8.4 Memory Visibility Rules
@@ -861,6 +949,27 @@ Required sequence:
 4. build the prompt only from that filtered set
 
 This must be treated as a hard execution invariant.
+
+### 8.6 Spend Profiles
+
+Every run should resolve a spend profile before the first provider request is issued.
+
+The resolved profile should be derived from:
+
+- the acting user roles
+- the connector origin such as DM, trusted shared space, or guest room
+- the task kind such as interactive, scheduled, or autonomous
+- any explicit admin-approved override attached to the workflow or integration policy
+
+The profile should control:
+
+- preflight token-count admission checks
+- maximum completion size
+- whether the run may continue after the synchronous reply window
+- whether the run may spawn sub-agents
+- which model roles are available to the run
+
+Guest and guest-like shared-channel profiles should remain intentionally narrow. The design target is to prevent accidental quota burn, not merely to attribute it later.
 
 ## 9. Agent Model
 
@@ -1014,6 +1123,21 @@ trait ModelProvider {
 }
 ```
 
+### 12.1.1 Usage Admission And Reconciliation
+
+Provider access should be wrapped by runtime-owned budget enforcement rather than left to callers.
+
+Suggested sequence:
+
+1. resolve the task's budget profile
+2. estimate request size with `count_tokens`
+3. deny or downgrade before the provider call if the request would exceed limits
+4. execute the provider call
+5. write the actual usage to `usage_ledger`
+6. re-evaluate rolling-window limits before any follow-up turn or background continuation
+
+If a provider does not expose exact accounting for a path, the runtime should still record best-effort estimates so spend policies remain enforceable.
+
 ### 12.2 OpenAI Provider
 
 Auth modes:
@@ -1083,6 +1207,8 @@ Every tool execution should receive:
 - browser launcher and headless-browser settings
 
 Runtime-owned metadata such as task ID, acting user, connector origin, and conversation session should still be available to policy and audit layers even if the minimal tool context struct does not yet carry every field directly.
+
+The same runtime-owned metadata should include the resolved budget profile so tool-side loops or delegated agent calls cannot bypass the original admission decision.
 
 ## 14. Lua Runtime
 
