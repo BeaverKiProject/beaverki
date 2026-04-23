@@ -5325,7 +5325,7 @@ Current agent kind: {kind}.
 Current role set: {roles}.
 Use tools when needed, but keep the task focused and auditable.
 Only low-risk read-only shell commands are allowed by default. Medium/high/critical shell commands require user approval.
-For exploring allowed roots and locating files, prefer filesystem_list, filesystem_read_text, and filesystem_search over shell_exec.
+For exploring allowed roots, prefer filesystem_list over shell_exec. For locating files by name or path fragment, use filesystem_find. Use filesystem_search only for searching inside file contents, not for file-name discovery.
 Use Lua tools when recurring or structured automation materially helps. Writing a Lua script triggers safety review. New scripts require explicit activation later, while rewrites of already active scripts stay active if the new version passes safety review. Scheduling standalone Lua automations requires user approval. When writing Lua, prefer `return function(ctx) ... end`, use BeaverKI host APIs such as `ctx.log_info`, `ctx.notify_user`, `ctx.task_defer`, `ctx.memory_read`, `ctx.memory_write`, and `ctx.tool_call`, and avoid legacy globals like `run()`, `log()`, or `notify()`.
 Use workflow tools for staged recurring automation. Reuse the same workflow_id when revising a workflow so BeaverKI creates a new workflow version instead of inventing unrelated workflows. Safety-approved workflows can be activated directly, and once active they can be scheduled without an extra approval step.
 When writing workflow definitions, treat `agent_task` prompts as durable prompt templates rather than short notes. If a stage has multiple rules, scope boundaries, or output-format requirements, encode them in readable multi-line text with explicit paragraphs or lists inside `config.prompt` instead of flattening them into one dense sentence.
@@ -5333,6 +5333,7 @@ When a user is building or debugging a workflow, inspect existing state before p
 When a user asks for a workflow overview, summary, or stage-by-stage explanation, use workflow_get and present both a concise overall summary and a readable stage breakdown grounded in the fetched definition.
 If a workflow run failed or blocked, prefer reading the run state and artifacts first, then revise the workflow with workflow_write using the same workflow_id, and only then suggest activation, replay, or rescheduling as needed.
 Never claim a workflow was created, revised, activated, scheduled, replayed, or successfully completed unless the corresponding workflow tool returned success in this task.
+Never claim a file, directory, or local artifact was found, exists, or was read unless a filesystem tool in this task returned it. If you verified a local file, mention the path. If you have not checked yet, say that directly instead of implying success.
 Use memory_read before updating existing mutable memory or when you need to confirm the current canonical value under a subject key.
 Use memory_write for mutable durable scoped state such as shopping lists, inventories, checklists, and shared notes. When updating keyed state, write the full latest canonical value under the same subject_key rather than describing a partial edit in prose.
 Automatic memory retrieval for the current conversation may be narrower than your role-based memory tool access. In a private DM, you may still use explicit memory tools against household scope when the user clearly asks for a household update and the current user is allowed to access household memory.
@@ -8059,15 +8060,19 @@ mod tests {
         assert!(description.contains("ctx.log_info"));
         assert!(description.contains("legacy globals like `run()`, `log()`, or `notify()`"));
         assert!(description.contains("Rewriting an already active script keeps it active"));
-        assert!(prompt.contains(
-            "prefer filesystem_list, filesystem_read_text, and filesystem_search over shell_exec"
-        ));
+        assert!(
+            prompt.contains("For locating files by name or path fragment, use filesystem_find")
+        );
+        assert!(prompt.contains("Use filesystem_search only for searching inside file contents"));
         assert!(prompt.contains("prefer `return function(ctx) ... end`"));
         assert!(prompt.contains("avoid legacy globals like `run()`, `log()`, or `notify()`"));
         assert!(prompt.contains("Use workflow tools for staged recurring automation"));
         assert!(prompt.contains("Reuse the same workflow_id when revising a workflow"));
         assert!(prompt.contains("workflow_run_list"));
         assert!(prompt.contains("workflow_run_get"));
+        assert!(prompt.contains(
+            "Never claim a file, directory, or local artifact was found, exists, or was read unless a filesystem tool in this task returned it"
+        ));
         assert!(prompt.contains("workflow overview, summary, or stage-by-stage explanation"));
         assert!(prompt.contains("Use memory_read before updating existing mutable memory"));
         assert!(prompt.contains("Use memory_write for mutable durable scoped state"));

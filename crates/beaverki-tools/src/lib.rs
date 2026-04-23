@@ -480,6 +480,7 @@ pub fn builtin_registry() -> ToolRegistry {
     let mut registry = ToolRegistry::new();
     registry.register(ShellExecTool);
     registry.register(ListFilesTool);
+    registry.register(FindFilesTool);
     registry.register(ReadTextTool);
     registry.register(WriteTextTool);
     registry.register(SearchFilesTool);
@@ -762,6 +763,106 @@ impl Tool for ReadTextTool {
             payload: json!({
                 "path": resolved.display().to_string(),
                 "content": truncate_text(&text, 32_000),
+            }),
+        })
+    }
+}
+
+pub struct FindFilesTool;
+
+#[async_trait]
+impl Tool for FindFilesTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "filesystem_find".to_owned(),
+            description:
+                "Find files or directories under an allowed root by file name or relative path fragment."
+                    .to_owned(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "name_pattern": { "type": "string" },
+                    "root": { "type": ["string", "null"] },
+                    "kind": {
+                        "type": ["string", "null"],
+                        "enum": ["file", "directory", "any", null]
+                    }
+                },
+                "required": ["name_pattern", "root", "kind"],
+                "additionalProperties": false
+            }),
+        }
+    }
+
+    async fn call(
+        &self,
+        input: Value,
+        context: &ToolContext,
+    ) -> std::result::Result<ToolOutput, ToolError> {
+        let name_pattern = input
+            .get("name_pattern")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| ToolError::Failed(anyhow!("filesystem_find requires name_pattern")))?;
+        let root = input.get("root").and_then(Value::as_str).unwrap_or(".");
+        let kind = input.get("kind").and_then(Value::as_str).unwrap_or("any");
+        let resolved_root = resolve_allowed_path(root, context, PathAccess::Read)?;
+        let lowered_pattern = name_pattern.to_ascii_lowercase();
+        let mut matches = Vec::new();
+
+        for entry in WalkDir::new(&resolved_root)
+            .follow_links(false)
+            .into_iter()
+            .filter_map(std::result::Result::ok)
+        {
+            if entry.path() == resolved_root {
+                continue;
+            }
+
+            let entry_kind = if entry.file_type().is_file() {
+                "file"
+            } else if entry.file_type().is_dir() {
+                "directory"
+            } else {
+                continue;
+            };
+            if kind != "any" && kind != entry_kind {
+                continue;
+            }
+
+            let relative_path = entry
+                .path()
+                .strip_prefix(&resolved_root)
+                .unwrap_or(entry.path())
+                .display()
+                .to_string();
+            let file_name = entry.file_name().to_string_lossy();
+            let matches_pattern = file_name.to_ascii_lowercase().contains(&lowered_pattern)
+                || relative_path
+                    .to_ascii_lowercase()
+                    .contains(&lowered_pattern);
+            if !matches_pattern {
+                continue;
+            }
+
+            matches.push(json!({
+                "path": entry.path().display().to_string(),
+                "relative_path": relative_path,
+                "kind": entry_kind,
+            }));
+
+            if matches.len() >= 50 {
+                break;
+            }
+        }
+
+        Ok(ToolOutput {
+            payload: json!({
+                "name_pattern": name_pattern,
+                "root": resolved_root.display().to_string(),
+                "kind": kind,
+                "matches": matches,
             }),
         })
     }
@@ -1244,6 +1345,39 @@ mod tests {
         }));
         assert!(entries.iter().any(|entry| {
             entry["path"] == json!(root.join("nested").join("beta.txt").display().to_string())
+                && entry["kind"] == json!("file")
+        }));
+    }
+
+    #[tokio::test]
+    async fn filesystem_find_locates_entries_by_name() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let root = tempdir.path().join("allowed");
+        fs::create_dir_all(root.join("lists")).expect("root dirs");
+        fs::write(root.join("lists").join("subredits.txt"), "r/graz\n").expect("write file");
+        let context = ToolContext::new(root.clone(), vec![root.clone()]);
+
+        let output = FindFilesTool
+            .call(
+                json!({
+                    "name_pattern": "subredits.txt",
+                    "root": ".",
+                    "kind": "file"
+                }),
+                &context,
+            )
+            .await
+            .expect("find output");
+
+        let matches = output.payload["matches"].as_array().expect("matches array");
+        assert!(matches.iter().any(|entry| {
+            entry["path"]
+                == json!(
+                    root.join("lists")
+                        .join("subredits.txt")
+                        .display()
+                        .to_string()
+                )
                 && entry["kind"] == json!("file")
         }));
     }
