@@ -54,6 +54,7 @@ impl IntoResponse for AppError {
         let markup = page_shell(
             "BeaverKi UI Error",
             None,
+            html! {},
             html! {
                 section class="hero" {
                     div class="hero-copy" {
@@ -224,17 +225,33 @@ async fn dashboard(
     let active_user = selected_user
         .clone()
         .or_else(|| users.first().map(|user| user.user.user_id.clone()));
-    let active_user_summary = active_user
-        .as_deref()
-        .and_then(|user_id| users.iter().find(|entry| entry.user.user_id == user_id));
     let title = active_user
         .as_deref()
         .unwrap_or("BeaverKi dashboard")
         .to_owned();
 
+    let topbar_user_form = html! {
+        form method="get" action="/" class="topbar-userform" {
+            select name="user" onchange="this.form.submit()" {
+                @for user in &users {
+                    option
+                        value=(user.user.user_id)
+                        selected[active_user.as_deref() == Some(user.user.user_id.as_str())] {
+                        (user.user.display_name)
+                    }
+                }
+            }
+            label class="topbar-check" {
+                input type="checkbox" name="include_archived" value="true"
+                      checked[include_archived] onchange="this.form.submit()";
+                span { "Archived" }
+            }
+        }
+    };
     Ok(page_shell(
         &format!("BeaverKi Web UI | {title}"),
         active_user.as_deref(),
+        topbar_user_form,
         html! {
             section class="hero" {
                 div class="hero-copy" {
@@ -242,11 +259,6 @@ async fn dashboard(
                     h1 { "BeaverKi dashboard" }
                     p class="lede" {
                         "Run tasks, inspect approvals, review sessions, and manage automation from one local view."
-                    }
-                    p class="hint" {
-                        "This UI is loopback-only and talks directly to the local daemon on "
-                        code { (state.listen_addr) }
-                        "."
                     }
                 }
                 div class="hero-stats" {
@@ -256,73 +268,23 @@ async fn dashboard(
                     (stat_card("Schedules", &catalog.schedules.len().to_string()))
                 }
             }
-            section class="panel workspace-panel" {
-                div class="workspace-layout" {
-                    div class="workspace-controls" {
-                        div class="panel-header" {
-                            div {
-                                p class="eyebrow" { "Workspace" }
-                                h2 { "Choose the active user view" }
-                            }
-                            p { "The dashboard below follows the selected user across tasks, sessions, memory, and workflows." }
-                        }
-                        form method="get" class="toolbar-form workspace-form" {
-                            label {
-                                span { "User" }
-                                select name="user" {
-                                    option value="" selected[active_user.is_none()] { "Default user" }
-                                    @for user in &users {
-                                        option
-                                            value=(user.user.user_id)
-                                            selected[active_user.as_deref() == Some(user.user.user_id.as_str())] {
-                                            (user.user.display_name) " (" (user.role_ids.join(", ")) ")"
-                                        }
-                                    }
-                                }
-                            }
-                            label class="check" {
-                                input type="checkbox" name="include_archived" value="true" checked[include_archived];
-                                span { "Show archived sessions" }
-                            }
-                            button type="submit" { "Refresh view" }
-                        }
-                        div class="quick-links" {
-                            a class="secondary-link" href="#operations" { "Operations" }
-                            a class="secondary-link" href="#people" { "People" }
-                            a class="secondary-link" href="#automation" { "Automation" }
-                        }
+            div class="tab-bar" role="tablist" {
+                button type="button" class="tab-btn" data-tab="operations" role="tab" {
+                    "Operations"
+                    @if !approvals.is_empty() {
+                        span class="tab-badge" { (approvals.len()) }
                     }
-                    aside class="workspace-summary" {
-                        p class="eyebrow" { "Current user" }
-                        @if let Some(entry) = active_user_summary {
-                            h3 { (&entry.user.display_name) }
-                            p class="muted" { code { (&entry.user.user_id) } }
-                            div class="summary-chips" {
-                                (status_chip(&entry.user.status))
-                            }
-                            (role_tokens(&entry.role_ids))
-                            dl class="summary-list" {
-                                div {
-                                    dt { "Users" }
-                                    dd { (users.len()) }
-                                }
-                                div {
-                                    dt { "Recent sessions" }
-                                    dd { (sessions.len()) }
-                                }
-                                div {
-                                    dt { "Workflow count" }
-                                    dd { (catalog.workflows.len()) }
-                                }
-                            }
-                        } @else {
-                            h3 { "No active user selected" }
-                            p class="muted" { "Pick a user to scope the dashboard." }
-                        }
+                }
+                button type="button" class="tab-btn" data-tab="people" role="tab" { "People" }
+                button type="button" class="tab-btn" data-tab="automation" role="tab" {
+                    "Automation"
+                    span class="tab-badge tab-badge-muted" { (catalog.workflows.len()) " wf" }
+                    @if !catalog.schedules.is_empty() {
+                        span class="tab-badge tab-badge-muted" { (catalog.schedules.len()) " sch" }
                     }
                 }
             }
-            section class="section-block" id="operations" {
+            section class="section-block tab-panel" id="operations" {
                 div class="section-heading" {
                     p class="eyebrow" { "Operations" }
                     h2 { "Tasks and runtime state" }
@@ -376,7 +338,7 @@ async fn dashboard(
                     }
                 }
             }
-            section class="section-block" id="people" {
+            section class="section-block tab-panel" id="people" {
                 div class="section-heading" {
                     p class="eyebrow" { "People" }
                     h2 { "Users and roles" }
@@ -399,7 +361,7 @@ async fn dashboard(
                     }
                 }
             }
-            section class="section-block" id="automation" {
+            section class="section-block tab-panel" id="automation" {
                 div class="section-heading" {
                     p class="eyebrow" { "Automation" }
                     h2 { "Workflows and supporting assets" }
@@ -415,6 +377,24 @@ async fn dashboard(
                     }
                     (automation_panel(&catalog, active_user.as_deref()))
                 }
+            }
+            script {
+                (PreEscaped(r#"
+(function() {
+  var TABS = ['operations', 'people', 'automation'];
+  var btns = document.querySelectorAll('.tab-btn');
+  var panels = document.querySelectorAll('.tab-panel');
+  function showTab(id) {
+    if (!TABS.includes(id)) id = TABS[0];
+    btns.forEach(function(b) { b.classList.toggle('active', b.dataset.tab === id); });
+    panels.forEach(function(p) { p.hidden = p.id !== id; });
+    history.replaceState(null, '', '#' + id);
+  }
+  btns.forEach(function(b) { b.addEventListener('click', function() { showTab(b.dataset.tab); }); });
+  var hash = window.location.hash.replace('#', '');
+  showTab(hash);
+})();
+"#))
             }
         },
     ))
@@ -486,6 +466,7 @@ async fn task_detail(
     Ok(page_shell(
         &format!("Task {}", task.task.task_id),
         selected_user.as_deref(),
+        html! {},
         html! {
             section class="hero compact" {
                 div class="hero-copy" {
@@ -812,6 +793,7 @@ fn render_workflow_detail(workflow: &WorkflowInspection, user: Option<&str>) -> 
     page_shell(
         &format!("Workflow {}", workflow.workflow.name),
         user,
+        html! {},
         html! {
             section class="hero compact" {
                 div class="hero-copy" {
@@ -966,6 +948,7 @@ fn render_workflow_editor(
             "Create workflow"
         },
         user,
+        html! {},
         html! {
             section class="hero compact" {
                 div class="hero-copy" {
@@ -1213,7 +1196,7 @@ fn workflow_schedules_panel(
                                 @if schedule_enabled(schedule) { "Disable" } @else { "Enable" }
                             }
                         }
-                        a class="secondary-link" href=(format!("/workflows/{}/edit{}&schedule_id={}", workflow_id, user_query_suffix(user), schedule.schedule_id)) { "Edit" }
+                        a class="secondary-link" href=(schedule_edit_link(workflow_id, &schedule.schedule_id, user)) { "Edit" }
                         form method="post" action=(format!("/schedules/{}/delete", schedule.schedule_id)) onsubmit="return confirm('Delete this schedule?');" {
                             (hidden_user_input(user))
                             button type="submit" class="danger" { "Delete" }
@@ -1542,6 +1525,58 @@ fn automation_panel(catalog: &AutomationCatalog, user: Option<&str>) -> Markup {
                 }
             }
         }
+        div class="panel inset automation-schedules" {
+            div class="panel-header" {
+                h3 { "Schedules" }
+                p { (catalog.schedules.len()) " items across all target types" }
+            }
+            @if catalog.schedules.is_empty() {
+                p class="empty" { "No schedules yet. Create a workflow and schedule it from the workflow detail page." }
+            } @else {
+                div class="list" {
+                    @for schedule in &catalog.schedules {
+                        article class="list-item compact-item" {
+                            div class="list-title" {
+                                div {
+                                    @if schedule.target_type == "workflow" {
+                                        a href=(workflow_link(&schedule.target_id, user)) { (&schedule.target_id) }
+                                    } @else {
+                                        strong { (&schedule.target_id) }
+                                    }
+                                    p class="muted inline-detail" {
+                                        code { (&schedule.target_type) }
+                                        " · " (&schedule.schedule_id)
+                                    }
+                                }
+                                (status_chip(if schedule_enabled(schedule) { "enabled" } else { "disabled" }))
+                            }
+                            p class="hint" {
+                                "Cron: " code { (&schedule.cron_expr) }
+                                " · Next: " (&schedule.next_run_at)
+                                @if let Some(last_run_at) = schedule.last_run_at.as_deref() {
+                                    " · Last: " (last_run_at)
+                                }
+                            }
+                            div class="inline-actions" {
+                                @if schedule.target_type == "workflow" {
+                                    a class="secondary-link" href=(schedule_edit_link(&schedule.target_id, &schedule.schedule_id, user)) { "Edit" }
+                                }
+                                form method="post" action=(format!("/schedules/{}/toggle", schedule.schedule_id)) {
+                                    (hidden_user_input(user))
+                                    button type="submit" {
+                                        @if schedule_enabled(schedule) { "Disable" } @else { "Enable" }
+                                    }
+                                }
+                                form method="post" action=(format!("/schedules/{}/delete", schedule.schedule_id)) onsubmit="return confirm('Delete this schedule?');" {
+                                    (hidden_user_input(user))
+                                    button type="submit" class="danger" { "Delete" }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1707,7 +1742,7 @@ fn parse_time_of_day(input: Option<&str>) -> Result<(u8, u8)> {
     Ok((hour, minute))
 }
 
-fn page_shell(title: &str, user: Option<&str>, body: Markup) -> Markup {
+fn page_shell(title: &str, user: Option<&str>, topbar_extra: Markup, body: Markup) -> Markup {
     html! {
         (DOCTYPE)
         html lang="en" {
@@ -1742,6 +1777,8 @@ body {
   color: var(--ink);
   font-family: "IBM Plex Sans", "Segoe UI Variable", "Avenir Next", sans-serif;
   background: linear-gradient(180deg, var(--bg-2) 0%, var(--bg) 100%);
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
 }
 a { color: inherit; }
 .page {
@@ -1781,6 +1818,7 @@ a { color: inherit; }
   border-radius: var(--radius-sm);
   background: var(--panel);
   border: 1px solid var(--line);
+  transition: background 0.12s, color 0.12s, border-color 0.12s;
 }
 .hero, .panel {
   background: var(--panel);
@@ -1792,8 +1830,8 @@ a { color: inherit; }
   display: grid;
   grid-template-columns: 1.4fr .8fr;
   gap: 22px;
-  padding: 24px;
-  margin-bottom: 20px;
+  padding: 18px 24px;
+  margin-bottom: 14px;
   border-left: 4px solid var(--accent);
 }
 .hero.compact { grid-template-columns: 1fr auto; }
@@ -1858,7 +1896,9 @@ a { color: inherit; }
   margin-bottom: 28px;
 }
 .section-heading {
-  margin: 0 0 14px;
+  margin: 0 0 16px;
+  padding-left: 14px;
+  border-left: 3px solid var(--accent);
 }
 .section-heading h2,
 .section-heading p {
@@ -1868,13 +1908,11 @@ a { color: inherit; }
   margin-bottom: 6px;
 }
 .panel-header, .panel-subheader {
-  display: flex;
-  justify-content: space-between;
-  gap: 14px;
-  align-items: flex-start;
-  margin-bottom: 14px;
+  margin-bottom: 16px;
 }
-.panel-header p, .panel-subheader p { margin: 0; color: var(--muted); }
+.panel-header h2, .panel-header h3 { margin: 0 0 4px; }
+.panel-subheader h3 { margin: 0 0 4px; }
+.panel-header p, .panel-subheader p { margin: 0; color: var(--muted); font-size: 0.9rem; }
 .toolbar, .inline-actions, .hero-actions, .toolbar-form {
   display: flex;
   flex-wrap: wrap;
@@ -1966,6 +2004,7 @@ button, .primary-link, .secondary-link {
   letter-spacing: 0.08em;
   font-size: 0.82rem;
   font-weight: 700;
+  transition: background 0.12s, border-color 0.12s, color 0.12s;
 }
 button, .secondary-link {
   background: #fff;
@@ -2017,6 +2056,11 @@ button, .secondary-link {
   border-radius: var(--radius-sm);
   padding: 16px;
   background: var(--panel-2);
+  transition: border-color 0.12s, box-shadow 0.12s;
+}
+.list-item:hover {
+  border-color: var(--line-strong);
+  box-shadow: 0 2px 8px rgba(15,23,42,0.06);
 }
 .list-item.compact-item {
   padding: 12px 14px;
@@ -2107,6 +2151,9 @@ button, .secondary-link {
   display: grid;
   gap: 18px;
 }
+.automation-schedules {
+  margin-top: 18px;
+}
 .catalog-item {
   margin: 0 0 10px;
 }
@@ -2138,8 +2185,131 @@ button, .secondary-link {
 }
 code {
   font-family: "SFMono-Regular", "Consolas", monospace;
-  font-size: 0.92em;
+  font-size: 0.87em;
+  background: #f1f4f8;
+  padding: 1px 5px;
+  border-radius: 4px;
+  border: 1px solid var(--line);
 }
+.code-block code {
+  background: transparent;
+  border: none;
+  padding: 0;
+}
+/* Topbar user form */
+.topbar-userform {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.topbar-userform select {
+  width: auto;
+  min-width: 150px;
+  padding: 7px 10px;
+  font-size: 0.88rem;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--line);
+  background: var(--panel);
+  color: var(--ink);
+}
+.topbar-check {
+  display: inline-flex !important;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.85rem;
+  color: var(--muted);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.topbar-check input[type=checkbox] {
+  width: auto;
+  border: none;
+  padding: 0;
+  margin: 0;
+}
+/* Tab bar */
+.tab-bar {
+  display: flex;
+  gap: 2px;
+  margin-bottom: 20px;
+  border-bottom: 2px solid var(--line);
+}
+.tab-btn {
+  border: none;
+  border-radius: 0;
+  background: transparent;
+  color: var(--muted);
+  font-size: 0.9rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-transform: none;
+  padding: 10px 20px;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -2px;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  transition: color 0.12s, border-color 0.12s;
+}
+.tab-btn:hover:not(:disabled) {
+  background: transparent;
+  border-color: transparent;
+  border-bottom-color: var(--line-strong);
+  color: var(--ink);
+}
+.tab-btn.active {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+}
+.tab-btn.active:hover:not(:disabled) {
+  background: transparent;
+  border-bottom-color: var(--accent-strong);
+}
+.tab-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 20px;
+  height: 20px;
+  padding: 0 6px;
+  border-radius: 999px;
+  background: #f59e0b;
+  color: #fff;
+  font-size: 0.75rem;
+  font-weight: 700;
+}
+.tab-badge-muted {
+  background: var(--line);
+  color: var(--muted);
+}
+/* Status chip color variants */
+.chip-success { background: #f0fdf4; border-color: #86efac; color: #15803d; }
+.chip-info { background: var(--accent-soft-2); border-color: #c7ddff; color: var(--accent-strong); }
+.chip-warn { background: #fffbeb; border-color: #fcd34d; color: #b45309; }
+.chip-danger { background: var(--danger-soft); border-color: #fca5a5; color: #b91c1c; }
+.chip-muted { background: #f3f6f9; border-color: var(--line); color: var(--muted); }
+/* Approval card urgency */
+.approval-card { border-left: 3px solid #f59e0b; }
+/* Button hover states */
+button:hover:not(:disabled),
+.secondary-link:hover { background: var(--panel-2); border-color: var(--line-strong); }
+.primary:hover:not(:disabled),
+.primary-link:hover { background: var(--accent-strong); border-color: var(--accent-strong); }
+.danger:hover:not(:disabled) { background: #fee2e0; border-color: #fca5a5; }
+/* Keyboard focus ring */
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+/* Topnav hover and active page */
+.topnav a:hover, .topnav a.active {
+  background: var(--accent-soft);
+  color: var(--accent);
+  border-color: #93c5fd;
+}
+/* Clickable list item links */
+.list-title a { text-decoration: none; font-weight: 600; color: var(--ink); }
+.list-title a:hover { color: var(--accent); }
+/* Hint text */
+.hint { font-size: 0.88rem; }
 @media (max-width: 920px) {
   .hero, .hero.compact, .two-up, .three-up, .catalog-grid, .automation-layout, .workspace-layout {
     grid-template-columns: 1fr;
@@ -2158,10 +2328,24 @@ code {
                 div class="page" {
                     header class="topbar" {
                         a class="brand" href=(dashboard_link(user, false)) { span { "Beaver" } "Ki UI" }
+                        (topbar_extra)
                         nav class="topnav" {
                             a href=(dashboard_link(user, false)) { "Dashboard" }
                             a href=(workflow_editor_link(None, user)) { "New workflow" }
                         }
+                    }
+                    script {
+                        (PreEscaped(r#"
+(function(){
+  var path = window.location.pathname;
+  document.querySelectorAll('.topnav a').forEach(function(a) {
+    var ap = new URL(a.href).pathname;
+    if (ap === path || (ap !== '/' && path.startsWith(ap))) {
+      a.classList.add('active');
+    }
+  });
+})();
+"#))
                     }
                     (body)
                 }
@@ -2194,7 +2378,20 @@ fn role_tokens(role_ids: &[String]) -> Markup {
 }
 
 fn status_chip(label: &str) -> Markup {
-    html! { span class="status-chip" { (label.replace('_', " ")) } }
+    let modifier = match label.to_lowercase().as_str() {
+        "completed" | "active" | "approved" | "enabled" | "safe" => "chip-success",
+        "running" => "chip-info",
+        "pending" | "waiting_approval" | "pending_review" | "waiting" => "chip-warn",
+        "failed" | "error" | "denied" | "unsafe" | "blocked" => "chip-danger",
+        "disabled" | "inactive" | "archived" | "draft" => "chip-muted",
+        _ => "",
+    };
+    let class = if modifier.is_empty() {
+        "status-chip".to_owned()
+    } else {
+        format!("status-chip {modifier}")
+    };
+    html! { span class=(class) { (label.replace('_', " ")) } }
 }
 
 fn hidden_user_input(user: Option<&str>) -> Markup {
@@ -2245,6 +2442,11 @@ fn task_link(task_id: &str, user: Option<&str>) -> String {
 
 fn workflow_link(workflow_id: &str, user: Option<&str>) -> String {
     format!("/workflows/{workflow_id}{}", user_query_suffix(user))
+}
+
+fn schedule_edit_link(workflow_id: &str, schedule_id: &str, user: Option<&str>) -> String {
+    let user_param = user.map(|u| format!("&user={u}")).unwrap_or_default();
+    format!("/workflows/{workflow_id}/edit?schedule_id={schedule_id}{user_param}")
 }
 
 fn workflow_editor_link(workflow_id: Option<&str>, user: Option<&str>) -> String {
