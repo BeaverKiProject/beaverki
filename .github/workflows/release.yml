@@ -52,9 +52,6 @@ jobs:
           - os: ubuntu-latest
             artifact_name: beaverki-linux-x86_64
             platform_id: linux-x86_64
-          - os: macos-13
-            artifact_name: beaverki-macos-x86_64
-            platform_id: macos-x86_64
           - os: macos-14
             artifact_name: beaverki-macos-arm64
             platform_id: macos-arm64
