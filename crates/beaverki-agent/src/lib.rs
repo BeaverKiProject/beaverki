@@ -9379,12 +9379,17 @@ end"#,
 
     #[test]
     fn repo_packaged_skills_include_household_shopping_tools() {
-        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        let compiled_repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("workspace crates dir")
             .parent()
             .expect("workspace root")
             .to_path_buf();
+        let repo_root = if compiled_repo_root.join("skills").exists() {
+            compiled_repo_root
+        } else {
+            std::env::current_dir().expect("current dir")
+        };
         let tool_context = ToolContext::new(repo_root.clone(), vec![repo_root]);
         let loaded = load_filesystem_lua_tools(&tool_context).expect("load filesystem tools");
         let tool_ids = loaded
