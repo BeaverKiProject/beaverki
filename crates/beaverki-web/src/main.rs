@@ -196,32 +196,37 @@ async fn dashboard(
 ) -> Result<Markup, AppError> {
     let selected_user = normalize_user(query.user.clone());
     let include_archived = query.include_archived.unwrap_or(false);
-    let users_client = state.daemon.clone();
-    let tasks_client = state.daemon.clone();
-    let approvals_client = state.daemon.clone();
-    let sessions_client = state.daemon.clone();
-    let memories_client = state.daemon.clone();
-    let catalog_client = state.daemon.clone();
-    let status_client = state.daemon.clone();
-    let roles_client = state.daemon.clone();
-    let (users, tasks, approvals, sessions, memories, catalog, status, roles) = tokio::join!(
-        users_client.list_users(),
-        tasks_client.list_tasks(selected_user.clone(), 10),
-        approvals_client.list_approvals(selected_user.clone(), Some("pending".to_owned())),
-        sessions_client.list_sessions(selected_user.clone(), include_archived, 10),
-        memories_client.list_memories(selected_user.clone(), None, None, false, false, 10),
-        catalog_client.automation_catalog(selected_user.clone()),
-        status_client.status(),
-        roles_client.list_roles(),
+    let c_users = state.daemon.clone();
+    let c_tasks = state.daemon.clone();
+    let c_all_tasks = state.daemon.clone();
+    let c_approvals = state.daemon.clone();
+    let c_sessions = state.daemon.clone();
+    let c_memories = state.daemon.clone();
+    let c_catalog = state.daemon.clone();
+    let c_status = state.daemon.clone();
+    let c_roles = state.daemon.clone();
+    let (users, tasks, all_tasks, approvals, sessions, memories, catalog, status, roles) = tokio::join!(
+        c_users.list_users(),
+        c_tasks.list_tasks(selected_user.clone(), 10),
+        c_all_tasks.list_tasks(selected_user.clone(), 10_000),
+        c_approvals.list_approvals(selected_user.clone(), Some("pending".to_owned())),
+        c_sessions.list_sessions(selected_user.clone(), include_archived, 10),
+        c_memories.list_memories(selected_user.clone(), None, None, false, false, 10),
+        c_catalog.automation_catalog(selected_user.clone()),
+        c_status.status(),
+        c_roles.list_roles(),
     );
     let users = users?;
     let tasks = tasks?;
+    let all_tasks = all_tasks?;
     let approvals = approvals?;
     let sessions = sessions?;
     let memories = memories?;
     let catalog = catalog?;
     let status = status?;
     let roles = roles?;
+    let total_tasks = all_tasks.len();
+    let running_tasks = usize::from(status.active_task_id.is_some());
     let active_user = selected_user
         .clone()
         .or_else(|| users.first().map(|user| user.user.user_id.clone()));
@@ -266,9 +271,10 @@ async fn dashboard(
                     p class="console-sub" { "Local operator console — run tasks, clear approvals, inspect sessions." }
                 }
                 div class="stat-notes" {
-                    (stat_note("Pending approvals", &approvals.len().to_string(), "need operator review"))
-                    (stat_note("Workflows", &catalog.workflows.len().to_string(), "automation catalog"))
-                    (stat_note("Schedules", &catalog.schedules.len().to_string(), "recurring runs"))
+                    (stat_note("Tasks run", &total_tasks.to_string(), "all time"))
+                    (stat_note("Running", &running_tasks.to_string(), if running_tasks > 0 { "active now" } else { "idle" }))
+                    (stat_note("Pending approvals", &approvals.len().to_string(), "need review"))
+                    (stat_note("Workflows", &catalog.workflows.len().to_string(), "in catalog"))
                 }
             }
             div class="tab-bar" role="tablist" {
@@ -483,6 +489,10 @@ async fn task_detail(
                 }
             }
             @if auto_refresh {
+                div class="refresh-banner" {
+                    span class="refresh-dot" {}
+                    "Checking for updates…"
+                }
                 script { "window.setTimeout(() => window.location.reload(), 3000);" }
             }
             @if !approvals.is_empty() {
@@ -1295,20 +1305,42 @@ fn tasks_panel(tasks: &[beaverki_db::TaskRow], user: Option<&str>) -> Markup {
             } @else {
                 @for task in tasks {
                     article class="list-item" {
-                        div class="list-title" {
-                            a href=(task_link(&task.task_id, user)) { (&task.objective) }
-                        }
-                        p class="hint" {
-                            "State: " (status_chip(&task.state))
-                            " • Created " (&task.created_at)
-                        }
-                        @if let Some(result) = task.result_text.as_deref() {
-                            p class="truncate" { (result) }
+                        div class="task-row-layout" {
+                            span class=(task_state_dot(&task.state)) {}
+                            div {
+                                div class="list-title" style="margin-bottom:3px" {
+                                    a href=(task_link(&task.task_id, user)) { (&task.objective) }
+                                }
+                                p class="hint" {
+                                    (&task.created_at)
+                                    @if let Some(result) = task.result_text.as_deref() {
+                                        " · "
+                                        (result.chars().take(80).collect::<String>())
+                                        @if result.len() > 80 { "…" }
+                                    }
+                                }
+                            }
+                            (status_chip(&task.state))
                         }
                     }
                 }
             }
         }
+    }
+}
+
+fn task_state_dot(state: &str) -> &'static str {
+    let s = state.to_lowercase();
+    if s.contains("complet") || s.contains("done") || s.contains("success") {
+        "sdot sdot-green"
+    } else if s.contains("fail") || s.contains("error") || s.contains("denied") {
+        "sdot sdot-muted"
+    } else if s.contains("run") || s.contains("active") || s.contains("progress") {
+        "sdot sdot-cyan"
+    } else if s.contains("pend") || s.contains("approv") || s.contains("wait") {
+        "sdot sdot-amber"
+    } else {
+        "sdot sdot-muted"
     }
 }
 
@@ -1892,38 +1924,12 @@ a { color: inherit; }
 .stat-note-label { display: block; color: var(--cyan-2); font-size: 0.75rem; text-transform: uppercase; font-weight: 700; letter-spacing: 0.1em; margin-bottom: 6px; }
 .stat-note-value { display: block; font-size: 1.8rem; font-weight: 800; color: white; line-height: 1; }
 .stat-note-desc { display: block; margin-top: 4px; color: rgba(232, 246, 255, 0.5); font-size: 0.8rem; }
-/* Activity rows */
-.activity-list { display: grid; }
-.activity-row {
-  display: grid;
-  grid-template-columns: 10px 1fr auto;
-  gap: 14px;
-  align-items: center;
-  padding: 13px 0;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.07);
-}
-.activity-row:last-child { border-bottom: none; }
-.activity-body strong { display: block; color: white; font-size: 0.95rem; font-weight: 600; }
-.activity-body span { display: block; margin-top: 2px; color: rgba(232, 246, 255, 0.55); font-size: 0.82rem; }
-.activity-tag {
-  border: 1px solid rgba(103, 217, 255, 0.24);
-  border-radius: 999px;
-  padding: 5px 10px;
-  color: var(--cyan-2);
-  font-size: 0.72rem;
-  font-weight: 700;
-  white-space: nowrap;
-  text-transform: capitalize;
-}
-.activity-tag.tag-amber { border-color: rgba(244, 155, 35, 0.35); color: #ffd37d; }
-.activity-tag.tag-danger { border-color: rgba(239, 100, 97, 0.35); color: #ffa8a5; }
-.activity-tag.tag-muted { border-color: rgba(255,255,255,0.12); color: rgba(255,255,255,0.45); }
 /* Status dots */
-.sdot { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
-.sdot-green { background: var(--green); box-shadow: 0 0 12px rgba(40, 183, 123, 0.65); }
-.sdot-amber { background: var(--amber); box-shadow: 0 0 12px rgba(244, 155, 35, 0.65); }
-.sdot-cyan  { background: var(--cyan);  box-shadow: 0 0 12px rgba(19, 185, 255, 0.65); }
-.sdot-muted { background: rgba(255,255,255,0.2); }
+.sdot { width: 9px; height: 9px; border-radius: 50%; flex-shrink: 0; margin-top: 5px; }
+.sdot-green { background: var(--green); box-shadow: 0 0 8px rgba(40, 183, 123, 0.5); }
+.sdot-amber { background: var(--amber); box-shadow: 0 0 8px rgba(244, 155, 35, 0.55); }
+.sdot-cyan  { background: var(--cyan);  box-shadow: 0 0 8px rgba(19, 185, 255, 0.5); }
+.sdot-muted { background: var(--line-strong); }
 /* Panels */
 .panel {
   padding: 22px;
@@ -2079,6 +2085,32 @@ code {
 .role-picker { display: grid; gap: 10px; }
 .role-option { display: flex !important; gap: 12px; align-items: flex-start; padding: 12px; border: 1px solid var(--line); border-radius: var(--radius-sm); background: var(--panel-2); }
 .role-copy { display: grid; gap: 4px; }
+.task-row-layout { display: grid; grid-template-columns: 9px 1fr auto; gap: 12px; align-items: start; }
+/* Auto-refresh banner */
+.refresh-banner {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 16px;
+  padding: 8px 14px;
+  border-radius: 999px;
+  background: rgba(19, 185, 255, 0.08);
+  border: 1px solid rgba(19, 185, 255, 0.22);
+  color: var(--cyan);
+  font-size: 0.82rem;
+  font-weight: 600;
+}
+.refresh-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--cyan);
+  animation: pulse 1.4s ease-in-out infinite;
+}
+@keyframes pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.4; transform: scale(0.75); }
+}
 .catalog-grid, .automation-layout { display: grid; gap: 18px; }
 .catalog-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 .automation-layout { grid-template-columns: minmax(240px, 0.8fr) minmax(0, 1.2fr); }
