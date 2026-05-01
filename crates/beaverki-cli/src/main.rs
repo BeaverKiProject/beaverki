@@ -2414,8 +2414,8 @@ fn print_workflow_review_details(review: &beaverki_db::WorkflowReviewRow) {
         "{} {} {} {}",
         "Review".bold().bright_magenta(),
         review.review_id.bold().bright_white(),
-        format!("verdict={}", review.verdict).bold().to_string(),
-        format!("risk={}", review.risk_level).yellow().to_string(),
+        format!("verdict={}", review.verdict).bold(),
+        format!("risk={}", review.risk_level).yellow(),
     );
     print_indented_value("summary", &review.summary_text);
 
@@ -2995,6 +2995,7 @@ async fn load_db(config_dir: &PathBuf) -> Result<(LoadedConfig, Database)> {
     Ok((config, db))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn visible_memories_for_user(
     db: &Database,
     user: &UserRow,

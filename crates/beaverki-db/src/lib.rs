@@ -890,6 +890,7 @@ impl Database {
         Ok(memories)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn query_memories(
         &self,
         owner_user_id: Option<&str>,
@@ -2595,6 +2596,7 @@ impl Database {
         Ok(row)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn update_workflow_run(
         &self,
         workflow_run_id: &str,
@@ -3139,6 +3141,7 @@ impl Database {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn update_household_delivery_schedule(
         &self,
         delivery_id: &str,

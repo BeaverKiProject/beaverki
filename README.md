@@ -109,6 +109,7 @@ make run-task OBJECTIVE="Check my recent activity" TASK_ARGS='--user user_casey'
 - For workflows, see [Workflow Pipelines](docs/workflow-pipelines.md) and the example in [docs/examples/morning-news-digest-workflow.json](docs/examples/morning-news-digest-workflow.json).
 - For architecture and roadmap detail, see [V1 Technical Spec](docs/technical-spec.md), [Delivery Plan](docs/delivery-plan.md), and [Memory Design](docs/memory_design.md).
 - For contribution expectations, see [Contributing Guide](CONTRIBUTING.md) and [Developer Workflow](docs/developer-workflow.md).
+- For public-readiness and security boundaries, see [Public Repository Readiness](docs/public-readiness.md) and [Security Policy](SECURITY.md).
 
 ## Releases
 

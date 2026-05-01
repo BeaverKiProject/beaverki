@@ -26,9 +26,12 @@ const DISCORD_MAX_MESSAGE_LEN: usize = 1_900;
 const DISCORD_TYPING_REFRESH_INTERVAL: Duration = Duration::from_secs(8);
 
 #[cfg(test)]
-static TEST_DIRECT_SEND_CAPTURE: OnceLock<Mutex<Option<Arc<Mutex<Vec<String>>>>>> = OnceLock::new();
+static TEST_DIRECT_SEND_CAPTURE: OnceLock<Mutex<Option<TestDirectSendCapture>>> = OnceLock::new();
 #[cfg(test)]
 static TEST_HISTORY_CAPTURE: OnceLock<Mutex<Option<TestHistoryCapture>>> = OnceLock::new();
+
+#[cfg(test)]
+type TestDirectSendCapture = Arc<Mutex<Vec<String>>>;
 
 pub(crate) struct DiscordHistoryQuery<'a> {
     pub(crate) limit: u16,

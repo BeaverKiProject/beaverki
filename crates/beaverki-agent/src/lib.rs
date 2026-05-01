@@ -246,6 +246,7 @@ enum ManifestJsonSource {
 }
 
 impl PrimaryAgentRunner {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         db: Database,
         memory: MemoryStore,
@@ -1654,6 +1655,7 @@ impl PrimaryAgentRunner {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn create_scheduled_household_delivery(
         &self,
         task: &TaskRow,
@@ -1800,6 +1802,7 @@ impl PrimaryAgentRunner {
             .ok_or_else(|| ToolError::Failed(anyhow!("scheduled household delivery missing")))
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn update_scheduled_household_delivery(
         &self,
         delivery: &HouseholdDeliveryRow,
@@ -4170,6 +4173,7 @@ impl PrimaryAgentRunner {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn record_household_delivery_schedule_denial(
         &self,
         task: &TaskRow,
@@ -5857,8 +5861,10 @@ mod tests {
     #[derive(Clone)]
     struct StubConnectorHistoryDelegate {
         outcome: ConnectorHistoryOutcome,
-        requests: Arc<Mutex<Vec<(String, Option<String>, u16, bool)>>>,
+        requests: Arc<Mutex<Vec<ConnectorHistoryCall>>>,
     }
+
+    type ConnectorHistoryCall = (String, Option<String>, u16, bool);
 
     #[async_trait]
     impl ConnectorHistoryDelegate for StubConnectorHistoryDelegate {
@@ -6062,6 +6068,7 @@ mod tests {
         assert!(requests[0].3);
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn create_active_lua_tool(
         db: &Database,
         owner_user_id: &str,

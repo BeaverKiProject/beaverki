@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 
@@ -180,6 +180,7 @@ pub async fn review_lua_script(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn review_lua_tool(
     provider: &Arc<dyn ModelProvider>,
     tool_id: &str,
@@ -665,7 +666,7 @@ pub fn schedule_enabled(schedule: &ScheduleRow) -> bool {
 
 fn capability_allowed_roots(
     capability_profile: &Value,
-    working_dir: &PathBuf,
+    working_dir: &Path,
     default_roots: &[PathBuf],
 ) -> Vec<PathBuf> {
     let configured = capability_profile

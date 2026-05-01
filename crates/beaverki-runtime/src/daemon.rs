@@ -249,7 +249,7 @@ pub struct ConnectorMessageReply {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 enum DaemonEnvelope {
-    Ok { response: DaemonResponse },
+    Ok { response: Box<DaemonResponse> },
     Error { message: String },
 }
 
@@ -759,7 +759,7 @@ impl DaemonClient {
         match serde_json::from_str::<DaemonEnvelope>(&line)
             .context("failed to decode daemon response")?
         {
-            DaemonEnvelope::Ok { response } => Ok(response),
+            DaemonEnvelope::Ok { response } => Ok(*response),
             DaemonEnvelope::Error { message } => Err(anyhow!(message)),
         }
     }
@@ -1082,7 +1082,12 @@ impl RuntimeDaemon {
             .context("failed to decode daemon request")?;
         info!(request = ?request, "daemon received request");
         let (envelope, should_shutdown) = match self.handle_request(request).await {
-            Ok((response, should_shutdown)) => (DaemonEnvelope::Ok { response }, should_shutdown),
+            Ok((response, should_shutdown)) => (
+                DaemonEnvelope::Ok {
+                    response: Box::new(response),
+                },
+                should_shutdown,
+            ),
             Err(error) => (
                 DaemonEnvelope::Error {
                     message: error.to_string(),

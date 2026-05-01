@@ -159,8 +159,6 @@ Release publication is tag-driven.
 - Windows users are expected to run BeaverKi through WSL rather than a first-party native Windows package
 - Cargo crate versions remain normal semver in `Cargo.toml`; the Git tag is the public release identifier
 
-The current CI workflow intentionally skips clippy until the existing lint failures are addressed.
-
 ## 13. Recommended Next Repo Additions
 
 After crate scaffolding starts, the next useful repository additions are:

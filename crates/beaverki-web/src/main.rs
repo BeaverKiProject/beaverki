@@ -940,7 +940,7 @@ fn render_workflow_editor(
         });
     let stages = workflow
         .map(|workflow| workflow.stages.clone())
-        .unwrap_or_else(|| Vec::new());
+        .unwrap_or_default();
     page_shell(
         if workflow.is_some() {
             "Edit workflow"

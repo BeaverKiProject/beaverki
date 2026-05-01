@@ -3344,6 +3344,7 @@ impl Runtime {
         Ok(result.task)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn issue_approval_actions(
         &self,
         user_id: Option<&str>,
@@ -3382,6 +3383,7 @@ impl Runtime {
             .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn resolve_approval_action(
         &self,
         approver_user_id: Option<&str>,
@@ -3806,6 +3808,7 @@ impl Runtime {
         Ok((request, session))
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn build_primary_request_for_session(
         &self,
         user: &UserRow,
@@ -4357,6 +4360,7 @@ pub async fn verify_notion_integration(
 }
 
 #[cfg(test)]
+#[allow(clippy::await_holding_lock)]
 mod tests {
     use std::collections::VecDeque;
     use std::future::pending;

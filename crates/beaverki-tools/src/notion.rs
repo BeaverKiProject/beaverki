@@ -782,10 +782,10 @@ fn normalize_named_select_value(value: &Value, property_name: &str) -> Result<Va
     if let Some(name) = value.as_str() {
         return Ok(json!({ "name": name }));
     }
-    if let Some(object) = value.as_object() {
-        if object.contains_key("name") || object.contains_key("id") {
-            return Ok(Value::Object(object.clone()));
-        }
+    if let Some(object) = value.as_object()
+        && (object.contains_key("name") || object.contains_key("id"))
+    {
+        return Ok(Value::Object(object.clone()));
     }
     bail!(
         "property '{}' expects a string, null, or an object with 'name'/'id'",
@@ -1390,10 +1390,9 @@ fn notion_children_from_text(content: &str) -> Vec<Value> {
             Some(make_rich_block("bulleted_list_item", text))
         } else if let Some(text) = strip_numbered_list_prefix(line) {
             Some(make_rich_block("numbered_list_item", text))
-        } else if let Some(text) = line.strip_prefix("> ") {
-            Some(make_rich_block("quote", text))
         } else {
-            None
+            line.strip_prefix("> ")
+                .map(|text| make_rich_block("quote", text))
         };
 
         if let Some(b) = block {
@@ -1442,13 +1441,13 @@ fn push_or_nest(
     block: Value,
     is_indented: bool,
 ) {
+    if is_indented && let Some(pidx) = *last_top_idx {
+        nest_child_block(&mut children[pidx], block);
+        // Keep last_top_idx unchanged - the next sibling nests under the same parent.
+        return;
+    }
     if is_indented {
-        if let Some(pidx) = *last_top_idx {
-            nest_child_block(&mut children[pidx], block);
-            // Keep last_top_idx unchanged — the next sibling nests under the same parent.
-            return;
-        }
-        // No parent available — fall through to top-level.
+        // No parent available - fall through to top-level.
     }
     let block_type = block.get("type").and_then(Value::as_str).unwrap_or("");
     let can_be_parent = matches!(
@@ -1468,13 +1467,14 @@ fn nest_child_block(parent: &mut Value, child: Value) {
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_owned();
-    if let Some(inner) = parent.get_mut(&parent_type) {
-        if let Some(obj) = inner.as_object_mut() {
-            obj.entry("children".to_owned())
-                .or_insert_with(|| Value::Array(Vec::new()))
-                .as_array_mut()
-                .unwrap()
-                .push(child);
+    if let Some(inner) = parent.get_mut(&parent_type)
+        && let Some(obj) = inner.as_object_mut()
+    {
+        let children = obj
+            .entry("children".to_owned())
+            .or_insert_with(|| Value::Array(Vec::new()));
+        if let Some(children) = children.as_array_mut() {
+            children.push(child);
         }
     }
 }
@@ -1494,10 +1494,12 @@ fn strip_one_indent(line: &str) -> (bool, &str) {
 
 fn make_rich_block(block_type: &str, text: &str) -> Value {
     let mut block = json!({"object": "block", "type": block_type});
-    block.as_object_mut().unwrap().insert(
-        block_type.to_owned(),
-        json!({"rich_text": notion_rich_text_segments(text)}),
-    );
+    if let Some(object) = block.as_object_mut() {
+        object.insert(
+            block_type.to_owned(),
+            json!({"rich_text": notion_rich_text_segments(text)}),
+        );
+    }
     block
 }
 
@@ -1593,43 +1595,43 @@ fn parse_inline_markdown(mut text: &str, out: &mut Vec<Value>) {
             }
         }
         // Link: [text](url)
-        if text.starts_with('[') {
-            if let Some(bracket_end) = text.find("](") {
-                let link_text = &text[1..bracket_end];
-                let rest = &text[bracket_end + 2..];
-                if let Some(paren_end) = rest.find(')') {
-                    let url = &rest[..paren_end];
-                    flush_inline_plain(&mut plain, out);
-                    for chunk in split_text_chunks(link_text, MAX_BLOCK_TEXT_CHARS) {
-                        out.push(json!({
-                            "type": "text",
-                            "text": {"content": chunk, "link": {"url": url}}
-                        }));
-                    }
-                    text = &rest[paren_end + 1..];
-                    continue;
+        if text.starts_with('[')
+            && let Some(bracket_end) = text.find("](")
+        {
+            let link_text = &text[1..bracket_end];
+            let rest = &text[bracket_end + 2..];
+            if let Some(paren_end) = rest.find(')') {
+                let url = &rest[..paren_end];
+                flush_inline_plain(&mut plain, out);
+                for chunk in split_text_chunks(link_text, MAX_BLOCK_TEXT_CHARS) {
+                    out.push(json!({
+                        "type": "text",
+                        "text": {"content": chunk, "link": {"url": url}}
+                    }));
                 }
+                text = &rest[paren_end + 1..];
+                continue;
             }
         }
         // Color: {color:text} or {color_background:text}
-        if text.starts_with('{') {
-            if let Some(colon_pos) = text[1..].find(':') {
-                let color = &text[1..colon_pos + 1];
-                if is_notion_color(color) {
-                    let rest = &text[colon_pos + 2..];
-                    if let Some(close_pos) = rest.find('}') {
-                        let colored = &rest[..close_pos];
-                        flush_inline_plain(&mut plain, out);
-                        for chunk in split_text_chunks(colored, MAX_BLOCK_TEXT_CHARS) {
-                            out.push(json!({
-                                "type": "text",
-                                "text": {"content": chunk},
-                                "annotations": {"color": color}
-                            }));
-                        }
-                        text = &rest[close_pos + 1..];
-                        continue;
+        if text.starts_with('{')
+            && let Some(colon_pos) = text[1..].find(':')
+        {
+            let color = &text[1..colon_pos + 1];
+            if is_notion_color(color) {
+                let rest = &text[colon_pos + 2..];
+                if let Some(close_pos) = rest.find('}') {
+                    let colored = &rest[..close_pos];
+                    flush_inline_plain(&mut plain, out);
+                    for chunk in split_text_chunks(colored, MAX_BLOCK_TEXT_CHARS) {
+                        out.push(json!({
+                            "type": "text",
+                            "text": {"content": chunk},
+                            "annotations": {"color": color}
+                        }));
                     }
+                    text = &rest[close_pos + 1..];
+                    continue;
                 }
             }
         }
@@ -1714,10 +1716,10 @@ fn push_inline_annotated(
             annotations.insert("strikethrough".to_owned(), Value::Bool(true));
         }
         let mut seg = json!({"type": "text", "text": {"content": chunk}});
-        if !annotations.is_empty() {
-            seg.as_object_mut()
-                .unwrap()
-                .insert("annotations".to_owned(), Value::Object(annotations));
+        if !annotations.is_empty()
+            && let Some(object) = seg.as_object_mut()
+        {
+            object.insert("annotations".to_owned(), Value::Object(annotations));
         }
         out.push(seg);
     }
