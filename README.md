@@ -11,7 +11,7 @@ Today BeaverKi can:
 - run as a persistent local daemon
 - support multiple users with built-in household roles
 - keep tasks, memory, approvals, and audit history in local SQLite storage
-- use OpenAI models with different roles for planning, execution, summarization, and review
+- use either OpenAI or LM Studio-backed local models with different roles for planning, execution, summarization, and review
 - act through local tools such as shell, filesystem, browser, Discord, and Notion integrations
 - offer both a CLI workflow and a loopback-only local web UI
 
@@ -21,7 +21,7 @@ BeaverKi already has a usable runtime foundation, but it is still early-stage so
 
 Current first-party integrations and assumptions:
 
-- OpenAI is the first model provider
+- OpenAI and LM Studio are the currently supported model-provider paths
 - Discord is the first remote messaging connector
 - Notion is available as an optional integration
 - the web UI is local-only and intended for use on the same machine
@@ -32,17 +32,23 @@ Current first-party integrations and assumptions:
 
    You need Rust with `cargo` and `make`.
 
-2. Export an OpenAI API key.
+2. Choose a model provider.
+
+   For OpenAI, export an API key:
 
    ```bash
    export OPENAI_API_KEY="your-openai-api-key"
    ```
+
+   For LM Studio, start LM Studio locally and load at least one chat-capable model before setup.
 
 3. Initialize BeaverKi.
 
    ```bash
    make setup
    ```
+
+   `setup init` now lets you choose OpenAI or LM Studio, and for LM Studio it can discover and prompt for the model IDs to use for planning, execution, summarization, and safety review.
 
 4. Start the daemon.
 
@@ -59,6 +65,7 @@ Current first-party integrations and assumptions:
    ```
 
    By default it listens on `http://127.0.0.1:7676`.
+   Use the Settings link in the web UI to review or change the active provider, base URL, and model roles. The settings form fetches model suggestions through the daemon when the provider supports discovery, but still lets you type a custom model name. Restart the daemon after saving provider changes.
 
 6. Run a first task.
 
@@ -81,6 +88,12 @@ Current first-party integrations and assumptions:
 
 ## Common Household Setup Commands
 
+Verify the active configured provider:
+
+```bash
+cargo run -p beaverki-cli -- setup verify-provider
+```
+
 List roles and users:
 
 ```bash
@@ -102,7 +115,7 @@ make run-task OBJECTIVE="Check my recent activity" TASK_ARGS='--user user_casey'
 
 ## Where To Go Next
 
-- For CLI commands, daemon lifecycle, model setup, and approvals, see [CLI and Operations Guide](docs/cli-operations.md).
+- For CLI commands, daemon lifecycle, OpenAI or LM Studio model setup, and approvals, see [CLI and Operations Guide](docs/cli-operations.md).
 - For local UI behavior and constraints, see [Product Design](docs/design.md).
 - For Discord setup, see [Discord Setup Guide](docs/discord-setup.md).
 - For Notion setup, see [Notion Setup Guide](docs/notion-setup.md).

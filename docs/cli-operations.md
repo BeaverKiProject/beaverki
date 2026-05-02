@@ -6,9 +6,10 @@ This guide holds the command-oriented operational details for BeaverKi. The READ
 
 - install a Rust toolchain with `cargo`
 - install `make` if you want the short wrapper commands from the repository root
-- set `OPENAI_API_KEY` before first-time setup
+- set `OPENAI_API_KEY` before first-time setup if you plan to use OpenAI
 - optionally set `BEAVERKI_MASTER_PASSPHRASE` to avoid repeated passphrase prompts
 - optionally set `DISCORD_BOT_TOKEN` before enabling the Discord connector
+- start LM Studio and load at least one chat-capable model if you plan to use local inference through LM Studio
 
 Default model selections at setup time are:
 
@@ -79,7 +80,13 @@ curl -fsSL https://raw.githubusercontent.com/torlenor/beaverki/master/packaging/
 
 ## Setup And Model Configuration
 
-Verify that the OpenAI credential works:
+Verify the active configured provider:
+
+```bash
+cargo run -p beaverki-cli -- setup verify-provider
+```
+
+Verify that an OpenAI credential works before writing config:
 
 ```bash
 cargo run -p beaverki-cli -- setup verify-openai
@@ -90,6 +97,14 @@ Initialize a new BeaverKi installation:
 ```bash
 cargo run -p beaverki-cli -- setup init
 ```
+
+`setup init` now supports both OpenAI and LM Studio. During interactive setup BeaverKi will:
+
+- let you choose the provider
+- prompt for the LM Studio base URL when LM Studio is selected
+- try to discover available model IDs from LM Studio and let you choose planner, executor, summarizer, and safety-review models
+- if LM Studio discovery fails, offer to retry discovery, change the LM Studio base URL, or continue with manual model entry
+- prompt for an OpenAI API key and encrypted local secret passphrase only when OpenAI is selected
 
 Inspect or change the configured models:
 
@@ -102,7 +117,21 @@ cargo run -p beaverki-cli -- setup set-models \
   --safety-review-model gpt-5.4-mini
 ```
 
-`setup init` verifies the OpenAI API token unless `--skip-openai-check` is passed. The token is stored as an encrypted local secret reference under the BeaverKi state directory.
+`setup init` and `setup set-models` verify the active provider unless `--skip-openai-check` is passed. For OpenAI, BeaverKi stores the API key as an encrypted local secret reference under the BeaverKi state directory. For LM Studio, BeaverKi verifies the configured base URL and model IDs against the local `/v1/models` endpoint and does not create an encrypted provider secret.
+
+Example: initialize BeaverKi against LM Studio with explicit flags instead of the interactive prompts:
+
+```bash
+cargo run -p beaverki-cli -- setup init \
+  --provider lm_studio \
+  --lm-studio-base-url http://127.0.0.1:1234 \
+  --planner-model qwen3-32b \
+  --executor-model qwen3-14b \
+  --summarizer-model qwen3-14b \
+  --safety-review-model qwen3-14b
+```
+
+When LM Studio tool calling is not enabled for the active provider entry, BeaverKi fails closed for tool-requiring agent turns instead of pretending a text-only completion succeeded. That is the safe default for local models that are not yet reliable at structured tool use.
 
 ## Daemon Lifecycle
 
@@ -139,6 +168,8 @@ cargo run -p beaverki-web -- --config-dir /path/to/config
 
 By default the UI listens on `127.0.0.1:7676`.
 
+Use the Settings page in the local UI when you need to change the active model provider, adjust an LM Studio base URL, or update planner, executor, summarizer, and safety-review model IDs. The settings form asks the daemon to fetch model suggestions from the selected provider when discovery is supported, while still allowing custom model names. Saving provider changes updates `providers.yaml`; restart the daemon afterward so new tasks use the new runtime configuration.
+
 Design and access model for the first slice:
 
 - the web UI talks to the BeaverKi daemon through the supported daemon client surface rather than reading SQLite directly
@@ -149,6 +180,7 @@ Design and access model for the first slice:
 Current operator flows in the UI include:
 
 - submit tasks and inspect results
+- review the active runtime provider from the dashboard and change provider settings from the dedicated Settings page
 - inspect and resolve pending approvals
 - inspect and reset or archive sessions
 - inspect recent memory
