@@ -343,7 +343,9 @@ impl DaemonClient {
             .await?
         {
             DaemonResponse::ProviderConfig { view } => Ok(view),
-            other => Err(anyhow!("unexpected daemon provider config response: {other:?}")),
+            other => Err(anyhow!(
+                "unexpected daemon provider config response: {other:?}"
+            )),
         }
     }
 
@@ -353,7 +355,9 @@ impl DaemonClient {
             .await?
         {
             DaemonResponse::Ack { message } => Ok(message),
-            other => Err(anyhow!("unexpected daemon provider config update response: {other:?}")),
+            other => Err(anyhow!(
+                "unexpected daemon provider config update response: {other:?}"
+            )),
         }
     }
 
@@ -945,7 +949,8 @@ impl RuntimeDaemon {
             .unwrap_or(active_provider);
 
         let (available_models, available_models_error) = if include_available_models {
-            match load_provider_model_options(&config, selected_provider, &access.passphrase).await {
+            match load_provider_model_options(&config, selected_provider, &access.passphrase).await
+            {
                 Ok(models) => (models, None),
                 Err(error) => (Vec::new(), Some(error.to_string())),
             }
@@ -2009,7 +2014,11 @@ async fn load_provider_model_options(
                 .list_models()
                 .await
         }
-        other => bail!("provider '{}' kind '{}' does not support model discovery", provider.provider_id, other),
+        other => bail!(
+            "provider '{}' kind '{}' does not support model discovery",
+            provider.provider_id,
+            other
+        ),
     }
 }
 

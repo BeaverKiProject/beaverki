@@ -15,8 +15,8 @@ use beaverki_core::TaskState;
 use beaverki_db::{ApprovalRow, MemoryRow, RoleRow, ScheduleRow, TaskEventRow, ToolInvocationRow};
 use beaverki_runtime::{
     ActiveProviderSummary, AutomationCatalog, DaemonClient, ProviderConfigUpdate,
-    ProviderConfigView, SessionSummary, UserSummary, WorkflowDefinitionInput,
-    WorkflowInspection, WorkflowStageInput,
+    ProviderConfigView, SessionSummary, UserSummary, WorkflowDefinitionInput, WorkflowInspection,
+    WorkflowStageInput,
 };
 use clap::Parser;
 use maud::{DOCTYPE, Markup, PreEscaped, html};
@@ -227,7 +227,18 @@ async fn dashboard(
     let c_catalog = state.daemon.clone();
     let c_status = state.daemon.clone();
     let c_roles = state.daemon.clone();
-    let (provider_view, users, tasks, all_tasks, approvals, sessions, memories, catalog, status, roles) = tokio::join!(
+    let (
+        provider_view,
+        users,
+        tasks,
+        all_tasks,
+        approvals,
+        sessions,
+        memories,
+        catalog,
+        status,
+        roles,
+    ) = tokio::join!(
         c_provider.show_provider_config(None, false),
         c_users.list_users(),
         c_tasks.list_tasks(selected_user.clone(), 10),
@@ -463,7 +474,12 @@ async fn settings_page(
         ))
     };
 
-    Ok(page_shell("Settings", active_user.as_deref(), html! {}, body))
+    Ok(page_shell(
+        "Settings",
+        active_user.as_deref(),
+        html! {},
+        body,
+    ))
 }
 
 async fn submit_task(
@@ -2598,10 +2614,7 @@ fn stat_note(label: &str, value: &str, desc: &str) -> Markup {
     }
 }
 
-fn runtime_provider_panel(
-    provider: &ActiveProviderSummary,
-    user: Option<&str>,
-) -> Markup {
+fn runtime_provider_panel(provider: &ActiveProviderSummary, user: Option<&str>) -> Markup {
     html! {
         section class="provider-panel" {
             div class="provider-panel-header" {

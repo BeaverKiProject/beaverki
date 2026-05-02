@@ -1178,8 +1178,8 @@ async fn daemon_run(args: DaemonRunArgs) -> Result<()> {
             .expect("failed to read master passphrase")
     });
     let runtime = Runtime::load(&config_dir, &passphrase).await?;
-    let daemon = RuntimeDaemon::new(runtime)
-        .with_config_access(config_dir.clone(), passphrase.clone());
+    let daemon =
+        RuntimeDaemon::new(runtime).with_config_access(config_dir.clone(), passphrase.clone());
     println!("Daemon listening on {}", daemon.socket_path().display());
     daemon
         .run_until(async {
