@@ -517,6 +517,12 @@ async fn task_detail(
     var countdown = document.getElementById("refresh-countdown");
     var refreshNow = document.getElementById("refresh-now-btn");
 
+    function scrollStorageKey() {
+        var url = new URL(window.location.href);
+        url.searchParams.delete("_refresh");
+        return "beaverki:scroll:" + url.pathname + "?" + url.searchParams.toString();
+    }
+
     function buildRefreshUrl() {
         var url = new URL(window.location.href);
         url.searchParams.set("_refresh", String(Date.now()));
@@ -524,6 +530,11 @@ async fn task_detail(
     }
 
     function goNow() {
+        try {
+            window.sessionStorage.setItem(scrollStorageKey(), String(window.scrollY || window.pageYOffset || 0));
+        } catch (error) {
+            // Ignore sessionStorage failures and still refresh.
+        }
         window.location.replace(buildRefreshUrl());
     }
 
@@ -2324,6 +2335,24 @@ code {
                     script {
                         (PreEscaped(r#"
 (function(){
+    var currentUrl = new URL(window.location.href);
+    if (currentUrl.searchParams.has('_refresh')) {
+        var restoredUrl = new URL(window.location.href);
+        restoredUrl.searchParams.delete('_refresh');
+        var scrollKey = 'beaverki:scroll:' + restoredUrl.pathname + '?' + restoredUrl.searchParams.toString();
+        try {
+            var savedScroll = window.sessionStorage.getItem(scrollKey);
+            if (savedScroll !== null) {
+                window.history.scrollRestoration = 'manual';
+                window.requestAnimationFrame(function() {
+                    window.scrollTo(0, Number(savedScroll) || 0);
+                    window.sessionStorage.removeItem(scrollKey);
+                });
+            }
+        } catch (error) {
+            // Ignore sessionStorage failures and fall back to default scroll behavior.
+        }
+    }
   var path = window.location.pathname;
   document.querySelectorAll('.topnav a').forEach(function(a) {
     var ap = new URL(a.href).pathname;

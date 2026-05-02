@@ -462,9 +462,10 @@ impl PrimaryAgentRunner {
                         .await?
                     {
                         ToolFailureDisposition::Terminal(result) => Ok(*result),
-                        ToolFailureDisposition::Paused(_)
-                        | ToolFailureDisposition::Continue(_) => {
-                            unreachable!("terminal task failure expected for model provider failure")
+                        ToolFailureDisposition::Paused(_) | ToolFailureDisposition::Continue(_) => {
+                            unreachable!(
+                                "terminal task failure expected for model provider failure"
+                            )
                         }
                     };
                 }
@@ -5891,9 +5892,7 @@ mod tests {
             )
         }
 
-        fn scripted(
-            responses: Vec<std::result::Result<ModelTurnResponse, String>>,
-        ) -> Self {
+        fn scripted(responses: Vec<std::result::Result<ModelTurnResponse, String>>) -> Self {
             Self {
                 models: ProviderModels {
                     planner: "planner".to_owned(),

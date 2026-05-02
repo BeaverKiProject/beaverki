@@ -3269,7 +3269,9 @@ async fn discover_lm_studio_models(base_url: &str) -> Result<Vec<String>> {
     provider.list_models().await
 }
 
-async fn discover_lm_studio_models_with_retry(initial_base_url: String) -> Result<(String, Vec<String>)> {
+async fn discover_lm_studio_models_with_retry(
+    initial_base_url: String,
+) -> Result<(String, Vec<String>)> {
     let mut base_url = initial_base_url;
 
     loop {
