@@ -5863,6 +5863,8 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex, OnceLock};
 
+    use tokio::sync::Mutex as AsyncMutex;
+
     use anyhow::Result;
     use async_trait::async_trait;
     use beaverki_config::ProviderModels;
@@ -6044,12 +6046,9 @@ mod tests {
         }
     }
 
-    fn database_connect_guard() -> std::sync::MutexGuard<'static, ()> {
-        static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
-        GUARD
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .expect("database connect guard")
+    async fn database_connect_guard() -> tokio::sync::MutexGuard<'static, ()> {
+        static GUARD: OnceLock<AsyncMutex<()>> = OnceLock::new();
+        GUARD.get_or_init(|| AsyncMutex::new(())).lock().await
     }
 
     async fn test_runner_with_provider(
@@ -6057,7 +6056,7 @@ mod tests {
     ) -> (Database, PrimaryAgentRunner) {
         let db_dir = tempfile::tempdir().expect("tempdir");
         let db_path = db_dir.path().join("test.db");
-        let _guard = database_connect_guard();
+        let _guard = database_connect_guard().await;
         let db = Database::connect(&db_path).await.expect("connect");
         db.bootstrap_single_user("Alex").await.expect("bootstrap");
         let runner = PrimaryAgentRunner::new(
@@ -6253,7 +6252,7 @@ mod tests {
         ])) as Arc<dyn ModelProvider>;
         let db_dir = tempfile::tempdir().expect("tempdir");
         let db_path = db_dir.path().join("test.db");
-        let _guard = database_connect_guard();
+        let _guard = database_connect_guard().await;
         let db = Database::connect(&db_path).await.expect("connect");
         db.bootstrap_single_user("Alex").await.expect("bootstrap");
         let requests = Arc::new(Mutex::new(Vec::new()));
@@ -9442,7 +9441,7 @@ end"#,
         .expect("write manifest");
 
         let db_path = tempdir.path().join("test.db");
-        let _guard = database_connect_guard();
+        let _guard = database_connect_guard().await;
         let db = Database::connect(&db_path).await.expect("connect");
         db.bootstrap_single_user("Alex").await.expect("bootstrap");
         let provider = Arc::new(FakeProvider::new(vec![])) as Arc<dyn ModelProvider>;
@@ -9562,7 +9561,7 @@ end"#,
         .expect("write manifest");
 
         let db_path = tempdir.path().join("test.db");
-        let _guard = database_connect_guard();
+        let _guard = database_connect_guard().await;
         let db = Database::connect(&db_path).await.expect("connect");
         db.bootstrap_single_user("Alex").await.expect("bootstrap");
         let provider = Arc::new(FakeProvider::new(vec![])) as Arc<dyn ModelProvider>;
