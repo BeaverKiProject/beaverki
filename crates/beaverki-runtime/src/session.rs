@@ -7,7 +7,6 @@ use beaverki_db::{ConversationSessionRow, MemoryRow};
 use beaverki_policy::visible_memory_scopes;
 use chrono::{DateTime, Utc};
 
-pub(crate) const CLI_CONVERSATION_HISTORY_LIMIT: i64 = 4;
 const CLI_ACTIVE_CONVERSATION_WINDOW_SECS: i64 = 45 * 60;
 
 pub(crate) const SESSION_RESET_COMMAND: &str = "/new";
@@ -196,13 +195,29 @@ pub(crate) enum CliConversationStatus {
     FreshStart,
 }
 
-pub(crate) fn build_cli_task_context(recent_exchanges: &[CliConversationExchange]) -> String {
+pub(crate) fn build_cli_task_context(
+    summary_text: Option<&str>,
+    recent_exchanges: &[CliConversationExchange],
+) -> String {
     let mut context = String::new();
     context.push_str("CLI context:\n");
     context.push_str("- Source: CLI.\n");
     context.push_str(
         "- Conversation history for CLI requests is scoped to this BeaverKI user and entrypoint.\n",
     );
+
+    if let Some(summary_text) = summary_text
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        context.push_str("Older conversation summary:\n");
+        for line in summary_text.lines() {
+            let line = line.trim();
+            if !line.is_empty() {
+                context.push_str(&format!("- [CLI summary] {}\n", line));
+            }
+        }
+    }
 
     let Some(latest_exchange) = recent_exchanges.first() else {
         context.push_str(

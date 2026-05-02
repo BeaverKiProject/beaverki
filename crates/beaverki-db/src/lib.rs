@@ -3279,6 +3279,74 @@ impl Database {
         Ok(rows)
     }
 
+    pub async fn list_interactive_tasks_for_session_after(
+        &self,
+        session_id: &str,
+        since_inclusive: Option<&str>,
+        created_after_exclusive: Option<&str>,
+    ) -> Result<Vec<TaskRow>> {
+        let rows = match (since_inclusive, created_after_exclusive) {
+            (Some(since_inclusive), Some(created_after_exclusive)) => {
+                sqlx::query_as::<_, TaskRow>(
+                    "SELECT task_id, owner_user_id, initiating_identity_id, primary_agent_id, assigned_agent_id, parent_task_id, session_id, kind, state, objective, context_summary, result_text, scope, wake_at, created_at, updated_at, completed_at
+                     FROM tasks
+                     WHERE session_id = ?
+                       AND kind = 'interactive'
+                       AND created_at >= ?
+                       AND created_at > ?
+                     ORDER BY created_at ASC",
+                )
+                .bind(session_id)
+                .bind(since_inclusive)
+                .bind(created_after_exclusive)
+                .fetch_all(&self.pool)
+                .await
+            }
+            (Some(since_inclusive), None) => {
+                sqlx::query_as::<_, TaskRow>(
+                    "SELECT task_id, owner_user_id, initiating_identity_id, primary_agent_id, assigned_agent_id, parent_task_id, session_id, kind, state, objective, context_summary, result_text, scope, wake_at, created_at, updated_at, completed_at
+                     FROM tasks
+                     WHERE session_id = ?
+                       AND kind = 'interactive'
+                       AND created_at >= ?
+                     ORDER BY created_at ASC",
+                )
+                .bind(session_id)
+                .bind(since_inclusive)
+                .fetch_all(&self.pool)
+                .await
+            }
+            (None, Some(created_after_exclusive)) => {
+                sqlx::query_as::<_, TaskRow>(
+                    "SELECT task_id, owner_user_id, initiating_identity_id, primary_agent_id, assigned_agent_id, parent_task_id, session_id, kind, state, objective, context_summary, result_text, scope, wake_at, created_at, updated_at, completed_at
+                     FROM tasks
+                     WHERE session_id = ?
+                       AND kind = 'interactive'
+                       AND created_at > ?
+                     ORDER BY created_at ASC",
+                )
+                .bind(session_id)
+                .bind(created_after_exclusive)
+                .fetch_all(&self.pool)
+                .await
+            }
+            (None, None) => {
+                sqlx::query_as::<_, TaskRow>(
+                    "SELECT task_id, owner_user_id, initiating_identity_id, primary_agent_id, assigned_agent_id, parent_task_id, session_id, kind, state, objective, context_summary, result_text, scope, wake_at, created_at, updated_at, completed_at
+                     FROM tasks
+                     WHERE session_id = ?
+                       AND kind = 'interactive'
+                     ORDER BY created_at ASC",
+                )
+                .bind(session_id)
+                .fetch_all(&self.pool)
+                .await
+            }
+        }
+        .context("failed to list interactive tasks for session after boundary")?;
+        Ok(rows)
+    }
+
     pub async fn fetch_task(&self, task_id: &str) -> Result<Option<TaskRow>> {
         let row = sqlx::query_as::<_, TaskRow>(
             "SELECT task_id, owner_user_id, initiating_identity_id, primary_agent_id, assigned_agent_id, parent_task_id, session_id, kind, state, objective, context_summary, result_text, scope, wake_at, created_at, updated_at, completed_at
@@ -3346,6 +3414,24 @@ impl Database {
         Ok(events)
     }
 
+    pub async fn list_task_events_for_owner(
+        &self,
+        owner_user_id: &str,
+    ) -> Result<Vec<TaskEventRow>> {
+        let events = sqlx::query_as::<_, TaskEventRow>(
+            "SELECT task_events.event_id, task_events.task_id, task_events.event_type, task_events.actor_type, task_events.actor_id, task_events.payload_json, task_events.created_at
+             FROM task_events
+             INNER JOIN tasks ON tasks.task_id = task_events.task_id
+             WHERE tasks.owner_user_id = ?
+             ORDER BY task_events.created_at ASC",
+        )
+        .bind(owner_user_id)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list task events for owner")?;
+        Ok(events)
+    }
+
     pub async fn fetch_task_events(&self, task_id: &str) -> Result<Vec<TaskEventRow>> {
         let events = sqlx::query_as::<_, TaskEventRow>(
             "SELECT event_id, task_id, event_type, actor_type, actor_id, payload_json, created_at
@@ -3392,6 +3478,229 @@ impl Database {
         }
         .context("failed to list task events for session")?;
         Ok(events)
+    }
+
+    pub async fn fetch_active_session_transcript_summary(
+        &self,
+        session_id: &str,
+        reset_boundary: Option<&str>,
+    ) -> Result<Option<SessionTranscriptSummaryRow>> {
+        let row = if let Some(reset_boundary) = reset_boundary {
+            sqlx::query_as::<_, SessionTranscriptSummaryRow>(
+                "SELECT summary_id, session_id, reset_boundary, source_through_task_created_at, source_task_count, summary_text, estimated_tokens, summarizer_task_id, superseded_at, created_at, updated_at
+                 FROM session_transcript_summaries
+                 WHERE session_id = ?
+                   AND reset_boundary = ?
+                   AND superseded_at IS NULL
+                 ORDER BY created_at DESC
+                 LIMIT 1",
+            )
+            .bind(session_id)
+            .bind(reset_boundary)
+            .fetch_optional(&self.pool)
+            .await
+        } else {
+            sqlx::query_as::<_, SessionTranscriptSummaryRow>(
+                "SELECT summary_id, session_id, reset_boundary, source_through_task_created_at, source_task_count, summary_text, estimated_tokens, summarizer_task_id, superseded_at, created_at, updated_at
+                 FROM session_transcript_summaries
+                 WHERE session_id = ?
+                   AND reset_boundary IS NULL
+                   AND superseded_at IS NULL
+                 ORDER BY created_at DESC
+                 LIMIT 1",
+            )
+            .bind(session_id)
+            .fetch_optional(&self.pool)
+            .await
+        }
+        .context("failed to fetch active session transcript summary")?;
+        Ok(row)
+    }
+
+    pub async fn list_session_transcript_summaries(
+        &self,
+        session_id: &str,
+        reset_boundary: Option<&str>,
+        include_superseded: bool,
+        limit: i64,
+    ) -> Result<Vec<SessionTranscriptSummaryRow>> {
+        let rows = match (reset_boundary, include_superseded) {
+            (Some(reset_boundary), true) => sqlx::query_as::<_, SessionTranscriptSummaryRow>(
+                "SELECT summary_id, session_id, reset_boundary, source_through_task_created_at, source_task_count, summary_text, estimated_tokens, summarizer_task_id, superseded_at, created_at, updated_at
+                 FROM session_transcript_summaries
+                 WHERE session_id = ?
+                   AND reset_boundary = ?
+                 ORDER BY created_at DESC
+                 LIMIT ?",
+            )
+            .bind(session_id)
+            .bind(reset_boundary)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await,
+            (Some(reset_boundary), false) => sqlx::query_as::<_, SessionTranscriptSummaryRow>(
+                "SELECT summary_id, session_id, reset_boundary, source_through_task_created_at, source_task_count, summary_text, estimated_tokens, summarizer_task_id, superseded_at, created_at, updated_at
+                 FROM session_transcript_summaries
+                 WHERE session_id = ?
+                   AND reset_boundary = ?
+                   AND superseded_at IS NULL
+                 ORDER BY created_at DESC
+                 LIMIT ?",
+            )
+            .bind(session_id)
+            .bind(reset_boundary)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await,
+            (None, true) => sqlx::query_as::<_, SessionTranscriptSummaryRow>(
+                "SELECT summary_id, session_id, reset_boundary, source_through_task_created_at, source_task_count, summary_text, estimated_tokens, summarizer_task_id, superseded_at, created_at, updated_at
+                 FROM session_transcript_summaries
+                 WHERE session_id = ?
+                   AND reset_boundary IS NULL
+                 ORDER BY created_at DESC
+                 LIMIT ?",
+            )
+            .bind(session_id)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await,
+            (None, false) => sqlx::query_as::<_, SessionTranscriptSummaryRow>(
+                "SELECT summary_id, session_id, reset_boundary, source_through_task_created_at, source_task_count, summary_text, estimated_tokens, summarizer_task_id, superseded_at, created_at, updated_at
+                 FROM session_transcript_summaries
+                 WHERE session_id = ?
+                   AND reset_boundary IS NULL
+                   AND superseded_at IS NULL
+                 ORDER BY created_at DESC
+                 LIMIT ?",
+            )
+            .bind(session_id)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await,
+        }
+        .context("failed to list session transcript summaries")?;
+        Ok(rows)
+    }
+
+    pub async fn insert_session_transcript_summary(
+        &self,
+        input: NewSessionTranscriptSummary<'_>,
+    ) -> Result<SessionTranscriptSummaryRow> {
+        let summary_id = new_prefixed_id("session_summary");
+        let timestamp = now_rfc3339();
+        sqlx::query(
+            "INSERT INTO session_transcript_summaries
+             (summary_id, session_id, reset_boundary, source_through_task_created_at, source_task_count, summary_text, estimated_tokens, summarizer_task_id, superseded_at, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)",
+        )
+        .bind(&summary_id)
+        .bind(input.session_id)
+        .bind(input.reset_boundary)
+        .bind(input.source_through_task_created_at)
+        .bind(input.source_task_count)
+        .bind(input.summary_text)
+        .bind(input.estimated_tokens)
+        .bind(input.summarizer_task_id)
+        .bind(&timestamp)
+        .bind(&timestamp)
+        .execute(&self.pool)
+        .await
+        .context("failed to insert session transcript summary")?;
+
+        self.fetch_session_transcript_summary(&summary_id)
+            .await?
+            .ok_or_else(|| anyhow!("session transcript summary missing after insert"))
+    }
+
+    pub async fn supersede_session_transcript_summaries(
+        &self,
+        session_id: &str,
+        reset_boundary: Option<&str>,
+        except_summary_id: Option<&str>,
+    ) -> Result<()> {
+        let timestamp = now_rfc3339();
+        match (reset_boundary, except_summary_id) {
+            (Some(reset_boundary), Some(except_summary_id)) => {
+                sqlx::query(
+                    "UPDATE session_transcript_summaries
+                     SET superseded_at = ?, updated_at = ?
+                     WHERE session_id = ?
+                       AND reset_boundary = ?
+                       AND superseded_at IS NULL
+                       AND summary_id <> ?",
+                )
+                .bind(&timestamp)
+                .bind(&timestamp)
+                .bind(session_id)
+                .bind(reset_boundary)
+                .bind(except_summary_id)
+                .execute(&self.pool)
+                .await
+            }
+            (Some(reset_boundary), None) => {
+                sqlx::query(
+                    "UPDATE session_transcript_summaries
+                     SET superseded_at = ?, updated_at = ?
+                     WHERE session_id = ?
+                       AND reset_boundary = ?
+                       AND superseded_at IS NULL",
+                )
+                .bind(&timestamp)
+                .bind(&timestamp)
+                .bind(session_id)
+                .bind(reset_boundary)
+                .execute(&self.pool)
+                .await
+            }
+            (None, Some(except_summary_id)) => {
+                sqlx::query(
+                    "UPDATE session_transcript_summaries
+                     SET superseded_at = ?, updated_at = ?
+                     WHERE session_id = ?
+                       AND reset_boundary IS NULL
+                       AND superseded_at IS NULL
+                       AND summary_id <> ?",
+                )
+                .bind(&timestamp)
+                .bind(&timestamp)
+                .bind(session_id)
+                .bind(except_summary_id)
+                .execute(&self.pool)
+                .await
+            }
+            (None, None) => {
+                sqlx::query(
+                    "UPDATE session_transcript_summaries
+                     SET superseded_at = ?, updated_at = ?
+                     WHERE session_id = ?
+                       AND reset_boundary IS NULL
+                       AND superseded_at IS NULL",
+                )
+                .bind(&timestamp)
+                .bind(&timestamp)
+                .bind(session_id)
+                .execute(&self.pool)
+                .await
+            }
+        }
+        .context("failed to supersede session transcript summaries")?;
+        Ok(())
+    }
+
+    async fn fetch_session_transcript_summary(
+        &self,
+        summary_id: &str,
+    ) -> Result<Option<SessionTranscriptSummaryRow>> {
+        let row = sqlx::query_as::<_, SessionTranscriptSummaryRow>(
+            "SELECT summary_id, session_id, reset_boundary, source_through_task_created_at, source_task_count, summary_text, estimated_tokens, summarizer_task_id, superseded_at, created_at, updated_at
+             FROM session_transcript_summaries
+             WHERE summary_id = ?",
+        )
+        .bind(summary_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to fetch session transcript summary")?;
+        Ok(row)
     }
 
     pub async fn fetch_tool_invocations_for_owner(
@@ -3447,6 +3756,17 @@ pub struct NewTask<'a> {
     pub context_summary: Option<&'a str>,
     pub scope: MemoryScope,
     pub wake_at: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct NewSessionTranscriptSummary<'a> {
+    pub session_id: &'a str,
+    pub reset_boundary: Option<&'a str>,
+    pub source_through_task_created_at: &'a str,
+    pub source_task_count: i64,
+    pub summary_text: &'a str,
+    pub estimated_tokens: i64,
+    pub summarizer_task_id: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3736,6 +4056,21 @@ pub struct ConversationSessionRow {
     pub last_reset_at: Option<String>,
     pub archived_at: Option<String>,
     pub lifecycle_reason: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct SessionTranscriptSummaryRow {
+    pub summary_id: String,
+    pub session_id: String,
+    pub reset_boundary: Option<String>,
+    pub source_through_task_created_at: String,
+    pub source_task_count: i64,
+    pub summary_text: String,
+    pub estimated_tokens: i64,
+    pub summarizer_task_id: Option<String>,
+    pub superseded_at: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -4514,6 +4849,141 @@ mod tests {
 
         assert_eq!(first_row.status, "superseded");
         assert_eq!(second_row.status, "pending");
+    }
+
+    #[tokio::test]
+    async fn session_transcript_summaries_respect_reset_boundaries_and_supersession() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("test.db");
+        let db = Database::connect(&db_path).await.expect("connect");
+        let bootstrap = db.bootstrap_single_user("Alex").await.expect("bootstrap");
+        let session = db
+            .ensure_conversation_session(NewConversationSession {
+                session_kind: "cli",
+                session_key: "cli:user_alex",
+                audience_policy: "direct_user",
+                max_memory_scope: MemoryScope::Private,
+                originating_connector_type: None,
+                originating_connector_target: None,
+            })
+            .await
+            .expect("session");
+        let task_one = db
+            .create_task_with_params(NewTask {
+                owner_user_id: &bootstrap.user_id,
+                initiating_identity_id: "cli:user_alex",
+                primary_agent_id: &bootstrap.primary_agent_id,
+                assigned_agent_id: &bootstrap.primary_agent_id,
+                parent_task_id: None,
+                session_id: Some(&session.session_id),
+                kind: "interactive",
+                objective: "First exchange",
+                context_summary: None,
+                scope: MemoryScope::Private,
+                wake_at: None,
+            })
+            .await
+            .expect("task one");
+        let task_two = db
+            .create_task_with_params(NewTask {
+                owner_user_id: &bootstrap.user_id,
+                initiating_identity_id: "cli:user_alex",
+                primary_agent_id: &bootstrap.primary_agent_id,
+                assigned_agent_id: &bootstrap.primary_agent_id,
+                parent_task_id: None,
+                session_id: Some(&session.session_id),
+                kind: "interactive",
+                objective: "Second exchange",
+                context_summary: None,
+                scope: MemoryScope::Private,
+                wake_at: None,
+            })
+            .await
+            .expect("task two");
+
+        let first_summary = db
+            .insert_session_transcript_summary(NewSessionTranscriptSummary {
+                session_id: &session.session_id,
+                reset_boundary: None,
+                source_through_task_created_at: &task_one.created_at,
+                source_task_count: 1,
+                summary_text: "Summary one",
+                estimated_tokens: 24,
+                summarizer_task_id: None,
+            })
+            .await
+            .expect("insert first summary");
+        let second_summary = db
+            .insert_session_transcript_summary(NewSessionTranscriptSummary {
+                session_id: &session.session_id,
+                reset_boundary: None,
+                source_through_task_created_at: &task_two.created_at,
+                source_task_count: 2,
+                summary_text: "Summary two",
+                estimated_tokens: 40,
+                summarizer_task_id: None,
+            })
+            .await
+            .expect("insert second summary");
+        db.supersede_session_transcript_summaries(
+            &session.session_id,
+            None,
+            Some(&second_summary.summary_id),
+        )
+        .await
+        .expect("supersede old summary");
+
+        let active = db
+            .fetch_active_session_transcript_summary(&session.session_id, None)
+            .await
+            .expect("active summary")
+            .expect("summary row");
+        assert_eq!(active.summary_id, second_summary.summary_id);
+        let listed = db
+            .list_session_transcript_summaries(&session.session_id, None, true, 8)
+            .await
+            .expect("list summaries");
+        assert_eq!(listed.len(), 2);
+        assert!(
+            listed.iter().any(
+                |row| row.summary_id == first_summary.summary_id && row.superseded_at.is_some()
+            )
+        );
+
+        db.reset_conversation_session(&session.session_id, "manual_reset")
+            .await
+            .expect("reset session");
+        let reset_boundary = db
+            .fetch_conversation_session(&session.session_id)
+            .await
+            .expect("fetch session")
+            .expect("session row")
+            .last_reset_at;
+        let reset_summary = db
+            .insert_session_transcript_summary(NewSessionTranscriptSummary {
+                session_id: &session.session_id,
+                reset_boundary: reset_boundary.as_deref(),
+                source_through_task_created_at: &task_two.created_at,
+                source_task_count: 1,
+                summary_text: "Summary after reset",
+                estimated_tokens: 16,
+                summarizer_task_id: None,
+            })
+            .await
+            .expect("insert reset summary");
+
+        let active_after_reset = db
+            .fetch_active_session_transcript_summary(&session.session_id, reset_boundary.as_deref())
+            .await
+            .expect("active reset summary")
+            .expect("summary row");
+        assert_eq!(active_after_reset.summary_id, reset_summary.summary_id);
+        let legacy_active = db
+            .fetch_active_session_transcript_summary(&session.session_id, None)
+            .await
+            .expect("legacy summary")
+            .expect("legacy row");
+        assert_eq!(legacy_active.summary_id, second_summary.summary_id);
     }
 
     #[tokio::test]

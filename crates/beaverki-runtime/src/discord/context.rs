@@ -5,17 +5,17 @@ use chrono::{DateTime, Utc};
 
 use crate::connector_support::{assistant_reply_for_context, connector_context_from_events};
 
-use super::{DISCORD_ACTIVE_CONVERSATION_WINDOW_SECS, DISCORD_CONVERSATION_HISTORY_LIMIT};
+use super::DISCORD_ACTIVE_CONVERSATION_WINDOW_SECS;
 
 #[derive(Debug, Clone)]
-pub(super) struct ConversationExchange {
-    pub(super) created_at: String,
-    pub(super) state: String,
-    pub(super) source_label: String,
-    pub(super) channel_id: Option<String>,
-    pub(super) user_label: String,
-    pub(super) user_text: String,
-    pub(super) assistant_text: String,
+pub(crate) struct ConversationExchange {
+    pub(crate) created_at: String,
+    pub(crate) state: String,
+    pub(crate) source_label: String,
+    pub(crate) channel_id: Option<String>,
+    pub(crate) user_label: String,
+    pub(crate) user_text: String,
+    pub(crate) assistant_text: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,8 +24,9 @@ enum ConversationStatus {
     FreshStart,
 }
 
-pub(super) fn build_discord_task_context(
+pub(crate) fn build_discord_task_context(
     session: &ConversationSessionRow,
+    summary_text: Option<&str>,
     recent_exchanges: &[ConversationExchange],
     current_source_label: &str,
     user_label: &str,
@@ -45,6 +46,19 @@ pub(super) fn build_discord_task_context(
             "- Conversation history is scoped to this shared connector room rather than the user's wider personal history.\n",
         ),
         _ => context.push_str("- Conversation history is scoped to this connector session.\n"),
+    }
+
+    if let Some(summary_text) = summary_text
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        context.push_str("Older conversation summary:\n");
+        for line in summary_text.lines() {
+            let line = line.trim();
+            if !line.is_empty() {
+                context.push_str(&format!("- [Summary] {}\n", line));
+            }
+        }
     }
 
     let Some(latest_exchange) = recent_exchanges.first() else {
@@ -98,7 +112,7 @@ pub(super) fn build_discord_task_context(
     context
 }
 
-pub(super) fn discord_source_label(is_direct_message: bool) -> &'static str {
+pub(crate) fn discord_source_label(is_direct_message: bool) -> &'static str {
     if is_direct_message {
         "Discord direct message"
     } else {
@@ -106,23 +120,16 @@ pub(super) fn discord_source_label(is_direct_message: bool) -> &'static str {
     }
 }
 
-pub(super) async fn load_recent_conversation_exchanges(
+pub(crate) async fn build_conversation_exchanges(
     db: &Database,
-    session: &ConversationSessionRow,
+    tasks: &[TaskRow],
     fallback_user_label: &str,
 ) -> Result<Vec<ConversationExchange>> {
-    let tasks = db
-        .list_recent_interactive_tasks_for_session(
-            &session.session_id,
-            session.last_reset_at.as_deref(),
-            DISCORD_CONVERSATION_HISTORY_LIMIT,
-        )
-        .await?;
     let mut exchanges = Vec::with_capacity(tasks.len());
     for task in tasks {
         let events = db.fetch_task_events(&task.task_id).await?;
         exchanges.push(build_conversation_exchange(
-            &task,
+            task,
             &events,
             fallback_user_label,
         ));

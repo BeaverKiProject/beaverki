@@ -524,7 +524,7 @@ Exit criteria:
 
 Candidate follow-up work:
 
-- Further context-window optimization, transcript summarization, and token-budget visibility per user and session
+- Further context-window optimization beyond the current summary-overlay and token-budget inspection implementation
 - Additional model providers:
   - Anthropic
   - Azure OpenAI

@@ -19,7 +19,7 @@ use crate::{
 
 mod api;
 mod approvals;
-mod context;
+pub(crate) mod context;
 mod gateway;
 mod interactions;
 mod models;
@@ -33,9 +33,7 @@ use self::approvals::{
     render_approval_detail, render_approval_overview, render_critical_confirmation_prompt,
     render_waiting_approval_reply,
 };
-use self::context::{
-    build_discord_task_context, discord_source_label, load_recent_conversation_exchanges,
-};
+use self::context::discord_source_label;
 use self::interactions::{
     discord_interaction_to_message_request, is_channel_trigger_attempt, normalize_message_text,
 };
@@ -54,7 +52,6 @@ pub(crate) use self::api::set_test_direct_send_capture;
 #[cfg(test)]
 pub(crate) use self::api::{clear_test_history_capture, set_test_history_capture};
 
-const DISCORD_CONVERSATION_HISTORY_LIMIT: i64 = 4;
 const DISCORD_ACTIVE_CONVERSATION_WINDOW_SECS: i64 = 45 * 60;
 const DISCORD_REACTION_WORKING: &str = "%E2%8F%B3";
 const APPROVAL_ACTION_TOKEN_PREFIX: &str = "approval_token_";
@@ -461,20 +458,17 @@ impl RuntimeDaemon {
             .as_deref()
             .filter(|value| !value.trim().is_empty())
             .unwrap_or(mapped_user.display_name.as_str());
-        let recent_exchanges = load_recent_conversation_exchanges(
-            &self.runtime.db,
-            &session,
-            mapped_user.display_name.as_str(),
-        )
-        .await?;
         let current_source_label = discord_source_label(message.is_direct_message);
-        let task_context = build_discord_task_context(
-            &session,
-            &recent_exchanges,
-            current_source_label,
-            user_label,
-            &message.channel_id,
-        );
+        let task_context = self
+            .runtime
+            .build_connector_task_context(
+                &session,
+                mapped_user.display_name.as_str(),
+                current_source_label,
+                user_label,
+                &message.channel_id,
+            )
+            .await?;
         let task = self
             .runtime
             .enqueue_objective_from_connector(
@@ -1127,6 +1121,7 @@ mod tests {
 
         let context = build_discord_task_context(
             &test_session("direct_message"),
+            None,
             &[recent_exchange],
             "Discord direct message",
             "Torlenor",
@@ -1156,6 +1151,7 @@ mod tests {
 
         let context = build_discord_task_context(
             &test_session("direct_message"),
+            None,
             &[stale_exchange],
             "Discord direct message",
             "Torlenor",

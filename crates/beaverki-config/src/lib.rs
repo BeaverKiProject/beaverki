@@ -48,6 +48,7 @@ pub struct RuntimeDefaults {
 #[serde(default)]
 pub struct SessionManagementConfig {
     pub cleanup_interval_secs: u64,
+    pub transcript_budget: SessionTranscriptBudgetConfig,
     pub policies: Vec<SessionLifecyclePolicy>,
 }
 
@@ -55,6 +56,7 @@ impl Default for SessionManagementConfig {
     fn default() -> Self {
         Self {
             cleanup_interval_secs: 5 * 60,
+            transcript_budget: SessionTranscriptBudgetConfig::default(),
             policies: vec![
                 SessionLifecyclePolicy {
                     policy_id: "cli_inactive_reset".to_owned(),
@@ -101,6 +103,30 @@ impl Default for SessionManagementConfig {
                     max_memory_scope: None,
                 },
             ],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SessionTranscriptBudgetConfig {
+    pub protected_recent_exchanges: u32,
+    pub target_context_tokens: u32,
+    pub trigger_context_tokens: u32,
+    pub hard_context_tokens: u32,
+    pub summary_max_tokens: u32,
+    pub maintenance_interval_secs: Option<u64>,
+}
+
+impl Default for SessionTranscriptBudgetConfig {
+    fn default() -> Self {
+        Self {
+            protected_recent_exchanges: 4,
+            target_context_tokens: 8_000,
+            trigger_context_tokens: 10_000,
+            hard_context_tokens: 12_000,
+            summary_max_tokens: 1_200,
+            maintenance_interval_secs: Some(15 * 60),
         }
     }
 }

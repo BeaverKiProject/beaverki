@@ -163,6 +163,24 @@ Current operator controls include:
 - `beaverki session policy list`
 - `beaverki session policy set ...`
 
+## 8.1 Transcript Summaries And Token Budgets
+
+BeaverKi now keeps the newest session exchanges intact while compacting older transcript spans into a stored summary overlay when the session crosses configured context-budget thresholds.
+
+Current behavior:
+
+- the runtime estimates current session context size before prompt assembly
+- older exchanges can be summarized with the configured summarizer model instead of replaying the full raw transcript
+- the stored summary is tied to the current session reset window, so `/new` starts a fresh transcript-summary lineage
+- session compaction is recorded as auditable session maintenance work rather than rewriting task history
+- status and operator views show recent token usage, compaction counts, trim counts, estimated current context size, and whether a summary overlay is active
+
+This keeps session continuity explainable:
+
+- the newest exchanges remain raw
+- older continuity is carried forward as a deterministic stored summary plus explicit audit events
+- task history and durable memory remain separate from session-context compaction
+
 ## 9. Practical Examples
 
 ### 9.1 CLI Follow-Up

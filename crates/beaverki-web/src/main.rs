@@ -509,6 +509,11 @@ async fn task_detail(
                     h2 { "Result" }
                     p { "The daemon stores the latest result text directly on the task record." }
                 }
+                p class="hint" {
+                    "Tokens: " (task.token_usage.input_tokens) " in / " (task.token_usage.output_tokens) " out"
+                    " • Compactions: " (task.token_usage.compactions)
+                    " • Trims: " (task.token_usage.trims)
+                }
                 @if let Some(result) = task.task.result_text.as_deref() {
                     pre class="code-block" { (result) }
                 } @else {
@@ -1395,6 +1400,15 @@ fn sessions_panel(sessions: &[SessionSummary], user: Option<&str>) -> Markup {
                         " • Tasks: " (summary.task_count)
                     }
                     p class="hint" {
+                        "Tokens: " (summary.token_usage.input_tokens) " in / " (summary.token_usage.output_tokens) " out"
+                        " • Compactions: " (summary.token_usage.compactions)
+                        " • Trims: " (summary.token_usage.trims)
+                    }
+                    p class="hint" {
+                        "Context estimate: " (summary.token_usage.estimated_context_tokens.unwrap_or_default())
+                        " • Summary overlay: " (if summary.token_usage.active_summary { "active" } else { "not active" })
+                    }
+                    p class="hint" {
                         "Last activity: " (&summary.session.last_activity_at)
                         @if let Some(policy_id) = summary.matching_policy_id.as_deref() {
                             " • Policy " code { (policy_id) }
@@ -1433,6 +1447,11 @@ fn users_panel(users: &[UserSummary], active_user: Option<&str>) -> Markup {
                             (status_chip(&entry.user.status))
                         }
                         (role_tokens(&entry.role_ids))
+                        p class="hint" {
+                            "Tokens: " (entry.token_usage.input_tokens) " in / " (entry.token_usage.output_tokens) " out"
+                            " • Compactions: " (entry.token_usage.compactions)
+                            " • Trims: " (entry.token_usage.trims)
+                        }
                         @if let Some(primary_agent_id) = entry.user.primary_agent_id.as_deref() {
                             p class="hint" { "Primary agent: " code { (primary_agent_id) } }
                         }

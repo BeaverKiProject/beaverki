@@ -6,11 +6,30 @@ use beaverki_db::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct TokenUsageSummary {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub compactions: u64,
+    pub trims: u64,
+    pub estimated_context_tokens: Option<u64>,
+    pub active_summary: bool,
+    pub last_budget_event: Option<BudgetEventSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BudgetEventSummary {
+    pub event_type: String,
+    pub created_at: String,
+    pub reason: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskInspection {
     pub task: TaskRow,
     pub events: Vec<TaskEventRow>,
     pub tool_invocations: Vec<ToolInvocationRow>,
+    pub token_usage: TokenUsageSummary,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -67,6 +86,7 @@ pub struct SessionLifecycleExecution {
 pub struct UserSummary {
     pub user: UserRow,
     pub role_ids: Vec<String>,
+    pub token_usage: TokenUsageSummary,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -75,6 +95,7 @@ pub struct SessionSummary {
     pub owner_user_ids: Vec<String>,
     pub task_count: i64,
     pub matching_policy_id: Option<String>,
+    pub token_usage: TokenUsageSummary,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

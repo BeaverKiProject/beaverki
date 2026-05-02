@@ -12,13 +12,14 @@ use beaverki_core::{MemoryScope, TaskState, now_rfc3339};
 use beaverki_db::{
     ApprovalActionSet, ApprovalRow, BootstrapState, ConnectorIdentityRow, ConversationSessionRow,
     Database, IssueApprovalActions, MemoryRow, NewConversationSession, NewHouseholdDelivery,
-    NewSchedule, NewScript, NewScriptReview, NewTask, NewWorkflowDefinition, NewWorkflowReview,
-    NewWorkflowRun, NewWorkflowStage, RoleRow, RuntimeHeartbeatRow, RuntimeSessionRow, ScheduleRow,
-    ScriptReviewRow, ScriptRow, TaskRow, UpdateWorkflowDefinition, UserRoleRow, UserRow,
-    WorkflowDefinitionRow, WorkflowReviewRow, WorkflowRunRow, WorkflowStageRow,
+    NewSchedule, NewScript, NewScriptReview, NewSessionTranscriptSummary, NewTask,
+    NewWorkflowDefinition, NewWorkflowReview, NewWorkflowRun, NewWorkflowStage, RoleRow,
+    RuntimeHeartbeatRow, RuntimeSessionRow, ScheduleRow, ScriptReviewRow, ScriptRow,
+    SessionTranscriptSummaryRow, TaskEventRow, TaskRow, UpdateWorkflowDefinition, UserRoleRow,
+    UserRow, WorkflowDefinitionRow, WorkflowReviewRow, WorkflowRunRow, WorkflowStageRow,
 };
 use beaverki_memory::MemoryStore;
-use beaverki_models::ModelProvider;
+use beaverki_models::{ConversationItem, ModelProvider, ModelTokenUsage};
 use beaverki_policy::{
     can_grant_approvals, can_send_household_direct_delivery, can_write_household_memory,
     is_builtin_role, visible_memory_scopes,
@@ -45,9 +46,9 @@ pub use self::daemon::{
     DaemonStatus, RuntimeDaemon, latest_daemon_status, load_daemon_client,
 };
 pub use self::types::{
-    AutomationCatalog, MemoryInspection, RemoteApprovalActionOutcome, ScriptInspection,
-    SessionLifecycleExecution, SessionSummary, TaskInspection, UserSummary,
-    WorkflowDefinitionInput, WorkflowInspection, WorkflowStageInput,
+    AutomationCatalog, BudgetEventSummary, MemoryInspection, RemoteApprovalActionOutcome,
+    ScriptInspection, SessionLifecycleExecution, SessionSummary, TaskInspection, TokenUsageSummary,
+    UserSummary, WorkflowDefinitionInput, WorkflowInspection, WorkflowStageInput,
 };
 pub use self::workflow::parse_workflow_stage_config;
 
@@ -56,14 +57,13 @@ use self::delivery::{RuntimeHouseholdDeliveryDelegate, tool_error_to_anyhow};
 use self::history::RuntimeConnectorHistoryDelegate;
 use self::secrets::{load_discord_bot_token, load_notion_api_token, load_provider};
 use self::session::{
-    CLI_CONVERSATION_HISTORY_LIMIT, CliConversationExchange, CliConversationStatus,
-    SESSION_AUDIENCE_DIRECT_USER, SESSION_AUDIENCE_SCHEDULED_RUN, SESSION_KIND_CLI,
-    SESSION_KIND_CRON_RUN, SESSION_KIND_DIRECT_MESSAGE, SESSION_KIND_GROUP_ROOM,
-    SESSION_LIFECYCLE_REASON_MANUAL_RESET, build_cli_task_context, cap_scopes_to_session,
-    cap_task_scope_to_session, cli_conversation_status, connector_group_room_policy,
-    ensure_memory_visible_to_user, is_session_reset_command, is_session_status_command,
-    parse_memory_kind_filter, parse_session_max_scope, resolve_visible_memory_scopes,
-    session_lifecycle_is_due,
+    CliConversationExchange, CliConversationStatus, SESSION_AUDIENCE_DIRECT_USER,
+    SESSION_AUDIENCE_SCHEDULED_RUN, SESSION_KIND_CLI, SESSION_KIND_CRON_RUN,
+    SESSION_KIND_DIRECT_MESSAGE, SESSION_KIND_GROUP_ROOM, SESSION_LIFECYCLE_REASON_MANUAL_RESET,
+    build_cli_task_context, cap_scopes_to_session, cap_task_scope_to_session,
+    cli_conversation_status, connector_group_room_policy, ensure_memory_visible_to_user,
+    is_session_reset_command, is_session_status_command, parse_memory_kind_filter,
+    parse_session_max_scope, resolve_visible_memory_scopes, session_lifecycle_is_due,
 };
 use self::workflow::{
     apply_stage_result, parse_json_field, validate_workflow_definition_input,
@@ -73,6 +73,7 @@ use self::workflow::{
 
 const WORKFLOW_RUN_TASK_KIND: &str = "workflow_run";
 const WORKFLOW_AGENT_STAGE_TASK_KIND: &str = "workflow_agent_stage";
+const SESSION_MAINTENANCE_TASK_KIND: &str = "session_maintenance";
 
 #[derive(Debug, Clone)]
 pub struct InstalledSkillReport {
@@ -90,11 +91,27 @@ pub struct Runtime {
     notion_api_token: Option<String>,
 }
 
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 struct SessionTokenUsage {
     input_tokens: u64,
     output_tokens: u64,
     compactions: u64,
+    trims: u64,
+    last_budget_event: Option<BudgetEventSummary>,
+}
+
+#[derive(Debug, Clone)]
+struct SessionTranscriptWindow {
+    active_summary: Option<SessionTranscriptSummaryRow>,
+    recent_tasks: Vec<TaskRow>,
+}
+
+#[derive(Debug, Clone)]
+struct GeneratedSessionSummary {
+    text: String,
+    estimated_tokens: u64,
+    usage: Option<ModelTokenUsage>,
+    truncated: bool,
 }
 
 impl Runtime {
@@ -501,6 +518,7 @@ impl Runtime {
         queue_depth: i64,
     ) -> Result<Value> {
         let usage = self.session_token_usage(session).await?;
+        let budget = self.session_budget_usage(session).await?;
         Ok(json!({
             "session_id": session.session_id,
             "session_key": session.session_key,
@@ -510,6 +528,10 @@ impl Runtime {
             "input_tokens": usage.input_tokens,
             "output_tokens": usage.output_tokens,
             "compactions": usage.compactions,
+            "trims": usage.trims,
+            "estimated_context_tokens": budget.estimated_context_tokens,
+            "active_summary": budget.active_summary,
+            "last_budget_event": budget.last_budget_event,
             "queue_depth": queue_depth,
         }))
     }
@@ -521,6 +543,7 @@ impl Runtime {
     ) -> Result<String> {
         let active_provider = self.config.providers.active_provider()?;
         let usage = self.session_token_usage(session).await?;
+        let budget = self.session_budget_usage(session).await?;
         let mut lines = Vec::new();
         lines.push(format!(
             "Models: planner {}/{} | executor {}/{}",
@@ -547,10 +570,27 @@ impl Runtime {
             format_token_count(usage.output_tokens),
         ));
         lines.push(format!(
-            "Context: {} in-session | Compactions: {}",
+            "Context: {} estimated current | {} in-session actual | Compactions: {} | Trims: {}",
+            format_token_count(budget.estimated_context_tokens.unwrap_or_default()),
             format_token_count(usage.input_tokens.saturating_add(usage.output_tokens)),
             usage.compactions,
+            usage.trims,
         ));
+        lines.push(format!(
+            "Summary overlay: {}",
+            if budget.active_summary {
+                "active"
+            } else {
+                "not active"
+            }
+        ));
+        if let Some(last_budget_event) = budget.last_budget_event.as_ref() {
+            lines.push(format!(
+                "Last budget action: {} {}",
+                last_budget_event.event_type,
+                relative_time_text(&last_budget_event.created_at),
+            ));
+        }
         lines.push(format!(
             "Session: {} | updated {}",
             session.session_key,
@@ -575,28 +615,41 @@ impl Runtime {
             .db
             .list_task_events_for_session(&session.session_id, session.last_reset_at.as_deref())
             .await?;
-        let mut usage = SessionTokenUsage::default();
-        for event in events {
-            let payload: Value = match serde_json::from_str(&event.payload_json) {
-                Ok(payload) => payload,
-                Err(_) => continue,
-            };
-            match event.event_type.as_str() {
-                "model_turn_completed" => {
-                    usage.input_tokens += payload
-                        .get("input_tokens")
-                        .and_then(Value::as_u64)
-                        .unwrap_or_default();
-                    usage.output_tokens += payload
-                        .get("output_tokens")
-                        .and_then(Value::as_u64)
-                        .unwrap_or_default();
-                }
-                "conversation_compacted" | "context_compacted" => usage.compactions += 1,
-                _ => {}
-            }
-        }
-        Ok(usage)
+        Ok(summarize_session_token_usage(&events))
+    }
+
+    async fn session_budget_usage(
+        &self,
+        session: &ConversationSessionRow,
+    ) -> Result<TokenUsageSummary> {
+        let usage = self.session_token_usage(session).await?;
+        let (active_summary, unsummarized_tasks) =
+            self.load_session_transcript_material(session).await?;
+        Ok(TokenUsageSummary {
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            compactions: usage.compactions,
+            trims: usage.trims,
+            estimated_context_tokens: Some(
+                self.estimate_session_context_tokens(active_summary.as_ref(), &unsummarized_tasks),
+            ),
+            active_summary: active_summary.is_some(),
+            last_budget_event: usage.last_budget_event,
+        })
+    }
+
+    async fn user_token_usage(&self, user_id: &str) -> Result<TokenUsageSummary> {
+        let events = self.db.list_task_events_for_owner(user_id).await?;
+        let usage = summarize_session_token_usage(&events);
+        Ok(TokenUsageSummary {
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            compactions: usage.compactions,
+            trims: usage.trims,
+            estimated_context_tokens: None,
+            active_summary: false,
+            last_budget_event: usage.last_budget_event,
+        })
     }
 
     pub async fn execute_task(&self, task: TaskRow) -> Result<AgentResult> {
@@ -725,11 +778,13 @@ impl Runtime {
             let matching_policy_id = self
                 .match_session_lifecycle_policy(&session)
                 .map(|policy| policy.policy_id.clone());
+            let token_usage = self.session_budget_usage(&session).await?;
             summaries.push(SessionSummary {
                 session,
                 owner_user_ids,
                 task_count,
                 matching_policy_id,
+                token_usage,
             });
         }
         Ok(summaries)
@@ -811,11 +866,13 @@ impl Runtime {
         let matching_policy_id = self
             .match_session_lifecycle_policy(&session)
             .map(|policy| policy.policy_id.clone());
+        let token_usage = self.session_budget_usage(&session).await?;
         Ok(SessionSummary {
             session,
             owner_user_ids,
             task_count,
             matching_policy_id,
+            token_usage,
         })
     }
 
@@ -841,6 +898,7 @@ impl Runtime {
 
         Ok(TaskInspection {
             task,
+            token_usage: summarize_task_token_usage(&events),
             events,
             tool_invocations,
         })
@@ -3237,7 +3295,12 @@ impl Runtime {
                 .into_iter()
                 .map(|role| role.role_id)
                 .collect();
-            summaries.push(UserSummary { user, role_ids });
+            let token_usage = self.user_token_usage(&user.user_id).await?;
+            summaries.push(UserSummary {
+                user,
+                role_ids,
+                token_usage,
+            });
         }
         Ok(summaries)
     }
@@ -3765,14 +3828,10 @@ impl Runtime {
         scope: MemoryScope,
     ) -> Result<(AgentRequest, ConversationSessionRow)> {
         let session = self.resolve_cli_conversation_session(user).await?;
-        let recent_cli_exchanges = self
-            .db
-            .list_recent_interactive_tasks_for_session(
-                &session.session_id,
-                session.last_reset_at.as_deref(),
-                CLI_CONVERSATION_HISTORY_LIMIT,
-            )
-            .await?
+        let transcript_window = self.plan_session_transcript_window(&session).await?;
+        let recent_cli_exchanges = transcript_window
+            .recent_tasks
+            .iter()
             .into_iter()
             .map(|task| CliConversationExchange {
                 created_at: task.created_at.clone(),
@@ -3793,7 +3852,13 @@ impl Runtime {
         } else {
             None
         };
-        let task_context = Some(build_cli_task_context(&recent_cli_exchanges));
+        let task_context = Some(build_cli_task_context(
+            transcript_window
+                .active_summary
+                .as_ref()
+                .map(|summary| summary.summary_text.as_str()),
+            &recent_cli_exchanges,
+        ));
         let request = self
             .build_primary_request_for_session(
                 user,
@@ -3806,6 +3871,313 @@ impl Runtime {
             )
             .await?;
         Ok((request, session))
+    }
+
+    pub(crate) async fn build_connector_task_context(
+        &self,
+        session: &ConversationSessionRow,
+        fallback_user_label: &str,
+        current_source_label: &str,
+        user_label: &str,
+        channel_id: &str,
+    ) -> Result<String> {
+        let transcript_window = self.plan_session_transcript_window(session).await?;
+        let recent_exchanges = crate::discord::context::build_conversation_exchanges(
+            &self.db,
+            &transcript_window.recent_tasks,
+            fallback_user_label,
+        )
+        .await?;
+        Ok(crate::discord::context::build_discord_task_context(
+            session,
+            transcript_window
+                .active_summary
+                .as_ref()
+                .map(|summary| summary.summary_text.as_str()),
+            &recent_exchanges,
+            current_source_label,
+            user_label,
+            channel_id,
+        ))
+    }
+
+    async fn plan_session_transcript_window(
+        &self,
+        session: &ConversationSessionRow,
+    ) -> Result<SessionTranscriptWindow> {
+        self.maybe_compact_session_transcript(session).await?;
+        let (active_summary, unsummarized_tasks) =
+            self.load_session_transcript_material(session).await?;
+        let protected_recent_exchanges = self.protected_recent_exchange_limit();
+        let mut recent_tasks = unsummarized_tasks
+            .iter()
+            .rev()
+            .take(protected_recent_exchanges)
+            .cloned()
+            .collect::<Vec<_>>();
+        if recent_tasks.is_empty() && !unsummarized_tasks.is_empty() {
+            recent_tasks.push(
+                unsummarized_tasks
+                    .last()
+                    .cloned()
+                    .expect("non-empty unsummarized tasks"),
+            );
+        }
+        Ok(SessionTranscriptWindow {
+            active_summary,
+            recent_tasks,
+        })
+    }
+
+    async fn maybe_compact_session_transcript(
+        &self,
+        session: &ConversationSessionRow,
+    ) -> Result<()> {
+        let (active_summary, unsummarized_tasks) =
+            self.load_session_transcript_material(session).await?;
+        let estimated_before =
+            self.estimate_session_context_tokens(active_summary.as_ref(), &unsummarized_tasks);
+        let trigger_context_tokens = u64::from(
+            self.config
+                .runtime
+                .session_management
+                .transcript_budget
+                .trigger_context_tokens,
+        );
+        if estimated_before <= trigger_context_tokens {
+            return Ok(());
+        }
+
+        let protected_recent_exchanges = self.protected_recent_exchange_limit();
+        let summarize_count = unsummarized_tasks
+            .len()
+            .saturating_sub(protected_recent_exchanges);
+        if summarize_count == 0 {
+            return Ok(());
+        }
+
+        let tasks_to_summarize = &unsummarized_tasks[..summarize_count];
+        let preserved_tail = &unsummarized_tasks[summarize_count..];
+        let generated_summary = self
+            .generate_session_transcript_summary(active_summary.as_ref(), tasks_to_summarize)
+            .await?;
+        let maintenance_task = self
+            .create_session_maintenance_task(
+                session,
+                tasks_to_summarize,
+                "Compact older transcript context",
+            )
+            .await?;
+        if let Some(usage) = generated_summary.usage.as_ref() {
+            self.db
+                .append_task_event(
+                    &maintenance_task.task_id,
+                    "model_turn_completed",
+                    "runtime",
+                    &self.config.runtime.instance_id,
+                    json!({
+                        "model_role": "summarizer",
+                        "model_name": self.provider.model_names().summarizer,
+                        "input_tokens": usage.input_tokens,
+                        "output_tokens": usage.output_tokens,
+                        "output_text": generated_summary.text,
+                    }),
+                )
+                .await?;
+        }
+        let persisted_summary = self
+            .db
+            .insert_session_transcript_summary(NewSessionTranscriptSummary {
+                session_id: &session.session_id,
+                reset_boundary: session.last_reset_at.as_deref(),
+                source_through_task_created_at: &tasks_to_summarize
+                    .last()
+                    .expect("tasks selected for summarization")
+                    .created_at,
+                source_task_count: i64::try_from(tasks_to_summarize.len())
+                    .context("session summary task count exceeds i64")?,
+                summary_text: &generated_summary.text,
+                estimated_tokens: i64::try_from(generated_summary.estimated_tokens)
+                    .context("session summary token estimate exceeds i64")?,
+                summarizer_task_id: Some(&maintenance_task.task_id),
+            })
+            .await?;
+        self.db
+            .supersede_session_transcript_summaries(
+                &session.session_id,
+                session.last_reset_at.as_deref(),
+                Some(&persisted_summary.summary_id),
+            )
+            .await?;
+
+        let estimated_after = generated_summary.estimated_tokens
+            + preserved_tail
+                .iter()
+                .map(estimate_task_context_tokens)
+                .sum::<u64>();
+        self.db
+            .append_task_event(
+                &maintenance_task.task_id,
+                "conversation_compacted",
+                "runtime",
+                &self.config.runtime.instance_id,
+                json!({
+                    "session_id": session.session_id,
+                    "summary_id": persisted_summary.summary_id,
+                    "prior_summary_id": active_summary.as_ref().map(|summary| summary.summary_id.as_str()),
+                    "summarized_task_count": tasks_to_summarize.len(),
+                    "protected_recent_exchanges": protected_recent_exchanges,
+                    "estimated_tokens_before": estimated_before,
+                    "estimated_tokens_after": estimated_after,
+                    "summary_estimated_tokens": generated_summary.estimated_tokens,
+                }),
+            )
+            .await?;
+        if generated_summary.truncated {
+            self.db
+                .append_task_event(
+                    &maintenance_task.task_id,
+                    "context_trimmed",
+                    "runtime",
+                    &self.config.runtime.instance_id,
+                    json!({
+                        "session_id": session.session_id,
+                        "summary_id": persisted_summary.summary_id,
+                        "reason": "summary_max_tokens",
+                        "summary_estimated_tokens": generated_summary.estimated_tokens,
+                    }),
+                )
+                .await?;
+        }
+        self.db
+            .complete_task(&maintenance_task.task_id, &generated_summary.text)
+            .await?;
+        Ok(())
+    }
+
+    async fn load_session_transcript_material(
+        &self,
+        session: &ConversationSessionRow,
+    ) -> Result<(Option<SessionTranscriptSummaryRow>, Vec<TaskRow>)> {
+        let active_summary = self
+            .db
+            .fetch_active_session_transcript_summary(
+                &session.session_id,
+                session.last_reset_at.as_deref(),
+            )
+            .await?;
+        let unsummarized_tasks = self
+            .db
+            .list_interactive_tasks_for_session_after(
+                &session.session_id,
+                session.last_reset_at.as_deref(),
+                active_summary
+                    .as_ref()
+                    .map(|summary| summary.source_through_task_created_at.as_str()),
+            )
+            .await?;
+        Ok((active_summary, unsummarized_tasks))
+    }
+
+    async fn generate_session_transcript_summary(
+        &self,
+        active_summary: Option<&SessionTranscriptSummaryRow>,
+        tasks_to_summarize: &[TaskRow],
+    ) -> Result<GeneratedSessionSummary> {
+        let instructions = "Summarize older BeaverKI conversation history for future prompt compaction. Preserve durable facts, user preferences, open requests, decisions, constraints, and unresolved follow-ups. Keep it concise, structured, and auditable. Do not invent information.";
+        let prompt = build_session_summary_prompt(active_summary, tasks_to_summarize);
+        let response = self
+            .provider
+            .generate_turn(
+                "summarizer",
+                self.provider.model_names().summarizer.as_str(),
+                instructions,
+                &[ConversationItem::UserText(prompt)],
+                &[],
+            )
+            .await?;
+        let raw_text = response.output_text.trim();
+        let summary_text = if raw_text.is_empty() {
+            bail!("summarizer returned an empty transcript summary")
+        } else {
+            raw_text.to_owned()
+        };
+        let max_summary_tokens = u64::from(
+            self.config
+                .runtime
+                .session_management
+                .transcript_budget
+                .summary_max_tokens,
+        );
+        let (text, truncated) =
+            truncate_text_to_estimated_tokens(&summary_text, max_summary_tokens);
+        Ok(GeneratedSessionSummary {
+            estimated_tokens: estimate_text_tokens(&text),
+            text,
+            usage: response.usage,
+            truncated,
+        })
+    }
+
+    async fn create_session_maintenance_task(
+        &self,
+        session: &ConversationSessionRow,
+        reference_tasks: &[TaskRow],
+        objective: &str,
+    ) -> Result<TaskRow> {
+        let owner_user = self.session_maintenance_owner(reference_tasks).await?;
+        let primary_agent_id = owner_user
+            .primary_agent_id
+            .clone()
+            .ok_or_else(|| anyhow!("user '{}' has no primary agent", owner_user.user_id))?;
+        let scope =
+            cap_task_scope_to_session(MemoryScope::Private, parse_session_max_scope(session)?);
+        self.db
+            .create_task_with_params(NewTask {
+                owner_user_id: &owner_user.user_id,
+                initiating_identity_id: "runtime:session_maintenance",
+                primary_agent_id: &primary_agent_id,
+                assigned_agent_id: &primary_agent_id,
+                parent_task_id: None,
+                session_id: Some(&session.session_id),
+                kind: SESSION_MAINTENANCE_TASK_KIND,
+                objective,
+                context_summary: Some("Session transcript compaction handled by runtime."),
+                scope,
+                wake_at: None,
+            })
+            .await
+    }
+
+    async fn session_maintenance_owner(&self, reference_tasks: &[TaskRow]) -> Result<UserRow> {
+        for task in reference_tasks.iter().rev() {
+            if let Some(user) = self.db.fetch_user(&task.owner_user_id).await? {
+                return Ok(user);
+            }
+        }
+        Ok(self.default_user.clone())
+    }
+
+    fn protected_recent_exchange_limit(&self) -> usize {
+        usize::try_from(
+            self.config
+                .runtime
+                .session_management
+                .transcript_budget
+                .protected_recent_exchanges,
+        )
+        .unwrap_or(usize::MAX)
+    }
+
+    fn estimate_session_context_tokens(
+        &self,
+        active_summary: Option<&SessionTranscriptSummaryRow>,
+        tasks: &[TaskRow],
+    ) -> u64 {
+        active_summary
+            .map(|summary| u64::try_from(summary.estimated_tokens).unwrap_or_default())
+            .unwrap_or_default()
+            + tasks.iter().map(estimate_task_context_tokens).sum::<u64>()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4265,6 +4637,123 @@ fn approval_action_is_expired(action: &beaverki_db::ApprovalActionRow) -> bool {
         .unwrap_or(false)
 }
 
+fn summarize_session_token_usage(events: &[TaskEventRow]) -> SessionTokenUsage {
+    let mut usage = SessionTokenUsage::default();
+    for event in events {
+        let payload: Value = match serde_json::from_str(&event.payload_json) {
+            Ok(payload) => payload,
+            Err(_) => continue,
+        };
+        match event.event_type.as_str() {
+            "model_turn_completed" => {
+                usage.input_tokens += payload
+                    .get("input_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default();
+                usage.output_tokens += payload
+                    .get("output_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default();
+            }
+            "conversation_compacted" | "context_compacted" => {
+                usage.compactions += 1;
+                usage.last_budget_event = Some(BudgetEventSummary {
+                    event_type: event.event_type.clone(),
+                    created_at: event.created_at.clone(),
+                    reason: payload
+                        .get("reason")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned),
+                });
+            }
+            "context_trimmed" => {
+                usage.trims += 1;
+                usage.last_budget_event = Some(BudgetEventSummary {
+                    event_type: event.event_type.clone(),
+                    created_at: event.created_at.clone(),
+                    reason: payload
+                        .get("reason")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned),
+                });
+            }
+            _ => {}
+        }
+    }
+    usage
+}
+
+fn summarize_task_token_usage(events: &[TaskEventRow]) -> TokenUsageSummary {
+    let usage = summarize_session_token_usage(events);
+    TokenUsageSummary {
+        input_tokens: usage.input_tokens,
+        output_tokens: usage.output_tokens,
+        compactions: usage.compactions,
+        trims: usage.trims,
+        estimated_context_tokens: None,
+        active_summary: false,
+        last_budget_event: usage.last_budget_event,
+    }
+}
+
+fn estimate_text_tokens(text: &str) -> u64 {
+    if text.trim().is_empty() {
+        return 0;
+    }
+    u64::try_from(text.chars().count().div_ceil(4)).unwrap_or(u64::MAX)
+}
+
+fn estimate_task_context_tokens(task: &TaskRow) -> u64 {
+    estimate_text_tokens(&task.objective)
+        .saturating_add(estimate_text_tokens(&assistant_reply_for_context(task)))
+        .saturating_add(12)
+}
+
+fn truncate_text_to_estimated_tokens(text: &str, max_tokens: u64) -> (String, bool) {
+    if max_tokens == 0 {
+        return (String::new(), !text.trim().is_empty());
+    }
+    let max_chars = usize::try_from(max_tokens.saturating_mul(4)).unwrap_or(usize::MAX);
+    let char_count = text.chars().count();
+    if char_count <= max_chars {
+        return (text.trim().to_owned(), false);
+    }
+
+    let mut truncated = text.chars().take(max_chars).collect::<String>();
+    truncated = truncated.trim_end().to_owned();
+    if !truncated.ends_with("...") {
+        truncated.push_str("...");
+    }
+    (truncated, true)
+}
+
+fn build_session_summary_prompt(
+    active_summary: Option<&SessionTranscriptSummaryRow>,
+    tasks_to_summarize: &[TaskRow],
+) -> String {
+    let mut prompt = String::new();
+    prompt.push_str(
+        "Summarize the following older BeaverKI conversation state for future follow-up context.\n",
+    );
+    prompt.push_str("Preserve stable facts, user preferences, open requests, constraints, decisions, and unresolved follow-ups.\n");
+    prompt.push_str("Prefer short markdown bullets.\n\n");
+    if let Some(active_summary) = active_summary {
+        prompt.push_str("Existing older summary:\n");
+        prompt.push_str(active_summary.summary_text.trim());
+        prompt.push_str("\n\n");
+    }
+    prompt.push_str("Older transcript spans to fold in:\n");
+    for task in tasks_to_summarize {
+        prompt.push_str("- User: ");
+        prompt.push_str(task.objective.trim());
+        prompt.push('\n');
+        prompt.push_str("- Assistant: ");
+        prompt.push_str(assistant_reply_for_context(task).trim());
+        prompt.push_str("\n\n");
+    }
+    prompt
+}
+
 fn format_token_count(value: u64) -> String {
     if value >= 1_000_000 {
         format!("{:.1}M", value as f64 / 1_000_000.0)
@@ -4706,7 +5195,8 @@ mod tests {
             .expect("status task");
         let result = status.result_text.as_deref().expect("status text");
         assert!(result.contains("Tokens: 1.2k in / 45 out"));
-        assert!(result.contains("Context: 1.2k in-session | Compactions: 0"));
+        assert!(result.contains("in-session actual | Compactions: 0 | Trims: 0"));
+        assert!(result.contains("Summary overlay: not active"));
 
         runtime
             .reset_cli_conversation_session(&user, SESSION_RESET_COMMAND, MemoryScope::Private)
@@ -4718,7 +5208,10 @@ mod tests {
             .expect("status task after reset");
         let reset_result = reset_status.result_text.as_deref().expect("status text");
         assert!(reset_result.contains("Tokens: 0 in / 0 out"));
-        assert!(reset_result.contains("Context: 0 in-session | Compactions: 0"));
+        assert!(reset_result.contains(
+            "Context: 0 estimated current | 0 in-session actual | Compactions: 0 | Trims: 0"
+        ));
+        assert!(reset_result.contains("Summary overlay: not active"));
     }
 
     #[tokio::test]
@@ -5439,10 +5932,109 @@ mod tests {
             task_id: "task_old".to_owned(),
         };
 
-        let context = build_cli_task_context(&[stale_exchange]);
+        let context = build_cli_task_context(None, &[stale_exchange]);
 
         assert!(context.contains("Conversation status: fresh conversation"));
         assert!(!context.contains("Recent attributed CLI exchanges"));
+    }
+
+    #[tokio::test]
+    async fn cli_request_compacts_older_session_transcript_into_summary_overlay() {
+        let (_tempdir, mut runtime) = test_runtime(vec![ModelTurnResponse {
+            output_items: vec![],
+            tool_calls: vec![],
+            output_text: "- User prefers concise follow-ups\n- Open thread: continue the plan"
+                .to_owned(),
+            usage: Some(beaverki_models::ModelTokenUsage {
+                input_tokens: Some(64),
+                output_tokens: Some(18),
+            }),
+        }])
+        .await;
+        runtime
+            .config
+            .runtime
+            .session_management
+            .transcript_budget
+            .protected_recent_exchanges = 1;
+        runtime
+            .config
+            .runtime
+            .session_management
+            .transcript_budget
+            .trigger_context_tokens = 1;
+        let user = runtime.default_user().clone();
+        let session = runtime
+            .resolve_cli_conversation_session(&user)
+            .await
+            .expect("cli session");
+        let primary_agent_id = user.primary_agent_id.clone().expect("primary agent id");
+        let initiating_identity_id = format!("cli:{}", user.user_id);
+
+        for (objective, reply) in [
+            ("First turn", "First answer"),
+            ("Second turn", "Second answer"),
+            ("Third turn", "Third answer"),
+        ] {
+            let task = runtime
+                .db
+                .create_task_with_params(NewTask {
+                    owner_user_id: &user.user_id,
+                    initiating_identity_id: &initiating_identity_id,
+                    primary_agent_id: &primary_agent_id,
+                    assigned_agent_id: &primary_agent_id,
+                    parent_task_id: None,
+                    session_id: Some(&session.session_id),
+                    kind: "interactive",
+                    objective,
+                    context_summary: None,
+                    scope: MemoryScope::Private,
+                    wake_at: None,
+                })
+                .await
+                .expect("task");
+            runtime
+                .db
+                .complete_task(&task.task_id, reply)
+                .await
+                .expect("complete task");
+        }
+
+        let (request, _) = runtime
+            .prepare_cli_task_request(
+                &user,
+                &initiating_identity_id,
+                "Fourth turn",
+                MemoryScope::Private,
+            )
+            .await
+            .expect("prepare request");
+        let context = request.task_context.as_deref().expect("task context");
+        assert!(context.contains("Older conversation summary"));
+        assert!(context.contains("User prefers concise follow-ups"));
+        assert!(context.contains("[CLI] User: Third turn"));
+        assert!(!context.contains("[CLI] User: First turn"));
+
+        let active_summary = runtime
+            .db
+            .fetch_active_session_transcript_summary(
+                &session.session_id,
+                session.last_reset_at.as_deref(),
+            )
+            .await
+            .expect("active summary")
+            .expect("summary row");
+        assert_eq!(active_summary.source_task_count, 2);
+        let session_events = runtime
+            .db
+            .list_task_events_for_session(&session.session_id, session.last_reset_at.as_deref())
+            .await
+            .expect("session events");
+        assert!(
+            session_events
+                .iter()
+                .any(|event| event.event_type == "conversation_compacted")
+        );
     }
 
     #[tokio::test]

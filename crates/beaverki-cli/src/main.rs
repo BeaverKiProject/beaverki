@@ -24,6 +24,44 @@ use serde_json::Value;
 use tokio::time::{self, Duration};
 use tracing_subscriber::EnvFilter;
 
+fn format_token_count(value: u64) -> String {
+    if value >= 1_000_000 {
+        format!("{:.1}M", value as f64 / 1_000_000.0)
+    } else if value >= 1_000 {
+        format!("{:.1}k", value as f64 / 1_000.0)
+    } else {
+        value.to_string()
+    }
+}
+
+fn summarize_token_usage(
+    events: &[beaverki_db::TaskEventRow],
+) -> beaverki_runtime::TokenUsageSummary {
+    let mut usage = beaverki_runtime::TokenUsageSummary::default();
+    for event in events {
+        let payload: Value = match serde_json::from_str(&event.payload_json) {
+            Ok(payload) => payload,
+            Err(_) => continue,
+        };
+        match event.event_type.as_str() {
+            "model_turn_completed" => {
+                usage.input_tokens += payload
+                    .get("input_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default();
+                usage.output_tokens += payload
+                    .get("output_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default();
+            }
+            "conversation_compacted" | "context_compacted" => usage.compactions += 1,
+            "context_trimmed" => usage.trims += 1,
+            _ => {}
+        }
+    }
+    usage
+}
+
 #[derive(Parser)]
 #[command(name = "beaverki")]
 #[command(about = "BeaverKI M1 CLI runtime")]
@@ -1098,10 +1136,12 @@ async fn task_show(args: TaskShowArgs) -> Result<()> {
         let tool_invocations = db
             .fetch_tool_invocations_for_owner(&user.user_id, &args.task_id)
             .await?;
+        let token_usage = summarize_token_usage(&events);
         beaverki_runtime::TaskInspection {
             task,
             events,
             tool_invocations,
+            token_usage,
         }
     };
 
@@ -1110,6 +1150,13 @@ async fn task_show(args: TaskShowArgs) -> Result<()> {
     println!("State: {}", inspection.task.state);
     println!("Kind: {}", inspection.task.kind);
     println!("Objective: {}", inspection.task.objective);
+    println!(
+        "Tokens: {} in / {} out | Compactions: {} | Trims: {}",
+        format_token_count(inspection.token_usage.input_tokens),
+        format_token_count(inspection.token_usage.output_tokens),
+        inspection.token_usage.compactions,
+        inspection.token_usage.trims,
+    );
     if let Some(result_text) = inspection.task.result_text {
         println!("Result: {result_text}");
     }
@@ -1281,23 +1328,43 @@ async fn user_add(args: UserAddArgs) -> Result<()> {
 
 async fn user_list(args: ConfigDirArgs) -> Result<()> {
     let config_dir = resolve_config_dir(args.config_dir)?;
-    let (_, db) = load_db(&config_dir).await?;
-    let users = db.list_users().await?;
+    if let Ok(client) = try_daemon_client(&config_dir).await {
+        let users = client.list_users().await?;
+        for entry in users {
+            println!(
+                "- {} ({}) roles=[{}] primary_agent={} tokens={}/{} compactions={} trims={}",
+                entry.user.user_id,
+                entry.user.display_name,
+                entry.role_ids.join(", "),
+                entry
+                    .user
+                    .primary_agent_id
+                    .unwrap_or_else(|| "<none>".to_owned()),
+                format_token_count(entry.token_usage.input_tokens),
+                format_token_count(entry.token_usage.output_tokens),
+                entry.token_usage.compactions,
+                entry.token_usage.trims,
+            );
+        }
+    } else {
+        let (_, db) = load_db(&config_dir).await?;
+        let users = db.list_users().await?;
 
-    for user in users {
-        let roles = db
-            .list_user_roles(&user.user_id)
-            .await?
-            .into_iter()
-            .map(|row| row.role_id)
-            .collect::<Vec<_>>();
-        println!(
-            "- {} ({}) roles=[{}] primary_agent={}",
-            user.user_id,
-            user.display_name,
-            roles.join(", "),
-            user.primary_agent_id.unwrap_or_else(|| "<none>".to_owned())
-        );
+        for user in users {
+            let roles = db
+                .list_user_roles(&user.user_id)
+                .await?
+                .into_iter()
+                .map(|row| row.role_id)
+                .collect::<Vec<_>>();
+            println!(
+                "- {} ({}) roles=[{}] primary_agent={}",
+                user.user_id,
+                user.display_name,
+                roles.join(", "),
+                user.primary_agent_id.unwrap_or_else(|| "<none>".to_owned())
+            );
+        }
     }
 
     Ok(())
@@ -1388,6 +1455,52 @@ async fn skill_list(args: ConfigDirArgs) -> Result<()> {
 
 async fn session_list(args: SessionListArgs) -> Result<()> {
     let config_dir = resolve_config_dir(args.config_dir)?;
+    if !args.all_users
+        && let Ok(client) = try_daemon_client(&config_dir).await
+    {
+        let sessions = client
+            .list_sessions(args.user.clone(), args.include_archived, args.limit)
+            .await?;
+
+        if sessions.is_empty() {
+            println!("No sessions matched the requested filters.");
+            return Ok(());
+        }
+
+        for summary in sessions {
+            println!(
+                "- {} kind={} owners=[{}] tasks={} tokens={}/{} compactions={} trims={} summary={} estimated_context={} last_activity={} policy={}",
+                summary.session.session_id,
+                summary.session.session_kind,
+                if summary.owner_user_ids.is_empty() {
+                    "<none>".to_owned()
+                } else {
+                    summary.owner_user_ids.join(", ")
+                },
+                summary.task_count,
+                format_token_count(summary.token_usage.input_tokens),
+                format_token_count(summary.token_usage.output_tokens),
+                summary.token_usage.compactions,
+                summary.token_usage.trims,
+                if summary.token_usage.active_summary {
+                    "active"
+                } else {
+                    "none"
+                },
+                format_token_count(
+                    summary
+                        .token_usage
+                        .estimated_context_tokens
+                        .unwrap_or_default()
+                ),
+                summary.session.last_activity_at,
+                summary
+                    .matching_policy_id
+                    .unwrap_or_else(|| "<none>".to_owned()),
+            );
+        }
+        return Ok(());
+    }
     let (config, db) = load_db(&config_dir).await?;
     let owner_filter = if args.all_users {
         None
@@ -1432,6 +1545,70 @@ async fn session_list(args: SessionListArgs) -> Result<()> {
 
 async fn session_show(args: SessionShowArgs) -> Result<()> {
     let config_dir = resolve_config_dir(args.config_dir)?;
+    if let Ok(client) = try_daemon_client(&config_dir).await {
+        let sessions = client.list_sessions(None, true, 512).await?;
+        if let Some(summary) = sessions
+            .into_iter()
+            .find(|summary| summary.session.session_id == args.session_id)
+        {
+            println!("Session: {}", summary.session.session_id);
+            println!("Kind: {}", summary.session.session_kind);
+            println!("Key: {}", summary.session.session_key);
+            println!("Owners: {}", join_or_none(&summary.owner_user_ids));
+            println!("Audience policy: {}", summary.session.audience_policy);
+            println!("Max memory scope: {}", summary.session.max_memory_scope);
+            println!("Last activity: {}", summary.session.last_activity_at);
+            println!(
+                "Last reset: {}",
+                summary
+                    .session
+                    .last_reset_at
+                    .as_deref()
+                    .unwrap_or("<never>")
+            );
+            println!(
+                "Archived at: {}",
+                summary.session.archived_at.as_deref().unwrap_or("<active>")
+            );
+            println!(
+                "Lifecycle reason: {}",
+                summary
+                    .session
+                    .lifecycle_reason
+                    .as_deref()
+                    .unwrap_or("<none>")
+            );
+            println!("Task count: {}", summary.task_count);
+            println!(
+                "Tokens: {} in / {} out | Compactions: {} | Trims: {}",
+                format_token_count(summary.token_usage.input_tokens),
+                format_token_count(summary.token_usage.output_tokens),
+                summary.token_usage.compactions,
+                summary.token_usage.trims,
+            );
+            println!(
+                "Context estimate: {} | Summary overlay: {}",
+                format_token_count(
+                    summary
+                        .token_usage
+                        .estimated_context_tokens
+                        .unwrap_or_default()
+                ),
+                if summary.token_usage.active_summary {
+                    "active"
+                } else {
+                    "not active"
+                }
+            );
+            println!(
+                "Matching policy: {}",
+                summary
+                    .matching_policy_id
+                    .unwrap_or_else(|| "<none>".to_owned())
+            );
+            return Ok(());
+        }
+    }
     let (config, db) = load_db(&config_dir).await?;
     let session = db
         .fetch_conversation_session(&args.session_id)
