@@ -26,8 +26,15 @@ Recommended process:
 1. Extract the release archive to an installation directory such as `~/.local/share/beaverki/app` or `/opt/beaverki`.
 2. Substitute the placeholders in the relevant service template.
 3. Create a `beaverki.env` file inside the BeaverKi config directory that exports `BEAVERKI_MASTER_PASSPHRASE` for daemon-managed startup.
-4. Enable the daemon service first.
-5. Optionally enable the web UI service if the local web UI should start automatically.
+4. Run `beaverki setup init` and choose either OpenAI or LM Studio as the model provider.
+5. Enable the daemon service first.
+6. Optionally enable the web UI service if the local web UI should start automatically.
+
+Provider-specific setup notes:
+
+- OpenAI setup requires an API key. You can export `OPENAI_API_KEY` before running `beaverki setup init`.
+- LM Studio setup requires a locally running LM Studio instance with at least one loaded chat-capable model.
+- After setup, `beaverki setup verify-provider` checks the active provider configuration.
 
 The templates intentionally run:
 

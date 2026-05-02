@@ -1,4 +1,5 @@
 use std::future::Future;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -949,7 +950,11 @@ impl RuntimeDaemon {
                     let daemon = Arc::clone(&daemon);
                     tokio::spawn(async move {
                         if let Err(error) = daemon.handle_connection(stream).await {
-                            warn!("daemon connection failed: {error:#}");
+                            if is_benign_client_disconnect(&error) {
+                                info!("daemon client disconnected before response completed: {error:#}");
+                            } else {
+                                warn!("daemon connection failed: {error:#}");
+                            }
                         }
                     });
                 }
@@ -1580,10 +1585,22 @@ impl RuntimeDaemon {
             return Ok(());
         };
 
-        match connector_type.as_str() {
+        let follow_up_result = match connector_type.as_str() {
             "discord" => discord::maybe_send_task_follow_up(self, task, &events).await,
             _ => Ok(()),
+        };
+
+        if let Err(error) = follow_up_result {
+            warn!(
+                task_id = %task.task_id,
+                owner_user_id = %task.owner_user_id,
+                connector_type = %connector_type,
+                error = %format!("{error:#}"),
+                "connector follow-up failed; continuing without stopping the daemon",
+            );
         }
+
+        Ok(())
     }
 
     async fn prepare_socket(&self) -> Result<()> {
@@ -1733,6 +1750,19 @@ impl RuntimeDaemon {
             Self::session_cleanup_loop(daemon, interval_secs).await
         }))
     }
+}
+
+fn is_benign_client_disconnect(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io_error| {
+                matches!(
+                    io_error.kind(),
+                    ErrorKind::BrokenPipe | ErrorKind::ConnectionReset | ErrorKind::UnexpectedEof
+                )
+            })
+    })
 }
 
 pub async fn load_daemon_client(config_dir: impl AsRef<Path>) -> Result<DaemonClient> {

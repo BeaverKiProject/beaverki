@@ -10,7 +10,7 @@ use axum::{
     response::{IntoResponse, Redirect, Response},
     routing::{get, post},
 };
-use beaverki_config::LoadedConfig;
+use beaverki_config::{LoadedConfig, ProviderEntry};
 use beaverki_core::TaskState;
 use beaverki_db::{ApprovalRow, MemoryRow, RoleRow, ScheduleRow, TaskEventRow, ToolInvocationRow};
 use beaverki_runtime::{
@@ -35,7 +35,20 @@ struct Args {
 #[derive(Clone)]
 struct AppState {
     daemon: DaemonClient,
+    config_dir: PathBuf,
     listen_addr: SocketAddr,
+}
+
+#[derive(Clone)]
+struct ActiveProviderSummary {
+    provider_id: String,
+    kind: String,
+    base_url: Option<String>,
+    planner: String,
+    executor: String,
+    summarizer: String,
+    safety_review: String,
+    tool_calling: bool,
 }
 
 #[derive(Debug)]
@@ -156,6 +169,7 @@ async fn main() -> Result<()> {
 
     let state = AppState {
         daemon,
+        config_dir,
         listen_addr: args.listen_addr,
     };
     let app = Router::new()
@@ -194,6 +208,7 @@ async fn dashboard(
     State(state): State<AppState>,
     Query(query): Query<DashboardQuery>,
 ) -> Result<Markup, AppError> {
+    let provider = load_active_provider_summary(&state.config_dir)?;
     let selected_user = normalize_user(query.user.clone());
     let include_archived = query.include_archived.unwrap_or(false);
     let c_users = state.daemon.clone();
@@ -269,6 +284,7 @@ async fn dashboard(
                 div class="console-body" {
                     h1 class="console-title" { "BeaverKi dashboard" }
                     p class="console-sub" { "Local operator console — run tasks, clear approvals, inspect sessions." }
+                    (runtime_provider_panel(&provider))
                 }
                 div class="stat-notes" {
                     (stat_note("Tasks run", &total_tasks.to_string(), "all time"))
@@ -491,9 +507,41 @@ async fn task_detail(
             @if auto_refresh {
                 div class="refresh-banner" {
                     span class="refresh-dot" {}
-                    "Checking for updates…"
+                    span { "Checking for updates in " span id="refresh-countdown" { "3" } "s…" }
+                    button type="button" class="refresh-now-btn" id="refresh-now-btn" { "Refresh now" }
                 }
-                script { "window.setTimeout(() => window.location.reload(), 3000);" }
+                script {
+                    (PreEscaped(r#"
+(function() {
+    var remaining = 3;
+    var countdown = document.getElementById("refresh-countdown");
+    var refreshNow = document.getElementById("refresh-now-btn");
+
+    function buildRefreshUrl() {
+        var url = new URL(window.location.href);
+        url.searchParams.set("_refresh", String(Date.now()));
+        return url.toString();
+    }
+
+    function goNow() {
+        window.location.replace(buildRefreshUrl());
+    }
+
+    if (refreshNow) {
+        refreshNow.addEventListener("click", goNow);
+    }
+
+    window.setInterval(function() {
+        remaining -= 1;
+        if (countdown && remaining > 0) {
+            countdown.textContent = String(remaining);
+        }
+    }, 1000);
+
+    window.setTimeout(goNow, 3000);
+})();
+"#))
+                }
             }
             @if !approvals.is_empty() {
                 section class="panel" {
@@ -1910,6 +1958,80 @@ a { color: inherit; }
 }
 .console-title { margin: 0 0 6px; font-size: 1.5rem; font-weight: 800; color: white; line-height: 1.1; }
 .console-sub { margin: 0; color: rgba(235, 248, 255, 0.65); font-size: 0.95rem; line-height: 1.5; max-width: 520px; }
+.provider-panel {
+    margin-top: 18px;
+    padding: 16px 18px;
+    border: 1px solid rgba(154, 220, 255, 0.18);
+    border-radius: var(--radius-sm);
+    background: rgba(8, 23, 40, 0.58);
+    backdrop-filter: blur(8px);
+}
+.provider-panel-header {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    margin-bottom: 14px;
+}
+.provider-panel-header h2 {
+    margin: 0 0 4px;
+    font-size: 1rem;
+    font-weight: 700;
+    color: white;
+}
+.provider-panel-header p {
+    margin: 0;
+    color: rgba(235, 248, 255, 0.62);
+    font-size: 0.88rem;
+}
+.provider-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+.provider-token {
+    display: inline-flex;
+    align-items: center;
+    padding: 5px 10px;
+    border-radius: 999px;
+    background: rgba(255, 255, 255, 0.08);
+    border: 1px solid rgba(154, 220, 255, 0.16);
+    color: rgba(240, 250, 255, 0.86);
+    font-size: 0.78rem;
+    font-weight: 600;
+}
+.provider-token.accent {
+    background: rgba(19, 185, 255, 0.14);
+    border-color: rgba(19, 185, 255, 0.28);
+    color: var(--cyan-2);
+}
+.provider-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 10px 14px;
+}
+.provider-field {
+    padding-top: 10px;
+    border-top: 1px solid rgba(154, 220, 255, 0.12);
+}
+.provider-field-label {
+    display: block;
+    margin-bottom: 4px;
+    color: rgba(235, 248, 255, 0.56);
+    font-size: 0.73rem;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+}
+.provider-field-value {
+    display: block;
+    color: white;
+    font-size: 0.92rem;
+    font-weight: 600;
+    line-height: 1.4;
+    word-break: break-word;
+}
 /* Stat notes */
 .stat-notes {
   display: flex;
@@ -2090,6 +2212,7 @@ code {
 .refresh-banner {
   display: inline-flex;
   align-items: center;
+    flex-wrap: wrap;
   gap: 8px;
   margin-bottom: 16px;
   padding: 8px 14px;
@@ -2099,6 +2222,19 @@ code {
   color: var(--cyan);
   font-size: 0.82rem;
   font-weight: 600;
+}
+.refresh-now-btn {
+    padding: 6px 10px;
+    border-radius: 999px;
+    border: 1px solid rgba(19, 185, 255, 0.28);
+    background: rgba(255, 255, 255, 0.9);
+    color: var(--accent-strong);
+    font-size: 0.72rem;
+    letter-spacing: 0.04em;
+}
+.refresh-now-btn:hover:not(:disabled) {
+    background: #ffffff;
+    border-color: rgba(19, 185, 255, 0.42);
 }
 .refresh-dot {
   width: 7px;
@@ -2162,7 +2298,7 @@ code {
 /* Session / memory standalone cards */
 .session-card, .list-item:not(.list .list-item) { margin-bottom: 10px; }
 @media (max-width: 920px) {
-  .two-up, .three-up, .catalog-grid, .automation-layout, .workspace-layout { grid-template-columns: 1fr; }
+    .two-up, .three-up, .catalog-grid, .automation-layout, .workspace-layout, .provider-grid { grid-template-columns: 1fr; }
   .page { padding: 0 14px 40px; }
   .topbar { height: auto; padding: 12px 14px; }
   .console-lead { flex-direction: column; gap: 12px; }
@@ -2225,6 +2361,76 @@ fn stat_note(label: &str, value: &str, desc: &str) -> Markup {
                 span class="stat-note-desc" { (desc) }
             }
         }
+    }
+}
+
+fn load_active_provider_summary(config_dir: &PathBuf) -> Result<ActiveProviderSummary> {
+    let config = LoadedConfig::load_from_dir(config_dir)
+        .with_context(|| format!("failed to load {}", config_dir.display()))?;
+    let provider = config.providers.active_provider()?;
+    Ok(ActiveProviderSummary::from_entry(provider))
+}
+
+impl ActiveProviderSummary {
+    fn from_entry(entry: &ProviderEntry) -> Self {
+        Self {
+            provider_id: entry.provider_id.clone(),
+            kind: entry.kind.clone(),
+            base_url: entry.base_url.clone(),
+            planner: entry.models.planner.clone(),
+            executor: entry.models.executor.clone(),
+            summarizer: entry.models.summarizer.clone(),
+            safety_review: entry.models.safety_review.clone(),
+            tool_calling: entry.capabilities.tool_calling,
+        }
+    }
+}
+
+fn runtime_provider_panel(provider: &ActiveProviderSummary) -> Markup {
+    html! {
+        section class="provider-panel" {
+            div class="provider-panel-header" {
+                div {
+                    h2 { "Active model runtime" }
+                    p { "The web UI reads the active provider configuration on each dashboard refresh." }
+                }
+                div class="provider-meta" {
+                    span class="provider-token accent" { (provider_kind_label(&provider.kind)) }
+                    span class="provider-token" { "ID: " (&provider.provider_id) }
+                    span class="provider-token" {
+                        @if provider.tool_calling {
+                            "Tool calling enabled"
+                        } @else {
+                            "Tool calling disabled"
+                        }
+                    }
+                }
+            }
+            div class="provider-grid" {
+                (provider_field("Base URL", provider.base_url.as_deref().unwrap_or("Hosted default")))
+                (provider_field("Planner", &provider.planner))
+                (provider_field("Executor", &provider.executor))
+                (provider_field("Summarizer", &provider.summarizer))
+                (provider_field("Safety review", &provider.safety_review))
+            }
+        }
+    }
+}
+
+fn provider_field(label: &str, value: &str) -> Markup {
+    html! {
+        div class="provider-field" {
+            span class="provider-field-label" { (label) }
+            span class="provider-field-value" { (value) }
+        }
+    }
+}
+
+fn provider_kind_label(kind: &str) -> &str {
+    match kind {
+        "lm_studio" => "LM Studio",
+        "openai" => "OpenAI",
+        other => other,
     }
 }
 

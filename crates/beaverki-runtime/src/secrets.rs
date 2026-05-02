@@ -1,19 +1,39 @@
-use anyhow::{Result, bail};
+use std::sync::Arc;
+
+use anyhow::{Result, anyhow, bail};
 use beaverki_config::{LoadedConfig, SecretStore};
-use beaverki_models::OpenAiProvider;
+use beaverki_models::{LmStudioProvider, ModelProvider, OpenAiProvider};
 
-pub(crate) fn load_provider(config: &LoadedConfig, passphrase: &str) -> Result<OpenAiProvider> {
+pub(crate) fn load_provider(
+    config: &LoadedConfig,
+    passphrase: &str,
+) -> Result<Arc<dyn ModelProvider>> {
     let provider_entry = config.providers.active_provider()?;
-    if provider_entry.auth.mode != "api_token" {
-        bail!(
-            "provider auth mode '{}' is not implemented in M0/M1",
-            provider_entry.auth.mode
-        );
-    }
+    match provider_entry.kind.as_str() {
+        "openai" => {
+            if provider_entry.auth.mode != "api_token" {
+                bail!(
+                    "OpenAI provider auth mode '{}' is not implemented",
+                    provider_entry.auth.mode
+                );
+            }
 
-    let secret_store = SecretStore::new(&config.runtime.secret_dir);
-    let api_token = secret_store.read_secret(&provider_entry.auth.secret_ref, passphrase)?;
-    OpenAiProvider::from_entry(provider_entry, api_token)
+            let secret_ref = provider_entry.auth.secret_ref.as_deref().ok_or_else(|| {
+                anyhow!(
+                    "OpenAI provider '{}' requires auth.secret_ref",
+                    provider_entry.provider_id
+                )
+            })?;
+            let secret_store = SecretStore::new(&config.runtime.secret_dir);
+            let api_token = secret_store.read_secret(secret_ref, passphrase)?;
+            Ok(Arc::new(OpenAiProvider::from_entry(
+                provider_entry,
+                api_token,
+            )?))
+        }
+        "lm_studio" => Ok(Arc::new(LmStudioProvider::from_entry(provider_entry)?)),
+        other => bail!("unsupported provider kind '{}'", other),
+    }
 }
 
 pub(crate) fn load_discord_bot_token(

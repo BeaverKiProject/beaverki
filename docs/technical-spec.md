@@ -267,35 +267,46 @@ Purpose:
 
 - provider selection
 - model-role mapping
-- credential references
+- credential references or local endpoint settings
+- explicit capability flags for feature gaps such as tool calling
 
 Example:
 
 ```yaml
-providers:
-  active: "openai_main"
-  entries:
-    - provider_id: "openai_main"
-      kind: "openai"
-      auth:
-        mode: "api_token"
-        secret_ref: "secret://providers/openai_main/api_token"
-      models:
-        planner: "gpt-5.4"
-        executor: "gpt-5.4-mini"
-        summarizer: "gpt-5.4-mini"
-        safety_reviewer: "gpt-5.4-mini"
-    - provider_id: "openai_codex"
-      kind: "openai"
-      auth:
-        mode: "account_session"
-        secret_ref: "secret://providers/openai_codex/session"
-      models:
-        planner: "gpt-5.4"
-        executor: "gpt-5.4-mini"
-        summarizer: "gpt-5.4-mini"
-        safety_reviewer: "gpt-5.4-mini"
+version: 1
+active: "openai_main"
+entries:
+  - provider_id: "openai_main"
+    kind: "openai"
+    auth:
+      mode: "api_token"
+      secret_ref: "secret://local/openai_main_api_token"
+    models:
+      planner: "gpt-5.4"
+      executor: "gpt-5.4-mini"
+      summarizer: "gpt-5.4-mini"
+      safety_review: "gpt-5.4-mini"
+    capabilities:
+      tool_calling: true
+  - provider_id: "lm_studio_local"
+    kind: "lm_studio"
+    base_url: "http://127.0.0.1:1234/v1"
+    auth:
+      mode: "none"
+    models:
+      planner: "qwen3-32b"
+      executor: "qwen3-14b"
+      summarizer: "qwen3-14b"
+      safety_review: "qwen3-14b"
+    capabilities:
+      tool_calling: false
 ```
+
+Notes:
+
+- `base_url` is optional for hosted providers and required for the current LM Studio integration.
+- `auth.secret_ref` is omitted for providers with `auth.mode: none`.
+- `capabilities.tool_calling: false` tells the runtime to fail closed for tool-bearing turns instead of assuming hosted-provider parity.
 
 ### 5.6 `integrations.yaml`
 

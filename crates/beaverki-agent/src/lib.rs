@@ -407,6 +407,36 @@ impl PrimaryAgentRunner {
                 .await?;
             let available_tools =
                 tool_definitions_with_registered_lua_tools(&self.tools, &registered_lua_tools);
+            if !available_tools.is_empty() && !self.provider.capabilities().tool_calling {
+                let reason = format!(
+                    "Provider '{}' ({}) does not support required tool calling for {} model '{}'.",
+                    self.provider.provider_id(),
+                    self.provider.provider_kind(),
+                    model_role,
+                    model_name,
+                );
+                return match self
+                    .fail_task_terminal(
+                        &task,
+                        &request,
+                        &reason,
+                        json!({
+                            "provider_id": self.provider.provider_id(),
+                            "provider_kind": self.provider.provider_kind(),
+                            "model_role": model_role,
+                            "model_name": model_name,
+                            "tool_calling": self.provider.capabilities().tool_calling,
+                            "tool_count": available_tools.len(),
+                        }),
+                    )
+                    .await?
+                {
+                    ToolFailureDisposition::Terminal(result) => Ok(*result),
+                    ToolFailureDisposition::Paused(_) | ToolFailureDisposition::Continue(_) => {
+                        unreachable!("terminal task failure expected for capability gate")
+                    }
+                };
+            }
             let response = self
                 .provider
                 .generate_turn(
@@ -416,7 +446,29 @@ impl PrimaryAgentRunner {
                     &conversation,
                     &available_tools,
                 )
-                .await?;
+                .await;
+            let response = match response {
+                Ok(response) => response,
+                Err(error) => {
+                    let (reason, detail) = describe_model_turn_failure(
+                        self.provider.provider_id(),
+                        self.provider.provider_kind(),
+                        model_role,
+                        model_name,
+                        &error,
+                    );
+                    return match self
+                        .fail_task_terminal(&task, &request, &reason, detail)
+                        .await?
+                    {
+                        ToolFailureDisposition::Terminal(result) => Ok(*result),
+                        ToolFailureDisposition::Paused(_)
+                        | ToolFailureDisposition::Continue(_) => {
+                            unreachable!("terminal task failure expected for model provider failure")
+                        }
+                    };
+                }
+            };
 
             info!(
                 task_id = %task.task_id,
@@ -5738,6 +5790,66 @@ fn roles_label(role_ids: &[String]) -> String {
     }
 }
 
+fn describe_model_turn_failure(
+    provider_id: &str,
+    provider_kind: &str,
+    model_role: &str,
+    model_name: &str,
+    error: &anyhow::Error,
+) -> (String, Value) {
+    let error_text = format!("{error:#}");
+    if is_context_window_error(&error_text) {
+        return (
+            format!(
+                "Provider '{}' ({}) rejected the {} model '{}' because the prompt exceeded the model context window. Choose a model with a larger context window or reduce the task, memory, or conversation size.",
+                provider_id, provider_kind, model_role, model_name,
+            ),
+            json!({
+                "error_kind": "context_window_exceeded",
+                "provider_id": provider_id,
+                "provider_kind": provider_kind,
+                "model_role": model_role,
+                "model_name": model_name,
+                "error": error_text,
+            }),
+        );
+    }
+
+    (
+        format!(
+            "Provider '{}' ({}) failed while generating the {} model '{}': {}",
+            provider_id, provider_kind, model_role, model_name, error_text,
+        ),
+        json!({
+            "error_kind": "provider_request_failed",
+            "provider_id": provider_id,
+            "provider_kind": provider_kind,
+            "model_role": model_role,
+            "model_name": model_name,
+            "error": error_text,
+        }),
+    )
+}
+
+fn is_context_window_error(error_text: &str) -> bool {
+    let lowered = error_text.to_lowercase();
+    [
+        "context length",
+        "context window",
+        "maximum context",
+        "max context",
+        "too many tokens",
+        "requested tokens",
+        "prompt is too long",
+        "prompt too long",
+        "exceeds context",
+        "longer than the model's context",
+        "longer than the model context",
+    ]
+    .iter()
+    .any(|needle| lowered.contains(needle))
+}
+
 const SHELL_REVIEW_INSTRUCTIONS: &str = r#"You are BeaverKI's safety review agent.
 Review the provided shell command for necessity, reversibility, blast radius, and mismatch with the stated objective.
 If the task can be completed with built-in filesystem tools such as filesystem_list, filesystem_read_text, or filesystem_search, reject shell commands that only explore directories or locate files.
@@ -5748,7 +5860,7 @@ Return only JSON with this exact schema:
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, OnceLock};
 
     use anyhow::Result;
     use async_trait::async_trait;
@@ -5765,11 +5877,23 @@ mod tests {
     #[derive(Clone)]
     struct FakeProvider {
         models: ProviderModels,
-        responses: Arc<Mutex<VecDeque<ModelTurnResponse>>>,
+        capabilities: beaverki_models::ModelProviderCapabilities,
+        responses: Arc<Mutex<VecDeque<std::result::Result<ModelTurnResponse, String>>>>,
     }
 
     impl FakeProvider {
         fn new(responses: Vec<ModelTurnResponse>) -> Self {
+            Self::scripted(
+                responses
+                    .into_iter()
+                    .map(Ok)
+                    .collect::<Vec<std::result::Result<ModelTurnResponse, String>>>(),
+            )
+        }
+
+        fn scripted(
+            responses: Vec<std::result::Result<ModelTurnResponse, String>>,
+        ) -> Self {
             Self {
                 models: ProviderModels {
                     planner: "planner".to_owned(),
@@ -5777,15 +5901,37 @@ mod tests {
                     summarizer: "summarizer".to_owned(),
                     safety_review: "safety".to_owned(),
                 },
+                capabilities: beaverki_models::ModelProviderCapabilities { tool_calling: true },
                 responses: Arc::new(Mutex::new(responses.into())),
             }
+        }
+
+        fn with_tool_calling(mut self, tool_calling: bool) -> Self {
+            self.capabilities.tool_calling = tool_calling;
+            self
         }
     }
 
     #[async_trait]
     impl ModelProvider for FakeProvider {
+        fn provider_id(&self) -> &str {
+            "fake"
+        }
+
+        fn provider_kind(&self) -> &str {
+            "fake"
+        }
+
+        fn capabilities(&self) -> beaverki_models::ModelProviderCapabilities {
+            self.capabilities
+        }
+
         fn model_names(&self) -> &ProviderModels {
             &self.models
+        }
+
+        async fn verify_configuration(&self) -> Result<()> {
+            Ok(())
         }
 
         async fn generate_turn(
@@ -5800,7 +5946,8 @@ mod tests {
                 .lock()
                 .expect("lock")
                 .pop_front()
-                .ok_or_else(|| anyhow!("no more fake responses"))
+                .ok_or_else(|| anyhow!("no more fake responses"))?
+                .map_err(|message| anyhow!(message))
         }
     }
 
@@ -5832,8 +5979,24 @@ mod tests {
 
     #[async_trait]
     impl ModelProvider for RecordingProvider {
+        fn provider_id(&self) -> &str {
+            "recording"
+        }
+
+        fn provider_kind(&self) -> &str {
+            "recording"
+        }
+
+        fn capabilities(&self) -> beaverki_models::ModelProviderCapabilities {
+            beaverki_models::ModelProviderCapabilities { tool_calling: true }
+        }
+
         fn model_names(&self) -> &ProviderModels {
             &self.models
+        }
+
+        async fn verify_configuration(&self) -> Result<()> {
+            Ok(())
         }
 
         async fn generate_turn(
@@ -5882,11 +6045,20 @@ mod tests {
         }
     }
 
+    fn database_connect_guard() -> std::sync::MutexGuard<'static, ()> {
+        static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
+        GUARD
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("database connect guard")
+    }
+
     async fn test_runner_with_provider(
         provider: Arc<dyn ModelProvider>,
     ) -> (Database, PrimaryAgentRunner) {
         let db_dir = tempfile::tempdir().expect("tempdir");
         let db_path = db_dir.path().join("test.db");
+        let _guard = database_connect_guard();
         let db = Database::connect(&db_path).await.expect("connect");
         db.bootstrap_single_user("Alex").await.expect("bootstrap");
         let runner = PrimaryAgentRunner::new(
@@ -5926,6 +6098,97 @@ mod tests {
                     })
             })
             .collect()
+    }
+
+    #[tokio::test]
+    async fn run_task_fails_closed_when_provider_lacks_tool_calling() {
+        let provider = FakeProvider::new(vec![]).with_tool_calling(false);
+        let (db, runner) = test_runner(provider).await;
+        let default_user = db.default_user().await.expect("default").expect("user");
+        let roles = db
+            .list_user_roles(&default_user.user_id)
+            .await
+            .expect("roles")
+            .into_iter()
+            .map(|row| row.role_id)
+            .collect::<Vec<_>>();
+
+        let result = runner
+            .run_task(AgentRequest {
+                owner_user_id: default_user.user_id.clone(),
+                initiating_identity_id: format!("cli:{}", default_user.user_id),
+                primary_agent_id: default_user.primary_agent_id.clone().expect("agent"),
+                assigned_agent_id: default_user.primary_agent_id.clone().expect("agent"),
+                role_ids: roles.clone(),
+                objective: "Inspect the workspace".to_owned(),
+                scope: MemoryScope::Private,
+                kind: "interactive".to_owned(),
+                parent_task_id: None,
+                task_context: None,
+                visible_scopes: visible_memory_scopes(&roles),
+                memory_mode: AgentMemoryMode::ScopedRetrieval,
+                approved_shell_commands: Vec::new(),
+                approved_automation_actions: Vec::new(),
+            })
+            .await
+            .expect("task");
+
+        assert_eq!(result.task.state, TaskState::Failed.as_str());
+        assert!(
+            result
+                .task
+                .result_text
+                .as_deref()
+                .expect("result text")
+                .contains("does not support required tool calling")
+        );
+    }
+
+    #[tokio::test]
+    async fn run_task_fails_with_context_window_guidance() {
+        let provider = FakeProvider::scripted(vec![Err(
+            "LM Studio error: prompt is too long and exceeds context window of 4096 tokens"
+                .to_owned(),
+        )]);
+        let (db, runner) = test_runner(provider).await;
+        let default_user = db.default_user().await.expect("default").expect("user");
+        let roles = db
+            .list_user_roles(&default_user.user_id)
+            .await
+            .expect("roles")
+            .into_iter()
+            .map(|row| row.role_id)
+            .collect::<Vec<_>>();
+
+        let result = runner
+            .run_task(AgentRequest {
+                owner_user_id: default_user.user_id.clone(),
+                initiating_identity_id: format!("cli:{}", default_user.user_id),
+                primary_agent_id: default_user.primary_agent_id.clone().expect("agent"),
+                assigned_agent_id: default_user.primary_agent_id.clone().expect("agent"),
+                role_ids: roles.clone(),
+                objective: "Summarize the workspace and include all recent context".to_owned(),
+                scope: MemoryScope::Private,
+                kind: "interactive".to_owned(),
+                parent_task_id: None,
+                task_context: None,
+                visible_scopes: visible_memory_scopes(&roles),
+                memory_mode: AgentMemoryMode::ScopedRetrieval,
+                approved_shell_commands: Vec::new(),
+                approved_automation_actions: Vec::new(),
+            })
+            .await
+            .expect("task");
+
+        assert_eq!(result.task.state, TaskState::Failed.as_str());
+        assert!(
+            result
+                .task
+                .result_text
+                .as_deref()
+                .expect("result text")
+                .contains("exceeded the model context window")
+        );
     }
 
     fn test_request(
@@ -5991,6 +6254,7 @@ mod tests {
         ])) as Arc<dyn ModelProvider>;
         let db_dir = tempfile::tempdir().expect("tempdir");
         let db_path = db_dir.path().join("test.db");
+        let _guard = database_connect_guard();
         let db = Database::connect(&db_path).await.expect("connect");
         db.bootstrap_single_user("Alex").await.expect("bootstrap");
         let requests = Arc::new(Mutex::new(Vec::new()));
@@ -9179,6 +9443,7 @@ end"#,
         .expect("write manifest");
 
         let db_path = tempdir.path().join("test.db");
+        let _guard = database_connect_guard();
         let db = Database::connect(&db_path).await.expect("connect");
         db.bootstrap_single_user("Alex").await.expect("bootstrap");
         let provider = Arc::new(FakeProvider::new(vec![])) as Arc<dyn ModelProvider>;
@@ -9298,6 +9563,7 @@ end"#,
         .expect("write manifest");
 
         let db_path = tempdir.path().join("test.db");
+        let _guard = database_connect_guard();
         let db = Database::connect(&db_path).await.expect("connect");
         db.bootstrap_single_user("Alex").await.expect("bootstrap");
         let provider = Arc::new(FakeProvider::new(vec![])) as Arc<dyn ModelProvider>;

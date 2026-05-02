@@ -176,7 +176,7 @@ impl Runtime {
             .default_user()
             .await?
             .ok_or_else(|| anyhow!("runtime database has no bootstrap user; run setup first"))?;
-        let provider = Arc::new(load_provider(&config, passphrase)?) as Arc<dyn ModelProvider>;
+        let provider = load_provider(&config, passphrase)?;
         let discord_bot_token = load_discord_bot_token(&config, passphrase)?;
         let notion_api_token = load_notion_api_token(&config, passphrase)?;
         Self::from_parts_with_secrets(
@@ -4412,8 +4412,24 @@ mod tests {
 
     #[async_trait]
     impl ModelProvider for FakeProvider {
+        fn provider_id(&self) -> &str {
+            "fake"
+        }
+
+        fn provider_kind(&self) -> &str {
+            "fake"
+        }
+
+        fn capabilities(&self) -> beaverki_models::ModelProviderCapabilities {
+            beaverki_models::ModelProviderCapabilities { tool_calling: true }
+        }
+
         fn model_names(&self) -> &ProviderModels {
             &self.models
+        }
+
+        async fn verify_configuration(&self) -> Result<()> {
+            Ok(())
         }
 
         async fn generate_turn(
@@ -4477,9 +4493,10 @@ mod tests {
                 entries: vec![beaverki_config::ProviderEntry {
                     provider_id: "fake".to_owned(),
                     kind: "fake".to_owned(),
+                    base_url: None,
                     auth: beaverki_config::ProviderAuth {
                         mode: "api_token".to_owned(),
-                        secret_ref: "secret://local/fake_api_token".to_owned(),
+                        secret_ref: Some("secret://local/fake_api_token".to_owned()),
                     },
                     models: ProviderModels {
                         planner: "planner".to_owned(),
@@ -4487,6 +4504,7 @@ mod tests {
                         summarizer: "summarizer".to_owned(),
                         safety_review: "safety".to_owned(),
                     },
+                    capabilities: beaverki_config::ProviderCapabilities::default(),
                 }],
             },
             integrations: beaverki_config::IntegrationsConfig::default(),

@@ -236,6 +236,8 @@ Suggested next steps:
   1. Edit ${env_file} and set BEAVERKI_MASTER_PASSPHRASE
   2. Ensure ${bin_dir} is on your PATH
   3. Run: beaverki setup init
+     Choose OpenAI or LM Studio during setup. For OpenAI, export OPENAI_API_KEY first.
+     For LM Studio, make sure a local LM Studio server is running with a loaded model.
 EOF
 
 if [[ "${service_kind}" == "systemd" ]]; then

@@ -4,21 +4,22 @@ use std::process::Stdio;
 
 use anyhow::{Context, Result, anyhow, bail};
 use beaverki_config::{
-    DiscordAllowedChannel, DiscordChannelMode, LoadedConfig, SessionLifecycleAction,
-    SessionLifecyclePolicy, SessionPolicyMatchInput, SetupAnswers, default_app_paths,
-    prompt_passphrase_from_env, select_session_lifecycle_policy, write_integrations_config,
-    write_providers_config, write_runtime_config, write_setup_files,
+    DiscordAllowedChannel, DiscordChannelMode, LoadedConfig, ProviderAuth, ProviderCapabilities,
+    ProviderEntry, ProviderModels, SecretStore, SessionLifecycleAction, SessionLifecyclePolicy,
+    SessionPolicyMatchInput, SetupAnswers, default_app_paths, prompt_passphrase_from_env,
+    select_session_lifecycle_policy, write_integrations_config, write_providers_config,
+    write_runtime_config, write_setup_files,
 };
 use beaverki_core::{MemoryKind, MemoryScope};
 use beaverki_db::{ConversationSessionRow, Database, MemoryRow, UserRow};
-use beaverki_models::OpenAiProvider;
+use beaverki_models::{LmStudioProvider, ModelProvider, OpenAiProvider};
 use beaverki_policy::{is_builtin_role, visible_memory_scopes};
 use beaverki_runtime::{
     DaemonClient, Runtime, RuntimeDaemon, WorkflowDefinitionInput, inspect_installed_skills,
     latest_daemon_status, parse_workflow_stage_config,
 };
 use clap::{Args, Parser, Subcommand};
-use dialoguer::{Input, Password};
+use dialoguer::{Confirm, Input, Password, Select};
 use owo_colors::{OwoColorize, Style};
 use serde_json::Value;
 use tokio::time::{self, Duration};
@@ -165,6 +166,7 @@ enum NotionCommand {
 #[derive(Subcommand)]
 enum SetupCommand {
     Init(Box<SetupInitArgs>),
+    VerifyProvider(VerifyProviderArgs),
     VerifyOpenai(VerifyOpenAiArgs),
     ShowModels(ConfigDirArgs),
     SetModels(Box<SetModelsArgs>),
@@ -253,14 +255,20 @@ struct SetupInitArgs {
     log_dir: Option<PathBuf>,
     #[arg(long)]
     secret_dir: Option<PathBuf>,
-    #[arg(long, default_value = "gpt-5.4")]
-    planner_model: String,
-    #[arg(long, default_value = "gpt-5.4-mini")]
-    executor_model: String,
-    #[arg(long, default_value = "gpt-5.4-mini")]
-    summarizer_model: String,
-    #[arg(long, default_value = "gpt-5.4-mini")]
-    safety_review_model: String,
+    #[arg(long)]
+    provider: Option<String>,
+    #[arg(long)]
+    planner_model: Option<String>,
+    #[arg(long)]
+    executor_model: Option<String>,
+    #[arg(long)]
+    summarizer_model: Option<String>,
+    #[arg(long)]
+    safety_review_model: Option<String>,
+    #[arg(long)]
+    lm_studio_base_url: Option<String>,
+    #[arg(long, default_value_t = false)]
+    lm_studio_tool_calling: bool,
     #[arg(long, default_value = "OPENAI_API_KEY")]
     openai_api_token_env: String,
     #[arg(long, default_value = "BEAVERKI_MASTER_PASSPHRASE")]
@@ -446,6 +454,16 @@ struct VerifyOpenAiArgs {
 }
 
 #[derive(Args, Clone)]
+struct VerifyProviderArgs {
+    #[arg(long)]
+    config_dir: Option<PathBuf>,
+    #[arg(long, default_value = "OPENAI_API_KEY")]
+    openai_api_token_env: String,
+    #[arg(long, default_value = "BEAVERKI_MASTER_PASSPHRASE")]
+    passphrase_env: String,
+}
+
+#[derive(Args, Clone)]
 struct ConfigDirArgs {
     #[arg(long)]
     config_dir: Option<PathBuf>,
@@ -475,6 +493,46 @@ struct SetModelsArgs {
     openai_api_token_env: String,
     #[arg(long, default_value_t = false)]
     skip_openai_check: bool,
+}
+
+const DEFAULT_OPENAI_PLANNER_MODEL: &str = "gpt-5.4";
+const DEFAULT_OPENAI_EXECUTOR_MODEL: &str = "gpt-5.4-mini";
+const DEFAULT_OPENAI_SUMMARIZER_MODEL: &str = "gpt-5.4-mini";
+const DEFAULT_OPENAI_SAFETY_REVIEW_MODEL: &str = "gpt-5.4-mini";
+const DEFAULT_LM_STUDIO_BASE_URL: &str = "http://127.0.0.1:1234";
+const DEFAULT_LM_STUDIO_MODEL: &str = "local-model";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SetupProviderKind {
+    OpenAi,
+    LmStudio,
+}
+
+impl SetupProviderKind {
+    fn parse(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "openai" => Ok(Self::OpenAi),
+            "lm_studio" | "lm-studio" | "lmstudio" => Ok(Self::LmStudio),
+            other => bail!(
+                "unsupported provider '{}'; use 'openai' or 'lm_studio'",
+                other
+            ),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::OpenAi => "OpenAI",
+            Self::LmStudio => "LM Studio",
+        }
+    }
+
+    fn provider_id(self) -> &'static str {
+        match self {
+            Self::OpenAi => "openai_main",
+            Self::LmStudio => "lm_studio_local",
+        }
+    }
 }
 
 #[derive(Args, Clone)]
@@ -786,6 +844,7 @@ async fn main() -> Result<()> {
         },
         Commands::Setup { command } => match *command {
             SetupCommand::Init(args) => setup_init(*args).await,
+            SetupCommand::VerifyProvider(args) => verify_provider(args).await,
             SetupCommand::VerifyOpenai(args) => verify_openai(args).await,
             SetupCommand::ShowModels(args) => show_models(args).await,
             SetupCommand::SetModels(args) => set_models(*args).await,
@@ -871,27 +930,147 @@ async fn setup_init(args: SetupInitArgs) -> Result<()> {
         .secret_dir
         .unwrap_or_else(|| app_paths.secret_dir.clone());
     let database_path = state_dir.join("runtime.db");
-    let api_token = std::env::var(&args.openai_api_token_env).unwrap_or_else(|_| {
-        Password::new()
-            .with_prompt("OpenAI API token")
-            .interact()
-            .expect("failed to read OpenAI API token")
-    });
-    let master_passphrase = prompt_passphrase_from_env(&args.passphrase_env).unwrap_or_else(|| {
-        Password::new()
-            .with_prompt("Master passphrase for encrypted local secrets")
-            .with_confirmation("Confirm master passphrase", "passphrases do not match")
-            .interact()
-            .expect("failed to read master passphrase")
-    });
+    let provider_kind = match args.provider.as_deref() {
+        Some(value) => SetupProviderKind::parse(value)?,
+        None => {
+            let options = [SetupProviderKind::OpenAi, SetupProviderKind::LmStudio];
+            let labels = options.map(SetupProviderKind::label);
+            let selected = Select::new()
+                .with_prompt("Model provider")
+                .items(&labels)
+                .default(0)
+                .interact()
+                .context("failed to read provider choice")?;
+            options[selected]
+        }
+    };
+
+    let (provider, provider_secret_value, master_passphrase) = match provider_kind {
+        SetupProviderKind::OpenAi => {
+            let provider = ProviderEntry {
+                provider_id: provider_kind.provider_id().to_owned(),
+                kind: "openai".to_owned(),
+                base_url: None,
+                auth: ProviderAuth {
+                    mode: "api_token".to_owned(),
+                    secret_ref: Some("secret://local/openai_main_api_token".to_owned()),
+                },
+                models: ProviderModels {
+                    planner: prompt_model_input(
+                        "Planner model",
+                        args.planner_model.clone(),
+                        DEFAULT_OPENAI_PLANNER_MODEL,
+                    )?,
+                    executor: prompt_model_input(
+                        "Executor model",
+                        args.executor_model.clone(),
+                        DEFAULT_OPENAI_EXECUTOR_MODEL,
+                    )?,
+                    summarizer: prompt_model_input(
+                        "Summarizer model",
+                        args.summarizer_model.clone(),
+                        DEFAULT_OPENAI_SUMMARIZER_MODEL,
+                    )?,
+                    safety_review: prompt_model_input(
+                        "Safety review model",
+                        args.safety_review_model.clone(),
+                        DEFAULT_OPENAI_SAFETY_REVIEW_MODEL,
+                    )?,
+                },
+                capabilities: ProviderCapabilities::default(),
+            };
+            let api_token = std::env::var(&args.openai_api_token_env).unwrap_or_else(|_| {
+                Password::new()
+                    .with_prompt("OpenAI API token")
+                    .interact()
+                    .expect("failed to read OpenAI API token")
+            });
+            let master_passphrase = prompt_passphrase_from_env(&args.passphrase_env)
+                .unwrap_or_else(|| {
+                    Password::new()
+                        .with_prompt("Master passphrase for encrypted local secrets")
+                        .with_confirmation("Confirm master passphrase", "passphrases do not match")
+                        .interact()
+                        .expect("failed to read master passphrase")
+                });
+            (provider, Some(api_token), Some(master_passphrase))
+        }
+        SetupProviderKind::LmStudio => {
+            let initial_base_url = match args.lm_studio_base_url.as_deref() {
+                Some(value) => normalize_base_url_input(value)?,
+                None => normalize_base_url_input(
+                    &Input::<String>::new()
+                        .with_prompt("LM Studio base URL")
+                        .default(DEFAULT_LM_STUDIO_BASE_URL.to_owned())
+                        .interact_text()
+                        .context("failed to read LM Studio base URL")?,
+                )?,
+            };
+            let (base_url, discovered_models) =
+                discover_lm_studio_models_with_retry(initial_base_url).await?;
+            let planner_model = prompt_provider_model(
+                "Planner model",
+                args.planner_model.clone(),
+                &discovered_models,
+                discovered_models
+                    .first()
+                    .map(String::as_str)
+                    .unwrap_or(DEFAULT_LM_STUDIO_MODEL),
+            )?;
+            let executor_model = prompt_provider_model(
+                "Executor model",
+                args.executor_model.clone(),
+                &discovered_models,
+                planner_model.as_str(),
+            )?;
+            let summarizer_model = prompt_provider_model(
+                "Summarizer model",
+                args.summarizer_model.clone(),
+                &discovered_models,
+                executor_model.as_str(),
+            )?;
+            let safety_review_model = prompt_provider_model(
+                "Safety review model",
+                args.safety_review_model.clone(),
+                &discovered_models,
+                executor_model.as_str(),
+            )?;
+            let tool_calling = if args.lm_studio_tool_calling {
+                true
+            } else {
+                Confirm::new()
+                    .with_prompt(
+                        "Enable tool calling for the selected LM Studio model configuration?",
+                    )
+                    .default(false)
+                    .interact()
+                    .context("failed to read LM Studio tool calling choice")?
+            };
+            let provider = ProviderEntry {
+                provider_id: provider_kind.provider_id().to_owned(),
+                kind: "lm_studio".to_owned(),
+                base_url: Some(base_url),
+                auth: ProviderAuth {
+                    mode: "none".to_owned(),
+                    secret_ref: None,
+                },
+                models: ProviderModels {
+                    planner: planner_model,
+                    executor: executor_model,
+                    summarizer: summarizer_model,
+                    safety_review: safety_review_model,
+                },
+                capabilities: ProviderCapabilities { tool_calling },
+            };
+            (provider, None, None)
+        }
+    };
 
     if !args.skip_openai_check {
-        verify_openai_api_token(
-            &api_token,
-            &args.planner_model,
-            &args.executor_model,
-            &args.summarizer_model,
-            &args.safety_review_model,
+        verify_provider_entry(
+            &provider,
+            provider_secret_value.as_deref(),
+            &args.openai_api_token_env,
         )
         .await?;
     }
@@ -906,11 +1085,8 @@ async fn setup_init(args: SetupInitArgs) -> Result<()> {
         secret_dir: secret_dir.clone(),
         database_path: database_path.clone(),
         workspace_root,
-        planner_model: args.planner_model,
-        executor_model: args.executor_model,
-        summarizer_model: args.summarizer_model,
-        safety_review_model: args.safety_review_model,
-        openai_api_token: api_token,
+        provider,
+        provider_secret_value,
         master_passphrase,
     };
 
@@ -925,7 +1101,9 @@ async fn setup_init(args: SetupInitArgs) -> Result<()> {
         "Integrations config: {}",
         artifacts.integrations_path.display()
     );
-    println!("Encrypted secret ref: {}", artifacts.secret_ref);
+    if let Some(secret_ref) = artifacts.secret_ref.as_deref() {
+        println!("Encrypted secret ref: {}", secret_ref);
+    }
     println!("Data dir: {}", data_dir.display());
     println!("State dir: {}", state_dir.display());
     println!("Log dir: {}", log_dir.display());
@@ -2465,6 +2643,50 @@ async fn verify_openai(args: VerifyOpenAiArgs) -> Result<()> {
     Ok(())
 }
 
+async fn verify_provider(args: VerifyProviderArgs) -> Result<()> {
+    let config_dir = resolve_config_dir(args.config_dir)?;
+    let config = LoadedConfig::load_from_dir(&config_dir)?;
+    let provider = config.providers.active_provider()?;
+
+    let openai_api_token = if provider.kind == "openai" {
+        match std::env::var(&args.openai_api_token_env) {
+            Ok(value) => Some(value),
+            Err(_) => {
+                let secret_ref = provider.auth.secret_ref.as_deref().ok_or_else(|| {
+                    anyhow!(
+                        "OpenAI provider '{}' is missing auth.secret_ref",
+                        provider.provider_id
+                    )
+                })?;
+                let passphrase =
+                    prompt_passphrase_from_env(&args.passphrase_env).unwrap_or_else(|| {
+                        Password::new()
+                            .with_prompt("Master passphrase")
+                            .interact()
+                            .expect("failed to read master passphrase")
+                    });
+                let secret_store = SecretStore::new(&config.runtime.secret_dir);
+                Some(secret_store.read_secret(secret_ref, &passphrase)?)
+            }
+        }
+    } else {
+        None
+    };
+
+    verify_provider_entry(
+        provider,
+        openai_api_token.as_deref(),
+        &args.openai_api_token_env,
+    )
+    .await?;
+
+    println!(
+        "Provider verification succeeded for {} ({}).",
+        provider.provider_id, provider.kind
+    );
+    Ok(())
+}
+
 async fn show_models(args: ConfigDirArgs) -> Result<()> {
     let config_dir = resolve_config_dir(args.config_dir)?;
     let config = LoadedConfig::load_from_dir(&config_dir)?;
@@ -2473,6 +2695,13 @@ async fn show_models(args: ConfigDirArgs) -> Result<()> {
     println!("Config dir: {}", config.config_dir.display());
     println!("Active provider: {}", provider.provider_id);
     println!("Provider kind: {}", provider.kind);
+    if let Some(base_url) = provider.base_url.as_deref() {
+        println!("Provider base URL: {}", base_url);
+    }
+    println!(
+        "Tool calling enabled: {}",
+        provider.capabilities.tool_calling
+    );
     println!("Planner model: {}", provider.models.planner);
     println!("Executor model: {}", provider.models.executor);
     println!("Summarizer model: {}", provider.models.summarizer);
@@ -2930,17 +3159,20 @@ async fn set_models(args: SetModelsArgs) -> Result<()> {
         .unwrap_or_else(|| provider.models.safety_review.clone());
 
     if !args.skip_openai_check {
-        let api_token = std::env::var(&args.openai_api_token_env).with_context(|| {
-            format!("missing environment variable {}", args.openai_api_token_env)
-        })?;
-        verify_openai_api_token(
-            &api_token,
-            &planner_model,
-            &executor_model,
-            &summarizer_model,
-            &safety_review_model,
-        )
-        .await?;
+        let verification_entry = ProviderEntry {
+            provider_id: provider.provider_id.clone(),
+            kind: provider.kind.clone(),
+            base_url: provider.base_url.clone(),
+            auth: provider.auth.clone(),
+            models: ProviderModels {
+                planner: planner_model.clone(),
+                executor: executor_model.clone(),
+                summarizer: summarizer_model.clone(),
+                safety_review: safety_review_model.clone(),
+            },
+            capabilities: provider.capabilities.clone(),
+        };
+        verify_provider_entry(&verification_entry, None, &args.openai_api_token_env).await?;
     }
 
     provider.models.planner = planner_model;
@@ -2973,9 +3205,10 @@ async fn verify_openai_api_token(
         &beaverki_config::ProviderEntry {
             provider_id: "openai_main".to_owned(),
             kind: "openai".to_owned(),
+            base_url: None,
             auth: beaverki_config::ProviderAuth {
                 mode: "api_token".to_owned(),
-                secret_ref: "secret://local/openai_main_api_token".to_owned(),
+                secret_ref: Some("secret://local/openai_main_api_token".to_owned()),
             },
             models: beaverki_config::ProviderModels {
                 planner: planner_model.to_owned(),
@@ -2983,10 +3216,142 @@ async fn verify_openai_api_token(
                 summarizer: summarizer_model.to_owned(),
                 safety_review: safety_review_model.to_owned(),
             },
+            capabilities: beaverki_config::ProviderCapabilities::default(),
         },
         api_token.to_owned(),
     )?;
     provider.verify_credentials().await
+}
+
+async fn verify_provider_entry(
+    provider: &ProviderEntry,
+    openai_api_token: Option<&str>,
+    openai_api_token_env: &str,
+) -> Result<()> {
+    match provider.kind.as_str() {
+        "openai" => {
+            let api_token = match openai_api_token {
+                Some(value) => value.to_owned(),
+                None => std::env::var(openai_api_token_env).with_context(|| {
+                    format!("missing environment variable {}", openai_api_token_env)
+                })?,
+            };
+            let provider = OpenAiProvider::from_entry(provider, api_token)?;
+            provider.verify_configuration().await
+        }
+        "lm_studio" => {
+            let provider = LmStudioProvider::from_entry(provider)?;
+            provider.verify_configuration().await
+        }
+        other => bail!("unsupported provider kind '{}'", other),
+    }
+}
+
+async fn discover_lm_studio_models(base_url: &str) -> Result<Vec<String>> {
+    let provider = LmStudioProvider::from_entry(&ProviderEntry {
+        provider_id: "lm_studio_discovery".to_owned(),
+        kind: "lm_studio".to_owned(),
+        base_url: Some(base_url.to_owned()),
+        auth: ProviderAuth {
+            mode: "none".to_owned(),
+            secret_ref: None,
+        },
+        models: ProviderModels {
+            planner: DEFAULT_LM_STUDIO_MODEL.to_owned(),
+            executor: DEFAULT_LM_STUDIO_MODEL.to_owned(),
+            summarizer: DEFAULT_LM_STUDIO_MODEL.to_owned(),
+            safety_review: DEFAULT_LM_STUDIO_MODEL.to_owned(),
+        },
+        capabilities: ProviderCapabilities {
+            tool_calling: false,
+        },
+    })?;
+    provider.list_models().await
+}
+
+async fn discover_lm_studio_models_with_retry(initial_base_url: String) -> Result<(String, Vec<String>)> {
+    let mut base_url = initial_base_url;
+
+    loop {
+        match discover_lm_studio_models(&base_url).await {
+            Ok(models) => return Ok((base_url, models)),
+            Err(error) => {
+                println!("LM Studio model discovery failed: {error:#}");
+
+                let selected = Select::new()
+                    .with_prompt("LM Studio discovery options")
+                    .items(&[
+                        "Retry discovery",
+                        "Change LM Studio base URL",
+                        "Continue with manual model entry",
+                    ])
+                    .default(0)
+                    .interact()
+                    .context("failed to read LM Studio discovery action")?;
+
+                match selected {
+                    0 => continue,
+                    1 => {
+                        base_url = normalize_base_url_input(
+                            &Input::<String>::new()
+                                .with_prompt("LM Studio base URL")
+                                .default(base_url.clone())
+                                .interact_text()
+                                .context("failed to read LM Studio base URL")?,
+                        )?;
+                    }
+                    2 => return Ok((base_url, Vec::new())),
+                    _ => unreachable!(),
+                }
+            }
+        }
+    }
+}
+
+fn prompt_model_input(prompt: &str, provided: Option<String>, default: &str) -> Result<String> {
+    match provided {
+        Some(value) => Ok(value),
+        None => Input::<String>::new()
+            .with_prompt(prompt)
+            .default(default.to_owned())
+            .interact_text()
+            .with_context(|| format!("failed to read {prompt}")),
+    }
+}
+
+fn prompt_provider_model(
+    prompt: &str,
+    provided: Option<String>,
+    discovered_models: &[String],
+    default: &str,
+) -> Result<String> {
+    if let Some(value) = provided {
+        return Ok(value);
+    }
+
+    if discovered_models.is_empty() {
+        return prompt_model_input(prompt, None, default);
+    }
+
+    let default_index = discovered_models
+        .iter()
+        .position(|model| model == default)
+        .unwrap_or(0);
+    let selected = Select::new()
+        .with_prompt(prompt)
+        .items(discovered_models)
+        .default(default_index)
+        .interact()
+        .with_context(|| format!("failed to read {prompt}"))?;
+    Ok(discovered_models[selected].clone())
+}
+
+fn normalize_base_url_input(value: &str) -> Result<String> {
+    let trimmed = value.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        bail!("provider base URL cannot be empty");
+    }
+    Ok(trimmed.to_owned())
 }
 
 async fn load_db(config_dir: &PathBuf) -> Result<(LoadedConfig, Database)> {

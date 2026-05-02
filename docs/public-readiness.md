@@ -12,7 +12,7 @@ Make the repository understandable, reproducible, and honest about its security 
   - `cargo fmt --all --check`
   - `cargo clippy --workspace --all-targets -- -D warnings`
   - `cargo test --workspace --locked`
-- README quick start works from a clean checkout with Rust, `make`, and an OpenAI API key.
+- README quick start works from a clean checkout with Rust, `make`, and either an OpenAI API key or a running LM Studio instance with a loaded local model.
 - Security policy exists and states supported versus unsupported deployment shapes.
 - Release packaging docs describe the tag-driven release flow and generated archive contents.
 - Public docs do not imply that the web UI is safe to expose directly to the internet.

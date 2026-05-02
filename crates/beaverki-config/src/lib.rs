@@ -225,14 +225,33 @@ impl ProvidersConfig {
 pub struct ProviderEntry {
     pub provider_id: String,
     pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
     pub auth: ProviderAuth,
     pub models: ProviderModels,
+    #[serde(default)]
+    pub capabilities: ProviderCapabilities,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderAuth {
     pub mode: String,
-    pub secret_ref: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_ref: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProviderCapabilities {
+    pub tool_calling: bool,
+}
+
+impl Default for ProviderCapabilities {
+    fn default() -> Self {
+        Self {
+            tool_calling: default_provider_tool_calling(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -412,12 +431,9 @@ pub struct SetupAnswers {
     pub secret_dir: PathBuf,
     pub database_path: PathBuf,
     pub workspace_root: PathBuf,
-    pub planner_model: String,
-    pub executor_model: String,
-    pub summarizer_model: String,
-    pub safety_review_model: String,
-    pub openai_api_token: String,
-    pub master_passphrase: String,
+    pub provider: ProviderEntry,
+    pub provider_secret_value: Option<String>,
+    pub master_passphrase: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -425,7 +441,7 @@ pub struct SetupArtifacts {
     pub runtime_path: PathBuf,
     pub providers_path: PathBuf,
     pub integrations_path: PathBuf,
-    pub secret_ref: String,
+    pub secret_ref: Option<String>,
 }
 
 pub fn write_setup_files(answers: &SetupAnswers) -> Result<SetupArtifacts> {
@@ -440,8 +456,6 @@ pub fn write_setup_files(answers: &SetupAnswers) -> Result<SetupArtifacts> {
     fs::create_dir_all(&answers.secret_dir)
         .with_context(|| format!("failed to create {}", answers.secret_dir.display()))?;
 
-    let provider_id = "openai_main";
-    let secret_ref = format!("secret://local/{provider_id}_api_token");
     let runtime = RuntimeConfig {
         version: CURRENT_CONFIG_VERSION,
         instance_id: answers.instance_id.clone(),
@@ -462,21 +476,8 @@ pub fn write_setup_files(answers: &SetupAnswers) -> Result<SetupArtifacts> {
     };
     let providers = ProvidersConfig {
         version: CURRENT_CONFIG_VERSION,
-        active: provider_id.to_owned(),
-        entries: vec![ProviderEntry {
-            provider_id: provider_id.to_owned(),
-            kind: "openai".to_owned(),
-            auth: ProviderAuth {
-                mode: "api_token".to_owned(),
-                secret_ref: secret_ref.clone(),
-            },
-            models: ProviderModels {
-                planner: answers.planner_model.clone(),
-                executor: answers.executor_model.clone(),
-                summarizer: answers.summarizer_model.clone(),
-                safety_review: answers.safety_review_model.clone(),
-            },
-        }],
+        active: answers.provider.provider_id.clone(),
+        entries: vec![answers.provider.clone()],
     };
     let integrations = IntegrationsConfig::default();
 
@@ -489,23 +490,35 @@ pub fn write_setup_files(answers: &SetupAnswers) -> Result<SetupArtifacts> {
     write_providers_config_path(&providers_path, &providers)?;
     write_integrations_config_path(&integrations_path, &integrations)?;
 
-    let secret_store = SecretStore::new(&answers.secret_dir);
-    secret_store.write_secret(
-        &secret_ref,
-        &answers.openai_api_token,
-        &answers.master_passphrase,
-    )?;
+    if let Some(secret_value) = answers.provider_secret_value.as_deref() {
+        let secret_ref = answers
+            .provider
+            .auth
+            .secret_ref
+            .as_deref()
+            .ok_or_else(|| anyhow!("provider secret value requires auth.secret_ref"))?;
+        let master_passphrase = answers
+            .master_passphrase
+            .as_deref()
+            .ok_or_else(|| anyhow!("provider secret value requires master passphrase"))?;
+        let secret_store = SecretStore::new(&answers.secret_dir);
+        secret_store.write_secret(secret_ref, secret_value, master_passphrase)?;
+    }
 
     Ok(SetupArtifacts {
         runtime_path,
         providers_path,
         integrations_path,
-        secret_ref,
+        secret_ref: answers.provider.auth.secret_ref.clone(),
     })
 }
 
 fn default_safety_review_model() -> String {
     "gpt-5.4-mini".to_owned()
+}
+
+fn default_provider_tool_calling() -> bool {
+    true
 }
 
 fn default_config_version() -> u32 {
@@ -1108,6 +1121,12 @@ entries:
             loaded.providers.entries[0].models.safety_review,
             default_safety_review_model()
         );
+        assert_eq!(loaded.providers.entries[0].base_url, None);
+        assert!(loaded.providers.entries[0].capabilities.tool_calling);
+        assert_eq!(
+            loaded.providers.entries[0].auth.secret_ref.as_deref(),
+            Some("secret://local/openai_main_api_token")
+        );
         assert_eq!(loaded.integrations.discord.task_wait_timeout_secs, 5);
         assert_eq!(
             loaded.integrations.discord.approval_action_ttl_secs,
@@ -1154,6 +1173,108 @@ entries:
         assert!(!runtime_backup.contains("version:"));
         assert!(!providers_backup.contains("safety_review:"));
         assert!(!integrations_backup.contains("version:"));
+    }
+
+    #[test]
+    fn providers_config_roundtrips_local_provider_fields() {
+        let providers = ProvidersConfig {
+            version: CURRENT_CONFIG_VERSION,
+            active: "lm_studio_local".to_owned(),
+            entries: vec![ProviderEntry {
+                provider_id: "lm_studio_local".to_owned(),
+                kind: "lm_studio".to_owned(),
+                base_url: Some("http://127.0.0.1:1234/v1".to_owned()),
+                auth: ProviderAuth {
+                    mode: "none".to_owned(),
+                    secret_ref: None,
+                },
+                models: ProviderModels {
+                    planner: "qwen3-32b".to_owned(),
+                    executor: "qwen3-14b".to_owned(),
+                    summarizer: "qwen3-14b".to_owned(),
+                    safety_review: "qwen3-14b".to_owned(),
+                },
+                capabilities: ProviderCapabilities {
+                    tool_calling: false,
+                },
+            }],
+        };
+
+        let encoded = serde_yaml::to_string(&providers).expect("serialize providers");
+        assert!(encoded.contains("base_url: http://127.0.0.1:1234/v1"));
+        assert!(encoded.contains("tool_calling: false"));
+        assert!(!encoded.contains("secret_ref:"));
+
+        let decoded: ProvidersConfig = serde_yaml::from_str(&encoded).expect("parse providers");
+        let entry = &decoded.entries[0];
+        assert_eq!(entry.provider_id, "lm_studio_local");
+        assert_eq!(entry.kind, "lm_studio");
+        assert_eq!(entry.base_url.as_deref(), Some("http://127.0.0.1:1234/v1"));
+        assert_eq!(entry.auth.mode, "none");
+        assert_eq!(entry.auth.secret_ref, None);
+        assert!(!entry.capabilities.tool_calling);
+    }
+
+    #[test]
+    fn write_setup_files_supports_local_provider_without_secret() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let config_dir = tempdir.path().join("config");
+        let data_dir = tempdir.path().join("data");
+        let state_dir = tempdir.path().join("state");
+        let log_dir = state_dir.join("logs");
+        let secret_dir = state_dir.join("secrets");
+        let database_path = state_dir.join("runtime.db");
+
+        let artifacts = write_setup_files(&SetupAnswers {
+            config_dir: config_dir.clone(),
+            instance_id: "test-instance".to_owned(),
+            owner_display_name: "Alex".to_owned(),
+            data_dir: data_dir.clone(),
+            state_dir: state_dir.clone(),
+            log_dir: log_dir.clone(),
+            secret_dir: secret_dir.clone(),
+            database_path,
+            workspace_root: tempdir.path().to_path_buf(),
+            provider: ProviderEntry {
+                provider_id: "lm_studio_local".to_owned(),
+                kind: "lm_studio".to_owned(),
+                base_url: Some("http://127.0.0.1:1234/v1".to_owned()),
+                auth: ProviderAuth {
+                    mode: "none".to_owned(),
+                    secret_ref: None,
+                },
+                models: ProviderModels {
+                    planner: "qwen3-32b".to_owned(),
+                    executor: "qwen3-14b".to_owned(),
+                    summarizer: "qwen3-14b".to_owned(),
+                    safety_review: "qwen3-14b".to_owned(),
+                },
+                capabilities: ProviderCapabilities {
+                    tool_calling: false,
+                },
+            },
+            provider_secret_value: None,
+            master_passphrase: None,
+        })
+        .expect("write setup files");
+
+        assert_eq!(artifacts.secret_ref, None);
+        let providers = fs::read_to_string(config_dir.join("providers.yaml")).expect("providers");
+        assert!(providers.contains("kind: lm_studio"));
+        assert!(providers.contains("base_url: http://127.0.0.1:1234/v1"));
+        assert!(providers.contains("tool_calling: false"));
+        assert!(!providers.contains("secret_ref:"));
+        assert!(list_dir_entries(&secret_dir).is_empty());
+    }
+
+    fn list_dir_entries(path: &Path) -> Vec<PathBuf> {
+        fs::read_dir(path)
+            .map(|entries| {
+                entries
+                    .filter_map(|entry| entry.ok().map(|item| item.path()))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
     }
 
     #[test]
