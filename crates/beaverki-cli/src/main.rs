@@ -1178,7 +1178,8 @@ async fn daemon_run(args: DaemonRunArgs) -> Result<()> {
             .expect("failed to read master passphrase")
     });
     let runtime = Runtime::load(&config_dir, &passphrase).await?;
-    let daemon = RuntimeDaemon::new(runtime);
+    let daemon = RuntimeDaemon::new(runtime)
+        .with_config_access(config_dir.clone(), passphrase.clone());
     println!("Daemon listening on {}", daemon.socket_path().display());
     daemon
         .run_until(async {
@@ -1193,6 +1194,7 @@ async fn daemon_serve(args: DaemonServeArgs) -> Result<()> {
         .with_context(|| format!("missing environment variable {}", args.passphrase_env))?;
     let runtime = Runtime::load(&config_dir, &passphrase).await?;
     RuntimeDaemon::new(runtime)
+        .with_config_access(config_dir, passphrase)
         .run_until(std::future::pending::<()>())
         .await
 }

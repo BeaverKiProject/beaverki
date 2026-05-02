@@ -41,8 +41,9 @@ mod types;
 mod workflow;
 
 pub use self::daemon::{
-    ConnectorMessageReply, ConnectorMessageRequest, DaemonClient, DaemonRequest, DaemonResponse,
-    DaemonStatus, RuntimeDaemon, latest_daemon_status, load_daemon_client,
+    ActiveProviderSummary, ConnectorMessageReply, ConnectorMessageRequest, DaemonClient,
+    DaemonRequest, DaemonResponse, DaemonStatus, ProviderConfigUpdate, ProviderConfigView,
+    ProviderOption, RuntimeDaemon, latest_daemon_status, load_daemon_client,
 };
 pub use self::types::{
     AutomationCatalog, MemoryInspection, RemoteApprovalActionOutcome, ScriptInspection,

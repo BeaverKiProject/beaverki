@@ -10,11 +10,12 @@ use axum::{
     response::{IntoResponse, Redirect, Response},
     routing::{get, post},
 };
-use beaverki_config::{LoadedConfig, ProviderEntry};
+use beaverki_config::LoadedConfig;
 use beaverki_core::TaskState;
 use beaverki_db::{ApprovalRow, MemoryRow, RoleRow, ScheduleRow, TaskEventRow, ToolInvocationRow};
 use beaverki_runtime::{
-    AutomationCatalog, DaemonClient, SessionSummary, UserSummary, WorkflowDefinitionInput,
+    ActiveProviderSummary, AutomationCatalog, DaemonClient, ProviderConfigUpdate,
+    ProviderConfigView, SessionSummary, UserSummary, WorkflowDefinitionInput,
     WorkflowInspection, WorkflowStageInput,
 };
 use clap::Parser;
@@ -35,20 +36,7 @@ struct Args {
 #[derive(Clone)]
 struct AppState {
     daemon: DaemonClient,
-    config_dir: PathBuf,
     listen_addr: SocketAddr,
-}
-
-#[derive(Clone)]
-struct ActiveProviderSummary {
-    provider_id: String,
-    kind: String,
-    base_url: Option<String>,
-    planner: String,
-    executor: String,
-    summarizer: String,
-    safety_review: String,
-    tool_calling: bool,
 }
 
 #[derive(Debug)]
@@ -99,6 +87,13 @@ struct UserQuery {
 }
 
 #[derive(Debug, Default, Deserialize)]
+struct SettingsQuery {
+    user: Option<String>,
+    provider: Option<String>,
+    provider_saved: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize)]
 struct ScheduleEditQuery {
     user: Option<String>,
     schedule_id: Option<String>,
@@ -109,6 +104,17 @@ struct TaskForm {
     user: Option<String>,
     objective: String,
     scope: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProviderConfigForm {
+    user: Option<String>,
+    provider_id: String,
+    base_url: String,
+    planner_model: String,
+    executor_model: String,
+    summarizer_model: String,
+    safety_review_model: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -169,11 +175,12 @@ async fn main() -> Result<()> {
 
     let state = AppState {
         daemon,
-        config_dir,
         listen_addr: args.listen_addr,
     };
     let app = Router::new()
         .route("/", get(dashboard))
+        .route("/settings", get(settings_page))
+        .route("/providers/save", post(save_provider_config))
         .route("/users", post(create_user))
         .route("/tasks", post(submit_task))
         .route("/tasks/{task_id}", get(task_detail))
@@ -208,9 +215,9 @@ async fn dashboard(
     State(state): State<AppState>,
     Query(query): Query<DashboardQuery>,
 ) -> Result<Markup, AppError> {
-    let provider = load_active_provider_summary(&state.config_dir)?;
     let selected_user = normalize_user(query.user.clone());
     let include_archived = query.include_archived.unwrap_or(false);
+    let c_provider = state.daemon.clone();
     let c_users = state.daemon.clone();
     let c_tasks = state.daemon.clone();
     let c_all_tasks = state.daemon.clone();
@@ -220,7 +227,8 @@ async fn dashboard(
     let c_catalog = state.daemon.clone();
     let c_status = state.daemon.clone();
     let c_roles = state.daemon.clone();
-    let (users, tasks, all_tasks, approvals, sessions, memories, catalog, status, roles) = tokio::join!(
+    let (provider_view, users, tasks, all_tasks, approvals, sessions, memories, catalog, status, roles) = tokio::join!(
+        c_provider.show_provider_config(None, false),
         c_users.list_users(),
         c_tasks.list_tasks(selected_user.clone(), 10),
         c_all_tasks.list_tasks(selected_user.clone(), 10_000),
@@ -231,6 +239,7 @@ async fn dashboard(
         c_status.status(),
         c_roles.list_roles(),
     );
+    let provider_view = provider_view?;
     let users = users?;
     let tasks = tasks?;
     let all_tasks = all_tasks?;
@@ -284,7 +293,7 @@ async fn dashboard(
                 div class="console-body" {
                     h1 class="console-title" { "BeaverKi dashboard" }
                     p class="console-sub" { "Local operator console — run tasks, clear approvals, inspect sessions." }
-                    (runtime_provider_panel(&provider))
+                    (runtime_provider_panel(&provider_view.selected_provider, active_user.as_deref()))
                 }
                 div class="stat-notes" {
                     (stat_note("Tasks run", &total_tasks.to_string(), "all time"))
@@ -425,6 +434,38 @@ async fn dashboard(
     ))
 }
 
+async fn settings_page(
+    State(state): State<AppState>,
+    Query(query): Query<SettingsQuery>,
+) -> Result<Markup, AppError> {
+    let active_user = normalize_user(query.user.clone());
+    let provider_view = state
+        .daemon
+        .show_provider_config(query.provider.clone(), true)
+        .await?;
+    let body = html! {
+        header class="page-header" {
+            div class="page-header-copy" {
+                p class="eyebrow" { "Settings" }
+                h1 { "Model provider settings" }
+                p class="lede" {
+                    "Change the active provider, base URL, and role-specific models. Restart the daemon after saving so future tasks use the updated runtime configuration."
+                }
+            }
+            div class="page-header-actions" {
+                a class="secondary-link" href=(dashboard_link(active_user.as_deref(), false)) { "Back to dashboard" }
+            }
+        }
+        (provider_settings_panel(
+            &provider_view,
+            active_user.as_deref(),
+            query.provider_saved.unwrap_or(false),
+        ))
+    };
+
+    Ok(page_shell("Settings", active_user.as_deref(), html! {}, body))
+}
+
 async fn submit_task(
     State(state): State<AppState>,
     Form(form): Form<TaskForm>,
@@ -446,6 +487,29 @@ async fn submit_task(
     Ok(Redirect::to(&task_link(
         &task.task_id,
         normalize_user(form.user).as_deref(),
+    )))
+}
+
+async fn save_provider_config(
+    State(state): State<AppState>,
+    Form(form): Form<ProviderConfigForm>,
+) -> Result<Redirect, AppError> {
+    let user = normalize_user(form.user.clone());
+    state
+        .daemon
+        .update_provider_config(ProviderConfigUpdate {
+            provider_id: form.provider_id.clone(),
+            base_url: form.base_url,
+            planner_model: form.planner_model,
+            executor_model: form.executor_model,
+            summarizer_model: form.summarizer_model,
+            safety_review_model: form.safety_review_model,
+        })
+        .await?;
+    Ok(Redirect::to(&settings_link(
+        user.as_deref(),
+        Some(form.provider_id.as_str()),
+        true,
     )))
 }
 
@@ -1972,10 +2036,10 @@ a { color: inherit; }
 .provider-panel {
     margin-top: 18px;
     padding: 16px 18px;
-    border: 1px solid rgba(154, 220, 255, 0.18);
+    border: 1px solid var(--line);
     border-radius: var(--radius-sm);
-    background: rgba(8, 23, 40, 0.58);
-    backdrop-filter: blur(8px);
+    background: var(--panel);
+    box-shadow: var(--shadow);
 }
 .provider-panel-header {
     display: flex;
@@ -1989,12 +2053,24 @@ a { color: inherit; }
     margin: 0 0 4px;
     font-size: 1rem;
     font-weight: 700;
-    color: white;
+    color: var(--ink);
 }
 .provider-panel-header p {
     margin: 0;
-    color: rgba(235, 248, 255, 0.62);
+    color: var(--muted);
     font-size: 0.88rem;
+}
+.provider-selection-form {
+    margin-top: 16px;
+    margin-bottom: 16px;
+}
+.provider-selection-form label,
+.provider-edit-form label {
+    color: var(--muted);
+}
+.provider-selection-form select,
+.provider-edit-form input[type=text] {
+    background: #fff;
 }
 .provider-meta {
     display: flex;
@@ -2006,30 +2082,66 @@ a { color: inherit; }
     align-items: center;
     padding: 5px 10px;
     border-radius: 999px;
-    background: rgba(255, 255, 255, 0.08);
-    border: 1px solid rgba(154, 220, 255, 0.16);
-    color: rgba(240, 250, 255, 0.86);
+    background: var(--panel-2);
+    border: 1px solid var(--line);
+    color: var(--muted);
     font-size: 0.78rem;
     font-weight: 600;
 }
 .provider-token.accent {
-    background: rgba(19, 185, 255, 0.14);
-    border-color: rgba(19, 185, 255, 0.28);
-    color: var(--cyan-2);
+    background: rgba(19, 185, 255, 0.1);
+    border-color: rgba(19, 185, 255, 0.24);
+    color: var(--accent-strong);
 }
 .provider-grid {
     display: grid;
     grid-template-columns: repeat(2, minmax(0, 1fr));
     gap: 10px 14px;
 }
+.provider-edit-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 14px;
+    margin-top: 16px;
+    align-items: start;
+}
+.provider-edit-grid > :first-child {
+    grid-column: 1 / -1;
+}
+.provider-model-control {
+    display: grid;
+    gap: 8px;
+}
+.provider-model-picker {
+    display: grid;
+    gap: 6px;
+}
+.provider-model-picker span,
+.provider-model-custom span {
+    display: block;
+    font-size: 0.74rem;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--muted);
+}
+.provider-model-picker select,
+.provider-model-custom input[type=text] {
+    background: #fff;
+}
+.provider-model-help {
+    margin: -2px 0 0;
+    color: var(--muted);
+    font-size: 0.78rem;
+}
 .provider-field {
     padding-top: 10px;
-    border-top: 1px solid rgba(154, 220, 255, 0.12);
+    border-top: 1px solid var(--line);
 }
 .provider-field-label {
     display: block;
     margin-bottom: 4px;
-    color: rgba(235, 248, 255, 0.56);
+    color: var(--muted);
     font-size: 0.73rem;
     font-weight: 700;
     letter-spacing: 0.08em;
@@ -2037,11 +2149,103 @@ a { color: inherit; }
 }
 .provider-field-value {
     display: block;
-    color: white;
+    color: var(--ink);
     font-size: 0.92rem;
     font-weight: 600;
     line-height: 1.4;
     word-break: break-word;
+}
+.provider-note {
+    margin: 12px 0 0;
+    color: var(--muted);
+    font-size: 0.85rem;
+}
+.provider-discovery-note {
+    margin: 16px 0 0;
+    padding: 10px 12px;
+    border-radius: var(--radius-sm);
+    border: 1px solid rgba(19, 185, 255, 0.16);
+    background: rgba(19, 185, 255, 0.06);
+    color: var(--ink);
+    font-size: 0.85rem;
+}
+.provider-discovery-note strong {
+    color: var(--accent-strong);
+}
+.provider-discovery-note-warn {
+    border-color: rgba(244, 155, 35, 0.24);
+    background: rgba(244, 155, 35, 0.1);
+    color: #8a4b04;
+}
+.provider-save-note {
+    margin: 16px 0 0;
+    padding: 10px 12px;
+    border-radius: var(--radius-sm);
+    border: 1px solid rgba(40, 183, 123, 0.18);
+    background: rgba(40, 183, 123, 0.08);
+    color: #145c40;
+    font-size: 0.85rem;
+}
+.provider-save-note strong {
+    color: #0f5132;
+}
+.provider-actions {
+    display: flex;
+    gap: 10px;
+    align-items: center;
+    margin-top: 16px;
+}
+.console-hero .provider-panel {
+    border-color: rgba(154, 220, 255, 0.18);
+    background: rgba(8, 23, 40, 0.58);
+    backdrop-filter: blur(8px);
+    box-shadow: none;
+}
+.console-hero .provider-panel-header h2,
+.console-hero .provider-field-value,
+.console-hero .provider-save-note strong,
+.console-hero .provider-discovery-note strong {
+    color: white;
+}
+.console-hero .provider-panel-header p,
+.console-hero .provider-selection-form label,
+.console-hero .provider-edit-form label,
+.console-hero .provider-model-picker span,
+.console-hero .provider-model-custom span,
+.console-hero .provider-field-label,
+.console-hero .provider-note {
+    color: rgba(235, 248, 255, 0.68);
+}
+.console-hero .provider-model-help {
+    color: rgba(235, 248, 255, 0.62);
+}
+.console-hero .provider-token {
+    background: rgba(255, 255, 255, 0.08);
+    border-color: rgba(154, 220, 255, 0.16);
+    color: rgba(240, 250, 255, 0.86);
+}
+.console-hero .provider-token.accent {
+    background: rgba(19, 185, 255, 0.14);
+    border-color: rgba(19, 185, 255, 0.28);
+    color: var(--cyan-2);
+}
+.console-hero .provider-field {
+    border-top-color: rgba(154, 220, 255, 0.12);
+}
+.console-hero .provider-discovery-note {
+    border-color: rgba(19, 185, 255, 0.22);
+    background: rgba(19, 185, 255, 0.08);
+    color: rgba(220, 245, 255, 0.9);
+}
+.console-hero .provider-discovery-note-warn {
+    border-color: rgba(244, 155, 35, 0.28);
+    background: rgba(244, 155, 35, 0.12);
+    color: #ffd37d;
+}
+.console-hero .provider-save-note {
+    border-color: rgba(103, 217, 255, 0.2);
+    background: rgba(19, 185, 255, 0.08);
+    color: #dff7ff;
 }
 /* Stat notes */
 .stat-notes {
@@ -2309,7 +2513,7 @@ code {
 /* Session / memory standalone cards */
 .session-card, .list-item:not(.list .list-item) { margin-bottom: 10px; }
 @media (max-width: 920px) {
-    .two-up, .three-up, .catalog-grid, .automation-layout, .workspace-layout, .provider-grid { grid-template-columns: 1fr; }
+    .two-up, .three-up, .catalog-grid, .automation-layout, .workspace-layout, .provider-grid, .provider-edit-grid { grid-template-columns: 1fr; }
   .page { padding: 0 14px 40px; }
   .topbar { height: auto; padding: 12px 14px; }
   .console-lead { flex-direction: column; gap: 12px; }
@@ -2329,6 +2533,7 @@ code {
                         (topbar_extra)
                         nav class="topnav" {
                             a href=(dashboard_link(user, false)) { "Dashboard" }
+                            a href=(settings_link(user, None, false)) { "Settings" }
                             a href=(workflow_editor_link(None, user)) { "New workflow" }
                         }
                     }
@@ -2393,39 +2598,21 @@ fn stat_note(label: &str, value: &str, desc: &str) -> Markup {
     }
 }
 
-fn load_active_provider_summary(config_dir: &PathBuf) -> Result<ActiveProviderSummary> {
-    let config = LoadedConfig::load_from_dir(config_dir)
-        .with_context(|| format!("failed to load {}", config_dir.display()))?;
-    let provider = config.providers.active_provider()?;
-    Ok(ActiveProviderSummary::from_entry(provider))
-}
-
-impl ActiveProviderSummary {
-    fn from_entry(entry: &ProviderEntry) -> Self {
-        Self {
-            provider_id: entry.provider_id.clone(),
-            kind: entry.kind.clone(),
-            base_url: entry.base_url.clone(),
-            planner: entry.models.planner.clone(),
-            executor: entry.models.executor.clone(),
-            summarizer: entry.models.summarizer.clone(),
-            safety_review: entry.models.safety_review.clone(),
-            tool_calling: entry.capabilities.tool_calling,
-        }
-    }
-}
-
-fn runtime_provider_panel(provider: &ActiveProviderSummary) -> Markup {
+fn runtime_provider_panel(
+    provider: &ActiveProviderSummary,
+    user: Option<&str>,
+) -> Markup {
     html! {
         section class="provider-panel" {
             div class="provider-panel-header" {
                 div {
                     h2 { "Active model runtime" }
-                    p { "The web UI reads the active provider configuration on each dashboard refresh." }
+                    p { "View the current provider and jump to settings when you need to change runtime configuration." }
                 }
                 div class="provider-meta" {
                     span class="provider-token accent" { (provider_kind_label(&provider.kind)) }
                     span class="provider-token" { "ID: " (&provider.provider_id) }
+                    span class="provider-token" { "Currently active" }
                     span class="provider-token" {
                         @if provider.tool_calling {
                             "Tool calling enabled"
@@ -2441,6 +2628,151 @@ fn runtime_provider_panel(provider: &ActiveProviderSummary) -> Markup {
                 (provider_field("Executor", &provider.executor))
                 (provider_field("Summarizer", &provider.summarizer))
                 (provider_field("Safety review", &provider.safety_review))
+            }
+            div class="provider-actions" {
+                a class="secondary-link" href=(settings_link(user, Some(provider.provider_id.as_str()), false)) { "Open settings" }
+            }
+        }
+    }
+}
+
+fn provider_settings_panel(
+    provider_view: &ProviderConfigView,
+    user: Option<&str>,
+    provider_saved: bool,
+) -> Markup {
+    let provider = &provider_view.selected_provider;
+    html! {
+        section class="provider-panel" {
+            div class="provider-panel-header" {
+                div {
+                    h2 { "Provider configuration" }
+                    p { "Pick the provider BeaverKi should use for future tasks, then update the base URL and model roles as needed." }
+                }
+                div class="provider-meta" {
+                    span class="provider-token accent" { (provider_kind_label(&provider.kind)) }
+                    span class="provider-token" { "ID: " (&provider.provider_id) }
+                    @if provider.provider_id == provider_view.active_provider_id {
+                        span class="provider-token" { "Currently active" }
+                    } @else {
+                        span class="provider-token" { "Will become active on save" }
+                    }
+                    span class="provider-token" {
+                        @if provider.tool_calling {
+                            "Tool calling enabled"
+                        } @else {
+                            "Tool calling disabled"
+                        }
+                    }
+                }
+            }
+            div class="provider-grid" {
+                (provider_field("Base URL", provider.base_url.as_deref().unwrap_or("Hosted default")))
+                (provider_field("Planner", &provider.planner))
+                (provider_field("Executor", &provider.executor))
+                (provider_field("Summarizer", &provider.summarizer))
+                (provider_field("Safety review", &provider.safety_review))
+            }
+            @if provider_saved {
+                p class="provider-save-note" {
+                    strong { "Saved." }
+                    " Restart the daemon so new tasks use the updated provider, base URL, or model settings."
+                }
+            }
+            @if let Some(error) = &provider_view.available_models_error {
+                p class="provider-discovery-note provider-discovery-note-warn" {
+                    strong { "Model suggestions unavailable." }
+                    " "
+                    (error)
+                }
+            } @else if !provider_view.available_models.is_empty() {
+                p class="provider-discovery-note" {
+                    strong { (provider_view.available_models.len()) }
+                    " model suggestions loaded through the daemon. You can still type a custom model name if the one you want is not listed."
+                }
+            }
+            form method="get" action="/settings" class="toolbar-form provider-selection-form" {
+                @if let Some(user) = user {
+                    input type="hidden" name="user" value=(user);
+                }
+                label {
+                    span { "Provider to use" }
+                    select name="provider" onchange="this.form.submit()" {
+                        @for option in &provider_view.provider_options {
+                            option value=(&option.provider_id) selected[option.provider_id == provider.provider_id] {
+                                (&option.provider_id) " · " (provider_kind_label(&option.kind))
+                            }
+                        }
+                    }
+                }
+            }
+            form method="post" action="/providers/save" class="stacked-form provider-edit-form" {
+                @if let Some(user) = user {
+                    input type="hidden" name="user" value=(user);
+                }
+                input type="hidden" name="provider_id" value=(&provider.provider_id);
+                div class="provider-edit-grid" {
+                    label {
+                        span { "Base URL" }
+                        input type="text" name="base_url" value=(provider.base_url.as_deref().unwrap_or("")) placeholder={(if provider.kind == "lm_studio" { "http://127.0.0.1:1234/v1" } else { "Optional override" })};
+                    }
+                    (provider_model_input("Planner model", "planner_model", &provider.planner, &provider_view.available_models))
+                    (provider_model_input("Executor model", "executor_model", &provider.executor, &provider_view.available_models))
+                    (provider_model_input("Summarizer model", "summarizer_model", &provider.summarizer, &provider_view.available_models))
+                    (provider_model_input("Safety review model", "safety_review_model", &provider.safety_review, &provider_view.available_models))
+                }
+                p class="provider-note" {
+                    @if provider.kind == "lm_studio" {
+                        "LM Studio usually needs a local base URL. BeaverKi trims trailing slashes when saving. Model suggestions are fetched through the daemon from the configured provider entry."
+                    } @else {
+                        "Hosted providers can usually leave Base URL blank unless you intentionally need a compatible API override. Model suggestions are fetched through the daemon when credentials allow it."
+                    }
+                }
+                div class="provider-actions" {
+                    button type="submit" class="primary" { "Save provider config" }
+                }
+            }
+        }
+    }
+}
+
+fn provider_model_input(
+    label: &str,
+    name: &str,
+    value: &str,
+    available_models: &[String],
+) -> Markup {
+    let input_id = format!("provider-model-{name}");
+    let has_current_option = available_models.iter().any(|model| model == value);
+    html! {
+        div class="provider-model-control" {
+            span { (label) }
+            @if !available_models.is_empty() {
+                label class="provider-model-picker" {
+                    span { "Suggested models" }
+                    select onchange=(format!("if (this.value) document.getElementById('{}').value = this.value;", input_id)) {
+                        option value="" selected[!has_current_option] { "Choose a discovered model" }
+                        @if !has_current_option && !value.trim().is_empty() {
+                            option value=(value) selected { "Current custom value: " (value) }
+                        }
+                        @for model in available_models {
+                            option value=(model) selected[model == value] { (model) }
+                        }
+                    }
+                }
+            }
+            label class="provider-model-custom" {
+                span {
+                    @if available_models.is_empty() {
+                        "Model name"
+                    } @else {
+                        "Selected or custom model"
+                    }
+                }
+                input id=(input_id) type="text" name=(name) value=(value);
+            }
+            @if !available_models.is_empty() {
+                p class="provider-model-help" { "Pick a discovered model from the dropdown or type any custom model name below." }
             }
         }
     }
@@ -2514,6 +2846,33 @@ fn non_empty(value: String) -> Option<String> {
 }
 
 fn dashboard_link(user: Option<&str>, include_archived: bool) -> String {
+    dashboard_link_with_provider(user, include_archived, None, false)
+}
+
+fn settings_link(user: Option<&str>, provider: Option<&str>, provider_saved: bool) -> String {
+    let mut params = Vec::new();
+    if let Some(user) = user {
+        params.push(format!("user={user}"));
+    }
+    if let Some(provider) = provider {
+        params.push(format!("provider={provider}"));
+    }
+    if provider_saved {
+        params.push(String::from("provider_saved=true"));
+    }
+    if params.is_empty() {
+        String::from("/settings")
+    } else {
+        format!("/settings?{}", params.join("&"))
+    }
+}
+
+fn dashboard_link_with_provider(
+    user: Option<&str>,
+    include_archived: bool,
+    provider: Option<&str>,
+    provider_saved: bool,
+) -> String {
     let mut path = "/".to_owned();
     let mut params = Vec::new();
     if let Some(user) = user {
@@ -2521,6 +2880,12 @@ fn dashboard_link(user: Option<&str>, include_archived: bool) -> String {
     }
     if include_archived {
         params.push("include_archived=true".to_owned());
+    }
+    if let Some(provider) = provider {
+        params.push(format!("provider={provider}"));
+    }
+    if provider_saved {
+        params.push("provider_saved=true".to_owned());
     }
     if !params.is_empty() {
         path.push('?');

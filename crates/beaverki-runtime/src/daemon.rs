@@ -5,12 +5,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
-use beaverki_config::LoadedConfig;
+use beaverki_config::{LoadedConfig, ProviderEntry, SecretStore, write_providers_config};
 use beaverki_core::{TaskState, now_rfc3339};
 use beaverki_db::{
     ApprovalRow, Database, MemoryRow, RoleRow, RuntimeSessionRow, ScheduleRow, TaskRow,
     WorkflowDefinitionRow,
 };
+use beaverki_models::{LmStudioProvider, OpenAiProvider};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -84,10 +85,54 @@ impl DaemonStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActiveProviderSummary {
+    pub provider_id: String,
+    pub kind: String,
+    pub base_url: Option<String>,
+    pub planner: String,
+    pub executor: String,
+    pub summarizer: String,
+    pub safety_review: String,
+    pub tool_calling: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderOption {
+    pub provider_id: String,
+    pub kind: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderConfigView {
+    pub active_provider_id: String,
+    pub selected_provider: ActiveProviderSummary,
+    pub provider_options: Vec<ProviderOption>,
+    pub available_models: Vec<String>,
+    pub available_models_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderConfigUpdate {
+    pub provider_id: String,
+    pub base_url: String,
+    pub planner_model: String,
+    pub executor_model: String,
+    pub summarizer_model: String,
+    pub safety_review_model: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DaemonRequest {
     Ping,
     Status,
+    ShowProviderConfig {
+        provider_id: Option<String>,
+        include_available_models: bool,
+    },
+    UpdateProviderConfig {
+        update: ProviderConfigUpdate,
+    },
     ListUsers,
     ListRoles,
     CreateUser {
@@ -210,6 +255,7 @@ pub enum DaemonRequest {
 pub enum DaemonResponse {
     Pong { status: DaemonStatus },
     Status { status: DaemonStatus },
+    ProviderConfig { view: ProviderConfigView },
     Users { users: Vec<UserSummary> },
     User { user: UserSummary },
     Roles { roles: Vec<RoleRow> },
@@ -281,6 +327,33 @@ impl DaemonClient {
         match self.request(DaemonRequest::Status).await? {
             DaemonResponse::Status { status } => Ok(status),
             other => Err(anyhow!("unexpected daemon status response: {other:?}")),
+        }
+    }
+
+    pub async fn show_provider_config(
+        &self,
+        provider_id: Option<String>,
+        include_available_models: bool,
+    ) -> Result<ProviderConfigView> {
+        match self
+            .request(DaemonRequest::ShowProviderConfig {
+                provider_id,
+                include_available_models,
+            })
+            .await?
+        {
+            DaemonResponse::ProviderConfig { view } => Ok(view),
+            other => Err(anyhow!("unexpected daemon provider config response: {other:?}")),
+        }
+    }
+
+    pub async fn update_provider_config(&self, update: ProviderConfigUpdate) -> Result<String> {
+        match self
+            .request(DaemonRequest::UpdateProviderConfig { update })
+            .await?
+        {
+            DaemonResponse::Ack { message } => Ok(message),
+            other => Err(anyhow!("unexpected daemon provider config update response: {other:?}")),
         }
     }
 
@@ -795,9 +868,16 @@ impl DaemonClient {
 pub struct RuntimeDaemon {
     pub(crate) runtime: Arc<Runtime>,
     socket_path: PathBuf,
+    config_access: Option<DaemonConfigAccess>,
     pub(crate) shutdown: Arc<Notify>,
     pub(crate) wake_worker: Arc<Notify>,
     status: Arc<RwLock<DaemonStatus>>,
+}
+
+#[derive(Clone)]
+struct DaemonConfigAccess {
+    config_dir: PathBuf,
+    passphrase: String,
 }
 
 impl RuntimeDaemon {
@@ -807,14 +887,117 @@ impl RuntimeDaemon {
         Self {
             runtime: Arc::new(runtime),
             socket_path,
+            config_access: None,
             shutdown: Arc::new(Notify::new()),
             wake_worker: Arc::new(Notify::new()),
             status: Arc::new(RwLock::new(status)),
         }
     }
 
+    pub fn with_config_access(
+        mut self,
+        config_dir: impl Into<PathBuf>,
+        passphrase: impl Into<String>,
+    ) -> Self {
+        self.config_access = Some(DaemonConfigAccess {
+            config_dir: config_dir.into(),
+            passphrase: passphrase.into(),
+        });
+        self
+    }
+
     pub fn socket_path(&self) -> &Path {
         &self.socket_path
+    }
+
+    fn config_access(&self) -> Result<&DaemonConfigAccess> {
+        self.config_access
+            .as_ref()
+            .ok_or_else(|| anyhow!("daemon config access is not available"))
+    }
+
+    async fn load_provider_config_view(
+        &self,
+        selected_provider_id: Option<&str>,
+        include_available_models: bool,
+    ) -> Result<ProviderConfigView> {
+        let access = self.config_access()?;
+        let config = LoadedConfig::load_from_dir(&access.config_dir)
+            .with_context(|| format!("failed to load {}", access.config_dir.display()))?;
+        let active_provider = config.providers.active_provider()?;
+        let provider_options = config
+            .providers
+            .entries
+            .iter()
+            .map(|entry| ProviderOption {
+                provider_id: entry.provider_id.clone(),
+                kind: entry.kind.clone(),
+            })
+            .collect::<Vec<_>>();
+        let selected_provider = selected_provider_id
+            .and_then(|provider_id| {
+                config
+                    .providers
+                    .entries
+                    .iter()
+                    .find(|entry| entry.provider_id == provider_id)
+            })
+            .unwrap_or(active_provider);
+
+        let (available_models, available_models_error) = if include_available_models {
+            match load_provider_model_options(&config, selected_provider, &access.passphrase).await {
+                Ok(models) => (models, None),
+                Err(error) => (Vec::new(), Some(error.to_string())),
+            }
+        } else {
+            (Vec::new(), None)
+        };
+
+        Ok(ProviderConfigView {
+            active_provider_id: config.providers.active.clone(),
+            selected_provider: ActiveProviderSummary::from_entry(selected_provider),
+            provider_options,
+            available_models,
+            available_models_error,
+        })
+    }
+
+    async fn update_provider_config(&self, update: &ProviderConfigUpdate) -> Result<()> {
+        let access = self.config_access()?;
+        let mut config = LoadedConfig::load_from_dir(&access.config_dir)
+            .with_context(|| format!("failed to load {}", access.config_dir.display()))?;
+        let provider = config
+            .providers
+            .entries
+            .iter_mut()
+            .find(|entry| entry.provider_id == update.provider_id)
+            .ok_or_else(|| anyhow!("provider '{}' not found", update.provider_id))?;
+
+        provider.base_url = match provider.kind.as_str() {
+            "lm_studio" => Some(required_base_url(&update.base_url)?),
+            _ => normalize_optional_base_url(&update.base_url)?,
+        };
+        provider.models.planner = required_text(&update.planner_model, "planner model")?;
+        provider.models.executor = required_text(&update.executor_model, "executor model")?;
+        provider.models.summarizer = required_text(&update.summarizer_model, "summarizer model")?;
+        provider.models.safety_review =
+            required_text(&update.safety_review_model, "safety review model")?;
+        config.providers.active = update.provider_id.clone();
+
+        write_providers_config(&access.config_dir, &config.providers)?;
+        self.runtime
+            .db
+            .record_audit_event(
+                "runtime",
+                &self.current_session_id().await,
+                "provider_config_updated",
+                json!({
+                    "provider_id": update.provider_id,
+                    "active_provider_id": config.providers.active,
+                }),
+            )
+            .await?;
+        Ok(())
     }
 
     pub async fn run_until<F>(self, shutdown_signal: F) -> Result<()>
@@ -1133,6 +1316,26 @@ impl RuntimeDaemon {
                 },
                 false,
             )),
+            DaemonRequest::ShowProviderConfig {
+                provider_id,
+                include_available_models,
+            } => Ok((
+                DaemonResponse::ProviderConfig {
+                    view: self
+                        .load_provider_config_view(provider_id.as_deref(), include_available_models)
+                        .await?,
+                },
+                false,
+            )),
+            DaemonRequest::UpdateProviderConfig { update } => {
+                self.update_provider_config(&update).await?;
+                Ok((
+                    DaemonResponse::Ack {
+                        message: "provider config saved".to_owned(),
+                    },
+                    false,
+                ))
+            }
             DaemonRequest::ListUsers => Ok((
                 DaemonResponse::Users {
                     users: self.runtime.list_user_summaries().await?,
@@ -1763,6 +1966,75 @@ fn is_benign_client_disconnect(error: &anyhow::Error) -> bool {
                 )
             })
     })
+}
+
+impl ActiveProviderSummary {
+    fn from_entry(entry: &ProviderEntry) -> Self {
+        Self {
+            provider_id: entry.provider_id.clone(),
+            kind: entry.kind.clone(),
+            base_url: entry.base_url.clone(),
+            planner: entry.models.planner.clone(),
+            executor: entry.models.executor.clone(),
+            summarizer: entry.models.summarizer.clone(),
+            safety_review: entry.models.safety_review.clone(),
+            tool_calling: entry.capabilities.tool_calling,
+        }
+    }
+}
+
+async fn load_provider_model_options(
+    config: &LoadedConfig,
+    provider: &ProviderEntry,
+    passphrase: &str,
+) -> Result<Vec<String>> {
+    match provider.kind.as_str() {
+        "lm_studio" => LmStudioProvider::from_entry(provider)?.list_models().await,
+        "openai" => {
+            if provider.auth.mode != "api_token" {
+                bail!(
+                    "OpenAI provider '{}' requires auth.mode 'api_token'",
+                    provider.provider_id
+                );
+            }
+            let secret_ref = provider.auth.secret_ref.as_deref().ok_or_else(|| {
+                anyhow!(
+                    "OpenAI provider '{}' requires auth.secret_ref",
+                    provider.provider_id
+                )
+            })?;
+            let secret_store = SecretStore::new(&config.runtime.secret_dir);
+            let api_token = secret_store.read_secret(secret_ref, passphrase)?;
+            OpenAiProvider::from_entry(provider, api_token)?
+                .list_models()
+                .await
+        }
+        other => bail!("provider '{}' kind '{}' does not support model discovery", provider.provider_id, other),
+    }
+}
+
+fn required_text(value: &str, label: &str) -> Result<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        bail!("{label} cannot be empty");
+    }
+    Ok(trimmed.to_owned())
+}
+
+fn normalize_optional_base_url(value: &str) -> Result<Option<String>> {
+    let trimmed = value.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(trimmed.to_owned()))
+}
+
+fn required_base_url(value: &str) -> Result<String> {
+    let trimmed = value.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        bail!("base URL cannot be empty for LM Studio providers");
+    }
+    Ok(trimmed.to_owned())
 }
 
 pub async fn load_daemon_client(config_dir: impl AsRef<Path>) -> Result<DaemonClient> {

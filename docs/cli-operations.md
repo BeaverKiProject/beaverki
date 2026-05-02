@@ -168,6 +168,8 @@ cargo run -p beaverki-web -- --config-dir /path/to/config
 
 By default the UI listens on `127.0.0.1:7676`.
 
+Use the Settings page in the local UI when you need to change the active model provider, adjust an LM Studio base URL, or update planner, executor, summarizer, and safety-review model IDs. The settings form asks the daemon to fetch model suggestions from the selected provider when discovery is supported, while still allowing custom model names. Saving provider changes updates `providers.yaml`; restart the daemon afterward so new tasks use the new runtime configuration.
+
 Design and access model for the first slice:
 
 - the web UI talks to the BeaverKi daemon through the supported daemon client surface rather than reading SQLite directly
@@ -178,6 +180,7 @@ Design and access model for the first slice:
 Current operator flows in the UI include:
 
 - submit tasks and inspect results
+- review the active runtime provider from the dashboard and change provider settings from the dedicated Settings page
 - inspect and resolve pending approvals
 - inspect and reset or archive sessions
 - inspect recent memory

@@ -116,6 +116,35 @@ impl OpenAiProvider {
             response.text().await.ok(),
         ))
     }
+
+    pub async fn list_models(&self) -> Result<Vec<String>> {
+        let response = self
+            .client
+            .get("https://api.openai.com/v1/models")
+            .bearer_auth(&self.api_token)
+            .send()
+            .await
+            .context("failed to contact OpenAI while listing models")?;
+
+        let status = response.status();
+        if !status.is_success() {
+            return Err(openai_http_error(status, response.text().await.ok()));
+        }
+
+        let parsed: OpenAiCompatibleModelsResponse = response
+            .json()
+            .await
+            .context("failed to parse OpenAI model list")?;
+
+        let mut ids = parsed
+            .data
+            .into_iter()
+            .map(|model| model.id)
+            .collect::<Vec<_>>();
+        ids.sort();
+        ids.dedup();
+        Ok(ids)
+    }
 }
 
 impl LmStudioProvider {

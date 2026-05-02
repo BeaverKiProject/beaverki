@@ -65,6 +65,7 @@ Current first-party integrations and assumptions:
    ```
 
    By default it listens on `http://127.0.0.1:7676`.
+   Use the Settings link in the web UI to review or change the active provider, base URL, and model roles. The settings form fetches model suggestions through the daemon when the provider supports discovery, but still lets you type a custom model name. Restart the daemon after saving provider changes.
 
 6. Run a first task.
 
