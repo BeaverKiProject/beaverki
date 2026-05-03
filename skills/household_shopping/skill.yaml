@@ -5,6 +5,7 @@ tools:
       Read a household shopping list stored on a shared Notion page and return the current list items.
       This focuses on to-do and list-style blocks so the agent can reason over a practical shopping list
       without parsing the whole page manually.
+      If page_ref is stale or inaccessible, BeaverKi falls back to page_query/page_title_hint search.
     source_path: shopping_list_get.lua
     input_schema:
       type: object
@@ -66,6 +67,7 @@ tools:
     description: >
       Append one or more unchecked shopping-list items to a shared Notion page using native Notion to-do blocks.
       If no page_ref is provided, BeaverKi searches Notion for the most likely shopping-list page first.
+      If page_ref is stale or inaccessible, BeaverKi falls back to page_query/page_title_hint search.
     source_path: shopping_list_add_items.lua
     input_schema:
       type: object

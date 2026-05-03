@@ -113,6 +113,8 @@ pub struct LuaExecutionInput {
     pub notion_api_base_url: Option<String>,
     pub notion_api_version: Option<String>,
     pub notion_api_token: Option<String>,
+    pub notion_default_parent_kind: Option<String>,
+    pub notion_default_parent_ref: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -373,6 +375,8 @@ pub async fn execute_lua_script(input: LuaExecutionInput) -> Result<LuaExecution
     let notion_api_base_url = input.notion_api_base_url.clone();
     let notion_api_version = input.notion_api_version.clone();
     let notion_api_token = input.notion_api_token.clone();
+    let notion_default_parent_kind = input.notion_default_parent_kind.clone();
+    let notion_default_parent_ref = input.notion_default_parent_ref.clone();
     let deferred_until = Arc::new(Mutex::new(None::<String>));
     let notifications = Arc::new(Mutex::new(Vec::<String>::new()));
     let logs = Arc::new(Mutex::new(Vec::<String>::new()));
@@ -535,6 +539,8 @@ pub async fn execute_lua_script(input: LuaExecutionInput) -> Result<LuaExecution
         let notion_api_base_url = notion_api_base_url.clone();
         let notion_api_version = notion_api_version.clone();
         let notion_api_token = notion_api_token.clone();
+        let notion_default_parent_kind = notion_default_parent_kind.clone();
+        let notion_default_parent_ref = notion_default_parent_ref.clone();
         let function = lua
             .create_function(move |lua, (name, args): (String, LuaValue)| {
                 if let Some(allowed_tools) = &allowed_tools
@@ -555,6 +561,8 @@ pub async fn execute_lua_script(input: LuaExecutionInput) -> Result<LuaExecution
                 tool_context.notion_api_base_url = notion_api_base_url.clone();
                 tool_context.notion_api_version = notion_api_version.clone();
                 tool_context.notion_api_token = notion_api_token.clone();
+                tool_context.notion_default_parent_kind = notion_default_parent_kind.clone();
+                tool_context.notion_default_parent_ref = notion_default_parent_ref.clone();
                 let registry = builtin_registry();
                 let handle = tokio::runtime::Handle::current();
                 let output = tokio::task::block_in_place(|| {

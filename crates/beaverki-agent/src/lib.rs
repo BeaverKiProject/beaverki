@@ -2747,6 +2747,8 @@ impl PrimaryAgentRunner {
             notion_api_base_url: tool_context.notion_api_base_url.clone(),
             notion_api_version: tool_context.notion_api_version.clone(),
             notion_api_token: tool_context.notion_api_token.clone(),
+            notion_default_parent_kind: tool_context.notion_default_parent_kind.clone(),
+            notion_default_parent_ref: tool_context.notion_default_parent_ref.clone(),
         })
         .await;
         let execution = match execution {
@@ -4016,6 +4018,8 @@ impl PrimaryAgentRunner {
             notion_api_base_url: tool_context.notion_api_base_url.clone(),
             notion_api_version: tool_context.notion_api_version.clone(),
             notion_api_token: tool_context.notion_api_token.clone(),
+            notion_default_parent_kind: tool_context.notion_default_parent_kind.clone(),
+            notion_default_parent_ref: tool_context.notion_default_parent_ref.clone(),
         })
         .await;
         let execution = match execution {

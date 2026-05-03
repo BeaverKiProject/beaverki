@@ -424,10 +424,18 @@ cargo run -p beaverki-cli -- integration notion configure \
   --api-base-url https://api.notion.com/v1
 ```
 
+Optionally configure a default parent page or data source for new Notion pages. This lets the agent create temporary or scratch pages without spending steps searching for a parent:
+
+```bash
+cargo run -p beaverki-cli -- integration notion configure \
+  --default-parent-kind page \
+  --default-parent-ref <notion-page-url-or-id>
+```
+
 Once enabled, the agent can use:
 
-- built-in tools: `notion_search`, `notion_fetch`, `notion_create_page`, `notion_update_page`, `notion_append_block_children`, `notion_create_comment`
-- packaged skill wrappers from `skills/notion`: `notion_workspace_search`, `notion_read_entry`, `notion_capture_note`, `notion_update_entry`, `notion_append_content`, `notion_comment`
+- built-in tools: `notion_search`, `notion_fetch`, `notion_create_page`, `notion_update_page`, `notion_append_block_children`, `notion_delete_block`, `notion_create_comment`, `notion_api_request`
+- packaged skill wrappers from `skills/notion`: `notion_workspace_search`, `notion_read_entry`, `notion_capture_note`, `notion_update_entry`, `notion_append_content`, `notion_delete_blocks`, `notion_raw_api_request`, `notion_comment`
 
 ## Lua Automation And Schedules
 

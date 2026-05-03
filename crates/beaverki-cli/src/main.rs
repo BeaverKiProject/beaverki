@@ -573,6 +573,12 @@ struct NotionConfigureArgs {
     api_base_url: Option<String>,
     #[arg(long)]
     api_version: Option<String>,
+    #[arg(long)]
+    default_parent_ref: Option<String>,
+    #[arg(long)]
+    default_parent_kind: Option<String>,
+    #[arg(long, default_value_t = false)]
+    clear_default_parent: bool,
     #[arg(long, default_value = "NOTION_API_TOKEN")]
     notion_token_env: String,
     #[arg(long, default_value = "BEAVERKI_MASTER_PASSPHRASE")]
@@ -2765,6 +2771,20 @@ async fn notion_show(args: NotionShowArgs) -> Result<()> {
     println!("API base URL: {}", notion.api_base_url);
     println!("API version: {}", notion.api_version);
     println!(
+        "Default parent kind: {}",
+        notion
+            .default_parent_kind
+            .as_deref()
+            .unwrap_or("<not configured>")
+    );
+    println!(
+        "Default parent ref: {}",
+        notion
+            .default_parent_ref
+            .as_deref()
+            .unwrap_or("<not configured>")
+    );
+    println!(
         "API token secret ref: {}",
         notion
             .api_token_secret_ref
@@ -2827,6 +2847,40 @@ async fn notion_configure(args: NotionConfigureArgs) -> Result<()> {
         }
         notion.api_version = api_version.to_owned();
     }
+    if args.clear_default_parent {
+        if args.default_parent_ref.is_some() || args.default_parent_kind.is_some() {
+            bail!(
+                "--clear-default-parent cannot be combined with --default-parent-ref or --default-parent-kind"
+            );
+        }
+        notion.default_parent_ref = None;
+        notion.default_parent_kind = None;
+    } else {
+        if let Some(default_parent_ref) = args.default_parent_ref {
+            let default_parent_ref = default_parent_ref.trim();
+            if default_parent_ref.is_empty() {
+                bail!("default parent ref cannot be empty");
+            }
+            notion.default_parent_ref = Some(default_parent_ref.to_owned());
+            if notion.default_parent_kind.is_none() {
+                notion.default_parent_kind = Some("page".to_owned());
+            }
+        }
+        if let Some(default_parent_kind) = args.default_parent_kind {
+            let default_parent_kind = default_parent_kind.trim();
+            match default_parent_kind {
+                "page" | "data_source" => {
+                    notion.default_parent_kind = Some(default_parent_kind.to_owned());
+                }
+                _ => bail!("default parent kind must be 'page' or 'data_source'"),
+            }
+        }
+        if notion.default_parent_kind.is_some() && notion.default_parent_ref.is_none() {
+            bail!(
+                "--default-parent-kind requires --default-parent-ref or an existing default parent ref"
+            );
+        }
+    }
 
     if notion.enabled {
         let token_from_env = std::env::var(&args.notion_token_env).ok();
@@ -2866,6 +2920,20 @@ async fn notion_configure(args: NotionConfigureArgs) -> Result<()> {
     println!("Notion enabled: {}", notion.enabled);
     println!("API base URL: {}", notion.api_base_url);
     println!("API version: {}", notion.api_version);
+    println!(
+        "Default parent kind: {}",
+        notion
+            .default_parent_kind
+            .as_deref()
+            .unwrap_or("<not configured>")
+    );
+    println!(
+        "Default parent ref: {}",
+        notion
+            .default_parent_ref
+            .as_deref()
+            .unwrap_or("<not configured>")
+    );
     println!(
         "API token secret ref: {}",
         notion

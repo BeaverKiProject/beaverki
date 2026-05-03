@@ -343,6 +343,8 @@ pub struct NotionConfig {
     pub api_token_secret_ref: Option<String>,
     pub api_base_url: String,
     pub api_version: String,
+    pub default_parent_kind: Option<String>,
+    pub default_parent_ref: Option<String>,
 }
 
 impl Default for NotionConfig {
@@ -352,6 +354,8 @@ impl Default for NotionConfig {
             api_token_secret_ref: None,
             api_base_url: "https://api.notion.com/v1".to_owned(),
             api_version: "2026-03-11".to_owned(),
+            default_parent_kind: None,
+            default_parent_ref: None,
         }
     }
 }
@@ -471,7 +475,9 @@ pub fn write_setup_files(answers: &SetupAnswers) -> Result<SetupArtifacts> {
         features: RuntimeFeatures {
             markdown_exports: true,
         },
-        defaults: RuntimeDefaults { max_agent_steps: 8 },
+        defaults: RuntimeDefaults {
+            max_agent_steps: 12,
+        },
         session_management: SessionManagementConfig::default(),
     };
     let providers = ProvidersConfig {

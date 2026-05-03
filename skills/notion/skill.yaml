@@ -51,6 +51,7 @@ tools:
     kind: lua
     description: >
       Create a new Notion page under a parent page or data source.
+      If parent_kind and parent_ref are null or empty, BeaverKi uses the configured Notion default parent.
       The content field accepts Markdown-like syntax converted into native Notion blocks.
       Block types: headings (# / ## / ###), bullet lists (- or *), numbered lists (1. 2. …),
       to-do items (- [ ] / - [x]), blockquotes (>), fenced code blocks (```lang … ```),
@@ -65,10 +66,10 @@ tools:
       type: object
       properties:
         parent_kind:
-          type: string
-          enum: [page, data_source]
+          type: [string, "null"]
+          enum: [page, data_source, null]
         parent_ref:
-          type: string
+          type: [string, "null"]
         title:
           type: string
         content:
@@ -137,6 +138,56 @@ tools:
       additionalProperties: true
     capability_profile:
       allowed_tools: [notion_append_block_children]
+  - tool_id: notion_delete_blocks
+    kind: lua
+    description: >
+      Delete one or more existing Notion page content blocks by ID or URL.
+      Always use notion_read_entry first to inspect the current page content.blocks, then pass only
+      block IDs from that latest read that should be removed.
+      Deleted blocks are moved to Notion trash and can be restored from Notion.
+      Duplicate, missing, or already-deleted block IDs are skipped idempotently.
+    source_path: notion_delete_blocks.lua
+    input_schema:
+      type: object
+      properties:
+        block_refs:
+          type: array
+          items:
+            type: string
+          minItems: 1
+          maxItems: 100
+      required: [block_refs]
+      additionalProperties: false
+    output_schema:
+      type: object
+      additionalProperties: true
+    capability_profile:
+      allowed_tools: [notion_delete_block]
+  - tool_id: notion_raw_api_request
+    kind: lua
+    description: >
+      Call a Notion REST API endpoint through BeaverKi's configured Notion integration.
+      Use this for current Notion endpoints that do not yet have a dedicated helper, such as views,
+      file uploads, markdown page content, block updates, page move/trash, data source queries,
+      or comment update/delete. The path must be relative to /v1.
+    source_path: notion_raw_api_request.lua
+    input_schema:
+      type: object
+      properties:
+        method:
+          type: string
+          enum: [GET, POST, PATCH, DELETE]
+        path:
+          type: string
+        body_json:
+          type: [string, "null"]
+      required: [method, path, body_json]
+      additionalProperties: false
+    output_schema:
+      type: object
+      additionalProperties: true
+    capability_profile:
+      allowed_tools: [notion_api_request]
   - tool_id: notion_comment
     kind: lua
     description: Leave a comment on a Notion page or block.
