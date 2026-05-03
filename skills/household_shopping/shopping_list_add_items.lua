@@ -9,15 +9,7 @@ local function lower(text)
     return string.lower(trim(text))
 end
 
-local function resolve_page(ctx)
-    if trim(ctx.input.page_ref) ~= "" then
-        return {
-            ref = ctx.input.page_ref,
-            source = "page_ref",
-            search_query = nil,
-        }
-    end
-
+local function search_page(ctx)
     local query = trim(ctx.input.page_query)
     if query == "" then
         query = "shopping list"
@@ -69,6 +61,18 @@ local function resolve_page(ctx)
     }
 end
 
+local function resolve_page(ctx)
+    if trim(ctx.input.page_ref) ~= "" then
+        return {
+            ref = ctx.input.page_ref,
+            source = "page_ref",
+            search_query = nil,
+        }
+    end
+
+    return search_page(ctx)
+end
+
 return function(ctx)
     local lines = {}
     local normalized_items = {}
@@ -86,12 +90,28 @@ return function(ctx)
     end
 
     local resolved_page = resolve_page(ctx)
-    local result = ctx.tool_call("notion_append_block_children", {
+    local ok, result = pcall(ctx.tool_call, "notion_append_block_children", {
         parent_ref = resolved_page.ref,
         content = table.concat(lines, "\n"),
         position = "end",
         after_block_ref = nil,
     })
+    if not ok and resolved_page.source == "page_ref" then
+        local original_error = result
+        resolved_page = search_page(ctx)
+        ok, result = pcall(ctx.tool_call, "notion_append_block_children", {
+            parent_ref = resolved_page.ref,
+            content = table.concat(lines, "\n"),
+            position = "end",
+            after_block_ref = nil,
+        })
+        if not ok then
+            error("shopping_list_add_items could not append to explicit page_ref and fallback search also failed: " .. tostring(original_error) .. " / " .. tostring(result))
+        end
+        resolved_page.source = "page_ref_fallback_search"
+    elseif not ok then
+        error(result)
+    end
 
     return {
         page_ref = resolved_page.ref,

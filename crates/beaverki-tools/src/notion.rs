@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use reqwest::{Client, Method, StatusCode};
@@ -250,15 +252,15 @@ impl Tool for NotionCreatePageTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "notion_create_page".to_owned(),
-            description: "Create a Notion page under a parent page or data source using the configured Notion integration. For data sources, BeaverKi fills the title property automatically when it can infer it from the schema.".to_owned(),
+            description: "Create a Notion page under a parent page or data source using the configured Notion integration. If parent_kind and parent_ref are null or empty, BeaverKi uses the configured Notion default parent. For data sources, BeaverKi fills the title property automatically when it can infer it from the schema.".to_owned(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "parent_kind": {
-                        "type": "string",
-                        "enum": ["page", "data_source"]
+                        "type": ["string", "null"],
+                        "enum": ["page", "data_source", null]
                     },
-                    "parent_ref": { "type": "string" },
+                    "parent_ref": { "type": ["string", "null"] },
                     "title": { "type": "string" },
                     "content": { "type": ["string", "null"] }
                 },
@@ -278,12 +280,12 @@ impl Tool for NotionCreatePageTool {
             .get("parent_kind")
             .and_then(Value::as_str)
             .map(str::trim)
-            .ok_or_else(|| ToolError::Failed(anyhow!("notion_create_page requires parent_kind")))?;
+            .filter(|value| !value.is_empty());
         let parent_ref = input
             .get("parent_ref")
             .and_then(Value::as_str)
             .map(str::trim)
-            .ok_or_else(|| ToolError::Failed(anyhow!("notion_create_page requires parent_ref")))?;
+            .filter(|value| !value.is_empty());
         let title = input
             .get("title")
             .and_then(Value::as_str)
@@ -296,12 +298,14 @@ impl Tool for NotionCreatePageTool {
             .map(str::trim)
             .filter(|value| !value.is_empty());
 
-        let parent_id = notion_id_from_ref(parent_ref).map_err(ToolError::Failed)?;
+        let (parent_kind, parent_ref) =
+            notion_create_parent(parent_kind, parent_ref, context).map_err(ToolError::Failed)?;
+        let parent_id = notion_id_from_ref(&parent_ref).map_err(ToolError::Failed)?;
         let mut body = json!({
             "parent": {},
             "properties": {},
         });
-        match parent_kind {
+        match parent_kind.as_str() {
             "page" => {
                 body["parent"] = json!({
                     "type": "page_id",
@@ -555,6 +559,175 @@ impl Tool for NotionAppendBlockChildrenTool {
 }
 
 pub struct NotionCreateCommentTool;
+
+pub struct NotionDeleteBlockTool;
+
+#[async_trait]
+impl Tool for NotionDeleteBlockTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "notion_delete_block".to_owned(),
+            description: "Delete one or more Notion blocks by ID or URL using the configured Notion integration. Always fetch the current page content first with notion_fetch and delete only block IDs returned by that latest read. This moves each block to Notion trash; duplicate, missing, or already-archived block IDs are skipped idempotently.".to_owned(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "block_refs": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "minItems": 1,
+                        "maxItems": 100
+                    }
+                },
+                "required": ["block_refs"],
+                "additionalProperties": false
+            }),
+        }
+    }
+
+    async fn call(
+        &self,
+        input: Value,
+        context: &ToolContext,
+    ) -> std::result::Result<ToolOutput, ToolError> {
+        let config = notion_client_config(context).map_err(ToolError::Failed)?;
+        let refs = input
+            .get("block_refs")
+            .and_then(Value::as_array)
+            .ok_or_else(|| ToolError::Failed(anyhow!("notion_delete_block requires block_refs")))?;
+        if refs.is_empty() {
+            return Err(ToolError::Failed(anyhow!(
+                "notion_delete_block requires at least one block ref"
+            )));
+        }
+
+        let mut deleted = Vec::new();
+        let mut skipped_duplicates = Vec::new();
+        let mut already_archived_count = 0usize;
+        let mut not_found_count = 0usize;
+        let mut seen = HashSet::new();
+        for reference in refs.iter().take(MAX_APPEND_BLOCKS) {
+            let reference = reference.as_str().map(str::trim).ok_or_else(|| {
+                ToolError::Failed(anyhow!("notion_delete_block block_refs must be strings"))
+            })?;
+            let block_id = notion_id_from_ref(reference).map_err(ToolError::Failed)?;
+            if !seen.insert(block_id.clone()) {
+                skipped_duplicates.push(json!({
+                    "id": block_id,
+                    "reason": "duplicate_block_ref",
+                }));
+                continue;
+            }
+            match notion_request_json(Method::DELETE, &format!("blocks/{block_id}"), None, &config)
+                .await
+            {
+                Ok(response) => {
+                    deleted.push(normalize_block_delete_result(&response, &block_id));
+                }
+                Err(error) if notion_error_is_already_archived(&error) => {
+                    already_archived_count += 1;
+                    deleted.push(normalize_already_archived_block_delete_result(&block_id));
+                }
+                Err(error) if notion_error_is_not_found(&error) => {
+                    not_found_count += 1;
+                    deleted.push(normalize_missing_block_delete_result(&block_id));
+                }
+                Err(error) => {
+                    return Err(ToolError::Failed(error));
+                }
+            }
+        }
+
+        Ok(ToolOutput {
+            payload: json!({
+                "object": "block_delete_list",
+                "requested_count": refs.len(),
+                "deleted_count": deleted.len(),
+                "deleted_blocks": deleted,
+                "skipped_duplicate_count": skipped_duplicates.len(),
+                "skipped_duplicates": skipped_duplicates,
+                "already_archived_count": already_archived_count,
+                "not_found_count": not_found_count,
+                "truncated": refs.len() > MAX_APPEND_BLOCKS,
+            }),
+        })
+    }
+}
+
+pub struct NotionApiRequestTool;
+
+#[async_trait]
+impl Tool for NotionApiRequestTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "notion_api_request".to_owned(),
+            description: "Call a Notion REST API endpoint through BeaverKi's configured Notion integration. Use this for current Notion endpoints that do not yet have a dedicated BeaverKi helper, such as views, file uploads, markdown page content, block updates, page move/trash, data source queries, or comment update/delete. Path must be relative to /v1.".to_owned(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "method": {
+                        "type": "string",
+                        "enum": ["GET", "POST", "PATCH", "DELETE"]
+                    },
+                    "path": { "type": "string" },
+                    "body_json": {
+                        "type": ["string", "null"],
+                        "description": "Optional JSON request body encoded as a string. Use null for requests without a JSON body."
+                    }
+                },
+                "required": ["method", "path", "body_json"],
+                "additionalProperties": false
+            }),
+        }
+    }
+
+    async fn call(
+        &self,
+        input: Value,
+        context: &ToolContext,
+    ) -> std::result::Result<ToolOutput, ToolError> {
+        let config = notion_client_config(context).map_err(ToolError::Failed)?;
+        let method = input
+            .get("method")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ToolError::Failed(anyhow!("notion_api_request requires method")))
+            .and_then(|method| notion_http_method(method).map_err(ToolError::Failed))?;
+        let path = input
+            .get("path")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ToolError::Failed(anyhow!("notion_api_request requires path")))
+            .and_then(|path| notion_api_path(path).map_err(ToolError::Failed))?;
+        let body = input
+            .get("body_json")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|body| {
+                serde_json::from_str::<Value>(body).map_err(|error| {
+                    ToolError::Failed(anyhow!(
+                        "notion_api_request body_json must be valid JSON: {error}"
+                    ))
+                })
+            })
+            .transpose()?;
+
+        let response = notion_request_json(method, &path, body, &config)
+            .await
+            .map_err(ToolError::Failed)?;
+        let serialized = serde_json::to_string(&response).map_err(|error| {
+            ToolError::Failed(anyhow!(
+                "failed to serialize notion_api_request response: {error}"
+            ))
+        })?;
+
+        Ok(ToolOutput {
+            payload: json!({
+                "method": input.get("method").cloned().unwrap_or(Value::Null),
+                "path": path,
+                "response_json": truncate_text(&serialized, context.max_output_chars),
+            }),
+        })
+    }
+}
 
 #[async_trait]
 impl Tool for NotionCreateCommentTool {
@@ -889,12 +1062,86 @@ fn notion_append_position(
     }
 }
 
+fn notion_create_parent(
+    parent_kind: Option<&str>,
+    parent_ref: Option<&str>,
+    context: &ToolContext,
+) -> Result<(String, String)> {
+    match (parent_kind, parent_ref) {
+        (Some(kind), Some(reference)) => {
+            validate_notion_parent_kind(kind)?;
+            Ok((kind.to_owned(), reference.to_owned()))
+        }
+        (None, None) => {
+            let reference = context
+                .notion_default_parent_ref
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    anyhow!(
+                        "notion_create_page requires parent_kind and parent_ref, or a configured Notion default parent"
+                    )
+                })?;
+            let kind = context
+                .notion_default_parent_kind
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("page");
+            validate_notion_parent_kind(kind)?;
+            Ok((kind.to_owned(), reference.to_owned()))
+        }
+        _ => bail!("notion_create_page requires both parent_kind and parent_ref together"),
+    }
+}
+
+fn validate_notion_parent_kind(parent_kind: &str) -> Result<()> {
+    match parent_kind {
+        "page" | "data_source" => Ok(()),
+        other => bail!("unsupported notion_create_page parent_kind '{other}'"),
+    }
+}
+
 fn notion_comment_parent(parent_kind: &str, parent_id: &str) -> Result<Value> {
     match parent_kind {
         "page" => Ok(json!({ "page_id": parent_id })),
         "block" => Ok(json!({ "block_id": parent_id })),
         other => bail!("unsupported notion_create_comment parent_kind '{other}'"),
     }
+}
+
+fn notion_http_method(method: &str) -> Result<Method> {
+    match method.trim().to_ascii_uppercase().as_str() {
+        "GET" => Ok(Method::GET),
+        "POST" => Ok(Method::POST),
+        "PATCH" => Ok(Method::PATCH),
+        "DELETE" => Ok(Method::DELETE),
+        other => bail!("unsupported notion_api_request method '{other}'"),
+    }
+}
+
+fn notion_api_path(path: &str) -> Result<String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        bail!("notion_api_request path cannot be empty");
+    }
+    if trimmed.contains("://") || trimmed.starts_with("//") {
+        bail!("notion_api_request path must be relative to /v1");
+    }
+
+    let without_prefix = trimmed
+        .trim_start_matches('/')
+        .strip_prefix("v1/")
+        .unwrap_or_else(|| trimmed.trim_start_matches('/'));
+    if without_prefix.is_empty()
+        || without_prefix.starts_with('/')
+        || without_prefix.contains("..")
+        || without_prefix.chars().any(|ch| ch.is_control())
+    {
+        bail!("notion_api_request path must be a relative Notion API path");
+    }
+    Ok(without_prefix.to_owned())
 }
 
 async fn notion_request_json(
@@ -1044,6 +1291,57 @@ fn normalize_comment_result(comment: &Value) -> Value {
         "text": notion_rich_text_field(comment.get("rich_text")),
         "rich_text": comment.get("rich_text").cloned().unwrap_or(Value::Null),
     })
+}
+
+fn normalize_block_delete_result(block: &Value, fallback_id: &str) -> Value {
+    json!({
+        "object": block.get("object").cloned().unwrap_or_else(|| json!("block")),
+        "id": block.get("id").cloned().unwrap_or_else(|| json!(fallback_id)),
+        "type": block.get("type").cloned().unwrap_or(Value::Null),
+        "in_trash": block.get("in_trash").cloned().unwrap_or(Value::Null),
+        "archived": block.get("archived").cloned().unwrap_or(Value::Null),
+        "has_children": block.get("has_children").cloned().unwrap_or(Value::Null),
+        "text": notion_block_text(block),
+    })
+}
+
+fn normalize_already_archived_block_delete_result(block_id: &str) -> Value {
+    json!({
+        "object": "block",
+        "id": block_id,
+        "type": Value::Null,
+        "in_trash": true,
+        "archived": true,
+        "has_children": Value::Null,
+        "text": "",
+        "already_archived": true,
+    })
+}
+
+fn normalize_missing_block_delete_result(block_id: &str) -> Value {
+    json!({
+        "object": "block",
+        "id": block_id,
+        "type": Value::Null,
+        "in_trash": Value::Null,
+        "archived": Value::Null,
+        "has_children": Value::Null,
+        "text": "",
+        "not_found": true,
+    })
+}
+
+fn notion_error_is_already_archived(error: &anyhow::Error) -> bool {
+    let message = error.to_string();
+    message.contains("Can't edit block that is archived")
+        || message.contains("must unarchive the block before editing")
+}
+
+fn notion_error_is_not_found(error: &anyhow::Error) -> bool {
+    let message = error.to_string();
+    message.contains("status 404 Not Found")
+        || message.contains("\"code\":\"object_not_found\"")
+        || message.contains("Could not find block with ID")
 }
 
 fn normalize_search_result(item: &Value) -> Value {
@@ -1931,6 +2229,23 @@ mod tests {
     }
 
     #[test]
+    fn resolves_configured_default_create_parent() {
+        let mut context = ToolContext::new(std::env::temp_dir(), vec![]);
+        context.notion_default_parent_kind = Some("page".to_owned());
+        context.notion_default_parent_ref = Some("be633bf1-dfa0-436d-b259-571129a590e5".to_owned());
+
+        let parent = notion_create_parent(None, None, &context).expect("default parent");
+
+        assert_eq!(
+            parent,
+            (
+                "page".to_owned(),
+                "be633bf1-dfa0-436d-b259-571129a590e5".to_owned()
+            )
+        );
+    }
+
+    #[test]
     fn parses_properties_json_for_update_flow() {
         let decoded: Value =
             serde_json::from_str(r#"{"Title":"Household Inbox","Status":"Done","Done":true}"#)
@@ -1974,5 +2289,73 @@ mod tests {
         }));
         assert_eq!(normalized["id"], json!("comment_123"));
         assert_eq!(normalized["text"], json!("Please buy oat milk"));
+    }
+
+    #[test]
+    fn normalizes_deleted_block_response() {
+        let normalized = normalize_block_delete_result(
+            &json!({
+                "object": "block",
+                "id": "be633bf1-dfa0-436d-b259-571129a590e5",
+                "type": "paragraph",
+                "in_trash": true,
+                "paragraph": {
+                    "rich_text": [{ "plain_text": "Delete me" }]
+                }
+            }),
+            "fallback",
+        );
+
+        assert_eq!(
+            normalized["id"],
+            json!("be633bf1-dfa0-436d-b259-571129a590e5")
+        );
+        assert_eq!(normalized["in_trash"], json!(true));
+        assert_eq!(normalized["text"], json!("Delete me"));
+    }
+
+    #[test]
+    fn recognizes_already_archived_delete_error() {
+        let error = anyhow!(
+            "Notion API request to 'blocks/id' failed with status 400 Bad Request: {{\"message\":\"Can't edit block that is archived. You must unarchive the block before editing.\"}}"
+        );
+
+        assert!(notion_error_is_already_archived(&error));
+
+        let normalized =
+            normalize_already_archived_block_delete_result("be633bf1-dfa0-436d-b259-571129a590e5");
+        assert_eq!(normalized["in_trash"], json!(true));
+        assert_eq!(normalized["already_archived"], json!(true));
+    }
+
+    #[test]
+    fn recognizes_missing_block_delete_error() {
+        let error = anyhow!(
+            "Notion API request to 'blocks/id' failed with status 404 Not Found: {{\"code\":\"object_not_found\",\"message\":\"Could not find block with ID: id\"}}"
+        );
+
+        assert!(notion_error_is_not_found(&error));
+
+        let normalized =
+            normalize_missing_block_delete_result("be633bf1-dfa0-436d-b259-571129a590e5");
+        assert_eq!(normalized["not_found"], json!(true));
+        assert_eq!(
+            normalized["id"],
+            json!("be633bf1-dfa0-436d-b259-571129a590e5")
+        );
+    }
+
+    #[test]
+    fn normalizes_generic_api_paths() {
+        assert_eq!(
+            notion_api_path("/v1/pages/page-id").expect("path"),
+            "pages/page-id"
+        );
+        assert_eq!(
+            notion_api_path("data_sources/source-id/query").expect("path"),
+            "data_sources/source-id/query"
+        );
+        assert!(notion_api_path("https://api.notion.com/v1/users/me").is_err());
+        assert!(notion_api_path("../users/me").is_err());
     }
 }

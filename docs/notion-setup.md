@@ -43,6 +43,14 @@ Enable the integration:
 cargo run -p beaverki-cli -- integration notion configure --enable
 ```
 
+Optionally configure a default parent page or data source where BeaverKi should create new Notion pages when the user has not named a parent. This avoids repeated parent-discovery searches:
+
+```bash
+cargo run -p beaverki-cli -- integration notion configure \
+  --default-parent-kind page \
+  --default-parent-ref <notion-page-url-or-id>
+```
+
 If BeaverKi is already running as a daemon, restart it after enabling Notion so the runtime loads the decrypted token into memory:
 
 ```bash
@@ -64,6 +72,8 @@ Expected output when everything is working:
 Notion enabled: true
 API base URL: https://api.notion.com/v1
 API version: 2026-03-11
+Default parent kind: page
+Default parent ref: https://www.notion.so/...
 API token secret ref: secret://local/notion_api_token
 API connection: ok
 Bot name: My Integration
@@ -93,10 +103,12 @@ When the Notion integration is enabled, BeaverKi exposes these built-in tools to
 
 - `notion_search`: search pages or data sources shared with the integration
 - `notion_fetch`: fetch a page or data source by Notion URL or ID
-- `notion_create_page`: create a page under a parent page or data source
+- `notion_create_page`: create a page under a parent page or data source, or under the configured default parent when no parent is supplied
 - `notion_update_page`: update properties on an existing page using the page's current schema
 - `notion_append_block_children`: append Markdown-like content blocks to an existing page or block
+- `notion_delete_block`: delete page content blocks by ID or URL after reading the current page content; duplicate, missing, or already-deleted block IDs are skipped idempotently
 - `notion_create_comment`: leave a comment on a page or block
+- `notion_api_request`: call current Notion REST API endpoints that do not yet have a dedicated helper
 
 This repository also ships a starter packaged skill in `skills/notion` with higher-level wrappers:
 
@@ -105,6 +117,8 @@ This repository also ships a starter packaged skill in `skills/notion` with high
 - `notion_capture_note`
 - `notion_update_entry`
 - `notion_append_content`
+- `notion_delete_blocks`
+- `notion_raw_api_request`
 - `notion_comment`
 
 Those skill tools are Lua wrappers over the Rust-side Notion capability boundary, which keeps network access and credential handling in the host runtime rather than in Lua.
@@ -113,6 +127,8 @@ Practical examples for the new write tools:
 
 - update a household page status or due date without creating a new entry
 - append fresh shopping items or meeting notes to an existing shared page
+- fetch the current page content, delete obsolete blocks by IDs returned from that latest read, then append rewritten content
+- use the generic API request wrapper for newer endpoints such as enhanced markdown page content, views, file uploads, page move/trash, block updates, data source queries, and comment update/delete
 - leave review feedback or a follow-up note as a page or block comment
 
 ## 5. Troubleshooting

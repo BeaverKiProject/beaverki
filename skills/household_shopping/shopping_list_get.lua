@@ -9,16 +9,7 @@ local function lower(text)
     return string.lower(trim(text))
 end
 
-local function resolve_page(ctx)
-    if trim(ctx.input.page_ref) ~= "" then
-        return {
-            ref = ctx.input.page_ref,
-            title = nil,
-            source = "page_ref",
-            search_query = nil,
-        }
-    end
-
+local function search_page(ctx)
     local query = trim(ctx.input.page_query)
     if query == "" then
         query = "shopping list"
@@ -76,6 +67,19 @@ local function resolve_page(ctx)
     }
 end
 
+local function resolve_page(ctx)
+    if trim(ctx.input.page_ref) ~= "" then
+        return {
+            ref = ctx.input.page_ref,
+            title = nil,
+            source = "page_ref",
+            search_query = nil,
+        }
+    end
+
+    return search_page(ctx)
+end
+
 local function normalize_items(blocks, include_checked)
     local items = {}
     for _, block in ipairs(blocks or {}) do
@@ -101,12 +105,28 @@ end
 return function(ctx)
     local include_checked = ctx.input.include_checked == true
     local resolved_page = resolve_page(ctx)
-    local page = ctx.tool_call("notion_fetch", {
+    local ok, page = pcall(ctx.tool_call, "notion_fetch", {
         ref = resolved_page.ref,
         object_kind = "page",
         include_content = true,
         page_size = ctx.input.page_size
     })
+    if not ok and resolved_page.source == "page_ref" then
+        local original_error = page
+        resolved_page = search_page(ctx)
+        ok, page = pcall(ctx.tool_call, "notion_fetch", {
+            ref = resolved_page.ref,
+            object_kind = "page",
+            include_content = true,
+            page_size = ctx.input.page_size
+        })
+        if not ok then
+            error("shopping_list_get could not fetch explicit page_ref and fallback search also failed: " .. tostring(original_error) .. " / " .. tostring(page))
+        end
+        resolved_page.source = "page_ref_fallback_search"
+    elseif not ok then
+        error(page)
+    end
 
     local blocks = {}
     if page.content ~= nil and page.content.blocks ~= nil then

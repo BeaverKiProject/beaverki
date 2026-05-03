@@ -17,8 +17,9 @@ use walkdir::WalkDir;
 mod notion;
 
 use self::notion::{
-    NotionAppendBlockChildrenTool, NotionCreateCommentTool, NotionCreatePageTool, NotionFetchTool,
-    NotionSearchTool, NotionUpdatePageTool,
+    NotionApiRequestTool, NotionAppendBlockChildrenTool, NotionCreateCommentTool,
+    NotionCreatePageTool, NotionDeleteBlockTool, NotionFetchTool, NotionSearchTool,
+    NotionUpdatePageTool,
 };
 
 #[derive(Debug, Clone)]
@@ -368,6 +369,8 @@ pub struct ToolContext {
     pub notion_api_base_url: Option<String>,
     pub notion_api_version: Option<String>,
     pub notion_api_token: Option<String>,
+    pub notion_default_parent_kind: Option<String>,
+    pub notion_default_parent_ref: Option<String>,
 }
 
 impl ToolContext {
@@ -385,6 +388,8 @@ impl ToolContext {
             notion_api_base_url: None,
             notion_api_version: None,
             notion_api_token: None,
+            notion_default_parent_kind: None,
+            notion_default_parent_ref: None,
         }
     }
 }
@@ -492,7 +497,9 @@ pub fn builtin_registry() -> ToolRegistry {
     registry.register(NotionCreatePageTool);
     registry.register(NotionUpdatePageTool);
     registry.register(NotionAppendBlockChildrenTool);
+    registry.register(NotionDeleteBlockTool);
     registry.register(NotionCreateCommentTool);
+    registry.register(NotionApiRequestTool);
     registry
 }
 

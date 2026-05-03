@@ -226,6 +226,10 @@ impl Runtime {
                 Some(config.integrations.notion.api_base_url.clone());
             tool_context.notion_api_version = Some(config.integrations.notion.api_version.clone());
             tool_context.notion_api_token = notion_api_token.clone();
+            tool_context.notion_default_parent_kind =
+                config.integrations.notion.default_parent_kind.clone();
+            tool_context.notion_default_parent_ref =
+                config.integrations.notion.default_parent_ref.clone();
         }
         let household_delivery_delegate = Arc::new(RuntimeHouseholdDeliveryDelegate {
             db: db.clone(),
@@ -2583,6 +2587,20 @@ impl Runtime {
                             .enabled
                             .then(|| self.config.integrations.notion.api_version.clone()),
                         notion_api_token: self.notion_api_token.clone(),
+                        notion_default_parent_kind: self
+                            .config
+                            .integrations
+                            .notion
+                            .enabled
+                            .then(|| self.config.integrations.notion.default_parent_kind.clone())
+                            .flatten(),
+                        notion_default_parent_ref: self
+                            .config
+                            .integrations
+                            .notion
+                            .enabled
+                            .then(|| self.config.integrations.notion.default_parent_ref.clone())
+                            .flatten(),
                     })
                     .await
                     {
@@ -2720,6 +2738,20 @@ impl Runtime {
                             .enabled
                             .then(|| self.config.integrations.notion.api_version.clone()),
                         notion_api_token: self.notion_api_token.clone(),
+                        notion_default_parent_kind: self
+                            .config
+                            .integrations
+                            .notion
+                            .enabled
+                            .then(|| self.config.integrations.notion.default_parent_kind.clone())
+                            .flatten(),
+                        notion_default_parent_ref: self
+                            .config
+                            .integrations
+                            .notion
+                            .enabled
+                            .then(|| self.config.integrations.notion.default_parent_ref.clone())
+                            .flatten(),
                     })
                     .await
                     {
@@ -3080,6 +3112,20 @@ impl Runtime {
                 .enabled
                 .then(|| self.config.integrations.notion.api_version.clone()),
             notion_api_token: self.notion_api_token.clone(),
+            notion_default_parent_kind: self
+                .config
+                .integrations
+                .notion
+                .enabled
+                .then(|| self.config.integrations.notion.default_parent_kind.clone())
+                .flatten(),
+            notion_default_parent_ref: self
+                .config
+                .integrations
+                .notion
+                .enabled
+                .then(|| self.config.integrations.notion.default_parent_ref.clone())
+                .flatten(),
         })
         .await;
         let execution = match execution {
