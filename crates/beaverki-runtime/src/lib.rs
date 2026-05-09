@@ -6475,6 +6475,103 @@ end"#,
     }
 
     #[tokio::test]
+    async fn household_members_list_returns_configured_household_members() {
+        let (_tempdir, runtime) = test_runtime(vec![
+            ModelTurnResponse {
+                output_items: vec![json!({
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "household_members_list",
+                    "arguments": "{}"
+                })],
+                tool_calls: vec![beaverki_models::ModelToolCall {
+                    call_id: "call_1".to_owned(),
+                    name: "household_members_list".to_owned(),
+                    arguments: json!({}),
+                }],
+                output_text: String::new(),
+                usage: None,
+            },
+            ModelTurnResponse {
+                output_items: vec![json!({
+                    "type": "message",
+                    "content": [{ "type": "output_text", "text": "Alex, Casey, and Riley are in the household." }]
+                })],
+                tool_calls: vec![],
+                output_text: "Alex, Casey, and Riley are in the household.".to_owned(),
+                usage: None,
+            },
+        ])
+        .await;
+        let casey = runtime
+            .create_user("Casey", &[String::from("adult")])
+            .await
+            .expect("create Casey");
+        runtime
+            .create_user("Riley", &[String::from("child")])
+            .await
+            .expect("create Riley");
+        runtime
+            .create_user("Gale", &[String::from("guest")])
+            .await
+            .expect("create guest");
+        runtime
+            .create_user("Digest Bot", &[String::from("service")])
+            .await
+            .expect("create service");
+        runtime
+            .db
+            .upsert_connector_identity(
+                "discord",
+                "discord-casey",
+                None,
+                &casey.user_id,
+                "authenticated_message",
+            )
+            .await
+            .expect("map Casey");
+
+        let result = runtime
+            .run_objective(
+                None,
+                "What members are in the household?",
+                MemoryScope::Private,
+            )
+            .await
+            .expect("run objective");
+        assert_eq!(result.task.state, TaskState::Completed.as_str());
+
+        let inspection = runtime
+            .inspect_task(None, &result.task.task_id)
+            .await
+            .expect("inspect task");
+        let invocation = inspection
+            .tool_invocations
+            .iter()
+            .find(|invocation| invocation.tool_name == "household_members_list")
+            .expect("household_members_list invocation");
+        assert_eq!(invocation.status, "completed");
+        let response: Value = serde_json::from_str(
+            invocation
+                .response_json
+                .as_deref()
+                .expect("tool response json"),
+        )
+        .expect("response json");
+        let members = response["members"].as_array().expect("members array");
+        let display_names = members
+            .iter()
+            .map(|member| member["display_name"].as_str().expect("display name"))
+            .collect::<Vec<_>>();
+        assert_eq!(display_names, vec!["Alex", "Casey", "Riley"]);
+        let casey_member = members
+            .iter()
+            .find(|member| member["display_name"] == json!("Casey"))
+            .expect("Casey member");
+        assert_eq!(casey_member["can_receive_household_delivery"], json!(true));
+    }
+
+    #[tokio::test]
     async fn scheduled_household_delivery_pauses_for_approval_and_executes_later() {
         let _direct_send_guard = direct_send_test_guard();
         let (_tempdir, runtime) = test_runtime_with_discord_token(
