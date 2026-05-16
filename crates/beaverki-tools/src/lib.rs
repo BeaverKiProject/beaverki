@@ -4,7 +4,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
@@ -491,6 +491,7 @@ pub fn builtin_registry() -> ToolRegistry {
     registry.register(ReadTextTool);
     registry.register(WriteTextTool);
     registry.register(SearchFilesTool);
+    registry.register(CurrentDatetimeTool);
     registry.register(BrowserVisitTool);
     registry.register(NotionSearchTool);
     registry.register(NotionFetchTool);
@@ -501,6 +502,45 @@ pub fn builtin_registry() -> ToolRegistry {
     registry.register(NotionCreateCommentTool);
     registry.register(NotionApiRequestTool);
     registry
+}
+
+pub struct CurrentDatetimeTool;
+
+#[async_trait]
+impl Tool for CurrentDatetimeTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "current_datetime".to_owned(),
+            description: "Return the current host datetime for scheduling, reminders, relative time calculations, and user-facing confirmations. Always use this before creating or updating schedules, especially for relative requests like `in 5 minutes`, `tomorrow`, or `this afternoon`.".to_owned(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {},
+                "required": [],
+                "additionalProperties": false
+            }),
+        }
+    }
+
+    async fn call(
+        &self,
+        _input: Value,
+        context: &ToolContext,
+    ) -> std::result::Result<ToolOutput, ToolError> {
+        let unix_timestamp_seconds = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .context("system clock is before Unix epoch")
+            .map_err(ToolError::Failed)?
+            .as_secs();
+
+        Ok(ToolOutput {
+            payload: json!({
+                "current_at": beaverki_core::now_rfc3339(),
+                "current_at_timezone": "UTC",
+                "unix_timestamp_seconds": unix_timestamp_seconds,
+                "default_timezone": context.default_timezone.as_deref(),
+            }),
+        })
+    }
 }
 
 pub struct BrowserVisitTool;
