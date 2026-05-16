@@ -4,9 +4,13 @@ use std::process::Stdio;
 
 use anyhow::{Context, Result, anyhow, bail};
 use beaverki_config::{
-    DiscordAllowedChannel, DiscordChannelMode, LoadedConfig, ProviderAuth, ProviderCapabilities,
-    ProviderEntry, ProviderModels, SecretStore, SessionLifecycleAction, SessionLifecyclePolicy,
-    SessionPolicyMatchInput, SetupAnswers, default_app_paths, prompt_passphrase_from_env,
+    DEFAULT_LM_STUDIO_BASE_URL, DEFAULT_LM_STUDIO_MODEL, DEFAULT_OPENAI_EXECUTOR_MODEL,
+    DEFAULT_OPENAI_PLANNER_MODEL, DEFAULT_OPENAI_SAFETY_REVIEW_MODEL,
+    DEFAULT_OPENAI_SUMMARIZER_MODEL, DiscordAllowedChannel, DiscordChannelMode, LoadedConfig,
+    ProviderAuth, ProviderCapabilities, ProviderEntry, ProviderModels, SecretStore,
+    SessionLifecycleAction, SessionLifecyclePolicy, SessionPolicyMatchInput, SetupAnswers,
+    SetupProviderKind, default_app_paths, default_lm_studio_provider, default_openai_provider,
+    default_workspace_root, normalize_provider_base_url, prompt_passphrase_from_env,
     select_session_lifecycle_policy, write_integrations_config, write_providers_config,
     write_runtime_config, write_setup_files,
 };
@@ -495,46 +499,6 @@ struct SetModelsArgs {
     skip_openai_check: bool,
 }
 
-const DEFAULT_OPENAI_PLANNER_MODEL: &str = "gpt-5.4";
-const DEFAULT_OPENAI_EXECUTOR_MODEL: &str = "gpt-5.4-mini";
-const DEFAULT_OPENAI_SUMMARIZER_MODEL: &str = "gpt-5.4-mini";
-const DEFAULT_OPENAI_SAFETY_REVIEW_MODEL: &str = "gpt-5.4-mini";
-const DEFAULT_LM_STUDIO_BASE_URL: &str = "http://127.0.0.1:1234";
-const DEFAULT_LM_STUDIO_MODEL: &str = "local-model";
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SetupProviderKind {
-    OpenAi,
-    LmStudio,
-}
-
-impl SetupProviderKind {
-    fn parse(value: &str) -> Result<Self> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "openai" => Ok(Self::OpenAi),
-            "lm_studio" | "lm-studio" | "lmstudio" => Ok(Self::LmStudio),
-            other => bail!(
-                "unsupported provider '{}'; use 'openai' or 'lm_studio'",
-                other
-            ),
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::OpenAi => "OpenAI",
-            Self::LmStudio => "LM Studio",
-        }
-    }
-
-    fn provider_id(self) -> &'static str {
-        match self {
-            Self::OpenAi => "openai_main",
-            Self::LmStudio => "lm_studio_local",
-        }
-    }
-}
-
 #[derive(Args, Clone)]
 struct DiscordConfigureArgs {
     #[arg(long)]
@@ -953,38 +917,28 @@ async fn setup_init(args: SetupInitArgs) -> Result<()> {
 
     let (provider, provider_secret_value, master_passphrase) = match provider_kind {
         SetupProviderKind::OpenAi => {
-            let provider = ProviderEntry {
-                provider_id: provider_kind.provider_id().to_owned(),
-                kind: "openai".to_owned(),
-                base_url: None,
-                auth: ProviderAuth {
-                    mode: "api_token".to_owned(),
-                    secret_ref: Some("secret://local/openai_main_api_token".to_owned()),
-                },
-                models: ProviderModels {
-                    planner: prompt_model_input(
-                        "Planner model",
-                        args.planner_model.clone(),
-                        DEFAULT_OPENAI_PLANNER_MODEL,
-                    )?,
-                    executor: prompt_model_input(
-                        "Executor model",
-                        args.executor_model.clone(),
-                        DEFAULT_OPENAI_EXECUTOR_MODEL,
-                    )?,
-                    summarizer: prompt_model_input(
-                        "Summarizer model",
-                        args.summarizer_model.clone(),
-                        DEFAULT_OPENAI_SUMMARIZER_MODEL,
-                    )?,
-                    safety_review: prompt_model_input(
-                        "Safety review model",
-                        args.safety_review_model.clone(),
-                        DEFAULT_OPENAI_SAFETY_REVIEW_MODEL,
-                    )?,
-                },
-                capabilities: ProviderCapabilities::default(),
-            };
+            let provider = default_openai_provider(
+                prompt_model_input(
+                    "Planner model",
+                    args.planner_model.clone(),
+                    DEFAULT_OPENAI_PLANNER_MODEL,
+                )?,
+                prompt_model_input(
+                    "Executor model",
+                    args.executor_model.clone(),
+                    DEFAULT_OPENAI_EXECUTOR_MODEL,
+                )?,
+                prompt_model_input(
+                    "Summarizer model",
+                    args.summarizer_model.clone(),
+                    DEFAULT_OPENAI_SUMMARIZER_MODEL,
+                )?,
+                prompt_model_input(
+                    "Safety review model",
+                    args.safety_review_model.clone(),
+                    DEFAULT_OPENAI_SAFETY_REVIEW_MODEL,
+                )?,
+            );
             let api_token = std::env::var(&args.openai_api_token_env).unwrap_or_else(|_| {
                 Password::new()
                     .with_prompt("OpenAI API token")
@@ -1003,8 +957,8 @@ async fn setup_init(args: SetupInitArgs) -> Result<()> {
         }
         SetupProviderKind::LmStudio => {
             let initial_base_url = match args.lm_studio_base_url.as_deref() {
-                Some(value) => normalize_base_url_input(value)?,
-                None => normalize_base_url_input(
+                Some(value) => normalize_provider_base_url(value)?,
+                None => normalize_provider_base_url(
                     &Input::<String>::new()
                         .with_prompt("LM Studio base URL")
                         .default(DEFAULT_LM_STUDIO_BASE_URL.to_owned())
@@ -1052,22 +1006,14 @@ async fn setup_init(args: SetupInitArgs) -> Result<()> {
                     .interact()
                     .context("failed to read LM Studio tool calling choice")?
             };
-            let provider = ProviderEntry {
-                provider_id: provider_kind.provider_id().to_owned(),
-                kind: "lm_studio".to_owned(),
-                base_url: Some(base_url),
-                auth: ProviderAuth {
-                    mode: "none".to_owned(),
-                    secret_ref: None,
-                },
-                models: ProviderModels {
-                    planner: planner_model,
-                    executor: executor_model,
-                    summarizer: summarizer_model,
-                    safety_review: safety_review_model,
-                },
-                capabilities: ProviderCapabilities { tool_calling },
-            };
+            let provider = default_lm_studio_provider(
+                base_url,
+                planner_model,
+                executor_model,
+                summarizer_model,
+                safety_review_model,
+                tool_calling,
+            )?;
             (provider, None, None)
         }
     };
@@ -3364,7 +3310,7 @@ async fn discover_lm_studio_models_with_retry(
                 match selected {
                     0 => continue,
                     1 => {
-                        base_url = normalize_base_url_input(
+                        base_url = normalize_provider_base_url(
                             &Input::<String>::new()
                                 .with_prompt("LM Studio base URL")
                                 .default(base_url.clone())
@@ -3416,14 +3362,6 @@ fn prompt_provider_model(
         .interact()
         .with_context(|| format!("failed to read {prompt}"))?;
     Ok(discovered_models[selected].clone())
-}
-
-fn normalize_base_url_input(value: &str) -> Result<String> {
-    let trimmed = value.trim().trim_end_matches('/');
-    if trimmed.is_empty() {
-        bail!("provider base URL cannot be empty");
-    }
-    Ok(trimmed.to_owned())
 }
 
 async fn load_db(config_dir: &PathBuf) -> Result<(LoadedConfig, Database)> {
@@ -3734,10 +3672,6 @@ async fn resolve_user_for_db(db: &Database, user_id: Option<&str>) -> Result<Use
 
 fn resolve_config_dir(config_dir: Option<PathBuf>) -> Result<PathBuf> {
     Ok(config_dir.unwrap_or(default_app_paths()?.config_dir))
-}
-
-fn default_workspace_root() -> Result<PathBuf> {
-    std::env::current_dir().context("failed to determine current working directory")
 }
 
 fn print_daemon_status(status: &beaverki_runtime::DaemonStatus, reachable: bool) {

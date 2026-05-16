@@ -459,12 +459,15 @@ dependencies = [
  "beaverki-config",
  "beaverki-core",
  "beaverki-db",
+ "beaverki-models",
  "beaverki-runtime",
  "chrono",
  "clap",
  "maud",
  "serde",
  "serde_json",
+ "serde_yaml",
+ "tempfile",
  "tokio",
 ]
 

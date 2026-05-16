@@ -1,6 +1,7 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
 use axum::{
@@ -22,6 +23,10 @@ use clap::Parser;
 use maud::{DOCTYPE, Markup, PreEscaped, html};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tokio::sync::RwLock;
+
+mod browser;
+mod setup;
 
 #[derive(Parser)]
 #[command(name = "beaverki-web")]
@@ -31,16 +36,29 @@ struct Args {
     config_dir: Option<PathBuf>,
     #[arg(long, default_value = "127.0.0.1:7676")]
     listen_addr: SocketAddr,
+    #[arg(long, default_value_t = false)]
+    no_open_browser: bool,
 }
 
 #[derive(Clone)]
-struct AppState {
-    daemon: DaemonClient,
+pub(crate) struct AppState {
+    config_dir: PathBuf,
+    daemon_socket_path: Arc<RwLock<PathBuf>>,
     listen_addr: SocketAddr,
 }
 
+impl AppState {
+    async fn daemon(&self) -> DaemonClient {
+        DaemonClient::new(self.daemon_socket_path.read().await.clone())
+    }
+
+    pub(crate) async fn set_daemon_socket_path(&self, socket_path: PathBuf) {
+        *self.daemon_socket_path.write().await = socket_path;
+    }
+}
+
 #[derive(Debug)]
-struct AppError(anyhow::Error);
+pub(crate) struct AppError(anyhow::Error);
 
 impl<E> From<E> for AppError
 where
@@ -166,19 +184,21 @@ async fn main() -> Result<()> {
             .expect("default app paths")
             .config_dir
     });
-    let config = LoadedConfig::load_from_dir(&config_dir)
-        .with_context(|| format!("failed to load {}", config_dir.display()))?;
-    let daemon = DaemonClient::new(config.runtime.state_dir.join("daemon.sock"));
-    daemon.status().await.with_context(
-        || "the BeaverKi daemon is not reachable; start it before launching the web UI",
-    )?;
+    let daemon_socket_path = match LoadedConfig::load_from_dir(&config_dir) {
+        Ok(config) => config.runtime.state_dir.join("daemon.sock"),
+        Err(_) => beaverki_config::default_app_paths()
+            .expect("default app paths")
+            .state_dir
+            .join("daemon.sock"),
+    };
 
     let state = AppState {
-        daemon,
+        config_dir: config_dir.clone(),
+        daemon_socket_path: Arc::new(RwLock::new(daemon_socket_path)),
         listen_addr: args.listen_addr,
     };
     let app = Router::new()
-        .route("/", get(dashboard))
+        .route("/", get(root))
         .route("/settings", get(settings_page))
         .route("/providers/save", post(save_provider_config))
         .route("/users", post(create_user))
@@ -203,12 +223,37 @@ async fn main() -> Result<()> {
         .route("/schedules/{schedule_id}/toggle", post(toggle_schedule))
         .route("/schedules/{schedule_id}/delete", post(delete_schedule))
         .route("/static/logo.png", get(serve_logo))
+        .merge(setup::router())
         .with_state(state.clone());
 
     let listener = tokio::net::TcpListener::bind(state.listen_addr).await?;
     println!("BeaverKi web UI listening on http://{}", state.listen_addr);
+    if !args.no_open_browser
+        && let Err(error) = browser::open_system_browser(&format!("http://{}", state.listen_addr))
+    {
+        eprintln!("Failed to open browser: {error:#}");
+    }
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+async fn root(
+    State(state): State<AppState>,
+    Query(query): Query<DashboardQuery>,
+) -> Result<Response, AppError> {
+    if setup::setup_required(&state.config_dir).await? {
+        return Ok(Redirect::to("/setup").into_response());
+    }
+
+    let config = LoadedConfig::load_from_dir(&state.config_dir)?;
+    state
+        .set_daemon_socket_path(config.runtime.state_dir.join("daemon.sock"))
+        .await;
+    let daemon = state.daemon().await;
+    daemon.status().await.with_context(
+        || "the BeaverKi daemon is not reachable; start it before launching the web UI",
+    )?;
+    Ok(dashboard(State(state), Query(query)).await?.into_response())
 }
 
 async fn dashboard(
@@ -217,16 +262,17 @@ async fn dashboard(
 ) -> Result<Markup, AppError> {
     let selected_user = normalize_user(query.user.clone());
     let include_archived = query.include_archived.unwrap_or(false);
-    let c_provider = state.daemon.clone();
-    let c_users = state.daemon.clone();
-    let c_tasks = state.daemon.clone();
-    let c_all_tasks = state.daemon.clone();
-    let c_approvals = state.daemon.clone();
-    let c_sessions = state.daemon.clone();
-    let c_memories = state.daemon.clone();
-    let c_catalog = state.daemon.clone();
-    let c_status = state.daemon.clone();
-    let c_roles = state.daemon.clone();
+    let daemon = state.daemon().await;
+    let c_provider = daemon.clone();
+    let c_users = daemon.clone();
+    let c_tasks = daemon.clone();
+    let c_all_tasks = daemon.clone();
+    let c_approvals = daemon.clone();
+    let c_sessions = daemon.clone();
+    let c_memories = daemon.clone();
+    let c_catalog = daemon.clone();
+    let c_status = daemon.clone();
+    let c_roles = daemon.clone();
     let (
         provider_view,
         users,
@@ -450,8 +496,8 @@ async fn settings_page(
     Query(query): Query<SettingsQuery>,
 ) -> Result<Markup, AppError> {
     let active_user = normalize_user(query.user.clone());
-    let provider_view = state
-        .daemon
+    let daemon = state.daemon().await;
+    let provider_view = daemon
         .show_provider_config(query.provider.clone(), true)
         .await?;
     let body = html! {
@@ -491,8 +537,8 @@ async fn submit_task(
     } else {
         form.scope
     };
-    let task = state
-        .daemon
+    let daemon = state.daemon().await;
+    let task = daemon
         .run_task(
             normalize_user(form.user.clone()),
             form.objective,
@@ -511,8 +557,8 @@ async fn save_provider_config(
     Form(form): Form<ProviderConfigForm>,
 ) -> Result<Redirect, AppError> {
     let user = normalize_user(form.user.clone());
-    state
-        .daemon
+    let daemon = state.daemon().await;
+    daemon
         .update_provider_config(ProviderConfigUpdate {
             provider_id: form.provider_id.clone(),
             base_url: form.base_url,
@@ -533,8 +579,8 @@ async fn create_user(
     State(state): State<AppState>,
     Form(form): Form<UserCreateForm>,
 ) -> Result<Redirect, AppError> {
-    state
-        .daemon
+    let daemon = state.daemon().await;
+    daemon
         .create_user(
             form.display_name,
             form.roles
@@ -552,12 +598,11 @@ async fn task_detail(
     Query(query): Query<UserQuery>,
 ) -> Result<Markup, AppError> {
     let selected_user = normalize_user(query.user.clone());
-    let task = state
-        .daemon
+    let daemon = state.daemon().await;
+    let task = daemon
         .show_task(selected_user.clone(), task_id.clone())
         .await?;
-    let approvals = state
-        .daemon
+    let approvals = daemon
         .list_approvals(selected_user.clone(), Some("pending".to_owned()))
         .await?
         .into_iter()
@@ -680,8 +725,8 @@ async fn approve_task(
     Form(form): Form<ActionForm>,
 ) -> Result<Redirect, AppError> {
     let user = normalize_user(form.user);
-    let task = state
-        .daemon
+    let daemon = state.daemon().await;
+    let task = daemon
         .resolve_approval(user.clone(), approval_id, true)
         .await?;
     Ok(Redirect::to(&task_link(&task.task_id, user.as_deref())))
@@ -693,8 +738,8 @@ async fn deny_task(
     Form(form): Form<ActionForm>,
 ) -> Result<Redirect, AppError> {
     let user = normalize_user(form.user);
-    let task = state
-        .daemon
+    let daemon = state.daemon().await;
+    let task = daemon
         .resolve_approval(user.clone(), approval_id, false)
         .await?;
     Ok(Redirect::to(&task_link(&task.task_id, user.as_deref())))
@@ -705,8 +750,8 @@ async fn reset_session(
     Path(session_id): Path<String>,
     Form(form): Form<ActionForm>,
 ) -> Result<Redirect, AppError> {
-    state
-        .daemon
+    let daemon = state.daemon().await;
+    daemon
         .reset_session(normalize_user(form.user.clone()), session_id)
         .await?;
     Ok(Redirect::to(&dashboard_link(
@@ -720,8 +765,8 @@ async fn archive_session(
     Path(session_id): Path<String>,
     Form(form): Form<ActionForm>,
 ) -> Result<Redirect, AppError> {
-    state
-        .daemon
+    let daemon = state.daemon().await;
+    daemon
         .archive_session(normalize_user(form.user.clone()), session_id)
         .await?;
     Ok(Redirect::to(&dashboard_link(
@@ -735,8 +780,9 @@ async fn new_workflow(
     Query(query): Query<UserQuery>,
 ) -> Result<Markup, AppError> {
     let user = normalize_user(query.user.clone());
-    let users = state.daemon.list_users().await?;
-    let catalog = state.daemon.automation_catalog(user.clone()).await?;
+    let daemon = state.daemon().await;
+    let users = daemon.list_users().await?;
+    let catalog = daemon.automation_catalog(user.clone()).await?;
     Ok(render_workflow_editor(
         &users,
         user.as_deref(),
@@ -752,12 +798,10 @@ async fn edit_workflow(
     Query(query): Query<ScheduleEditQuery>,
 ) -> Result<Markup, AppError> {
     let user = normalize_user(query.user.clone());
-    let users = state.daemon.list_users().await?;
-    let catalog = state.daemon.automation_catalog(user.clone()).await?;
-    let workflow = state
-        .daemon
-        .show_workflow(user.clone(), workflow_id)
-        .await?;
+    let daemon = state.daemon().await;
+    let users = daemon.list_users().await?;
+    let catalog = daemon.automation_catalog(user.clone()).await?;
+    let workflow = daemon.show_workflow(user.clone(), workflow_id).await?;
     let editing_schedule = query
         .schedule_id
         .as_deref()
@@ -783,8 +827,8 @@ async fn save_workflow(
 ) -> Result<Redirect, AppError> {
     let user = normalize_user(form.user.clone());
     let definition = workflow_definition_from_form(&form)?;
-    let workflow = state
-        .daemon
+    let daemon = state.daemon().await;
+    let workflow = daemon
         .upsert_workflow(
             user.clone(),
             normalize_user(form.workflow_id.clone()),
@@ -806,10 +850,8 @@ async fn show_workflow(
     Query(query): Query<UserQuery>,
 ) -> Result<Markup, AppError> {
     let user = normalize_user(query.user.clone());
-    let workflow = state
-        .daemon
-        .show_workflow(user.clone(), workflow_id)
-        .await?;
+    let daemon = state.daemon().await;
+    let workflow = daemon.show_workflow(user.clone(), workflow_id).await?;
     Ok(render_workflow_detail(&workflow, user.as_deref()))
 }
 
@@ -819,8 +861,8 @@ async fn activate_workflow(
     Form(form): Form<ActionForm>,
 ) -> Result<Redirect, AppError> {
     let user = normalize_user(form.user.clone());
-    state
-        .daemon
+    let daemon = state.daemon().await;
+    daemon
         .activate_workflow(user.clone(), workflow_id.clone())
         .await?;
     Ok(Redirect::to(&workflow_link(&workflow_id, user.as_deref())))
@@ -832,8 +874,8 @@ async fn disable_workflow(
     Form(form): Form<ActionForm>,
 ) -> Result<Redirect, AppError> {
     let user = normalize_user(form.user.clone());
-    state
-        .daemon
+    let daemon = state.daemon().await;
+    daemon
         .disable_workflow(user.clone(), workflow_id.clone())
         .await?;
     Ok(Redirect::to(&workflow_link(&workflow_id, user.as_deref())))
@@ -845,10 +887,8 @@ async fn replay_workflow(
     Form(form): Form<ActionForm>,
 ) -> Result<Redirect, AppError> {
     let user = normalize_user(form.user.clone());
-    let task = state
-        .daemon
-        .replay_workflow(user.clone(), workflow_id)
-        .await?;
+    let daemon = state.daemon().await;
+    let task = daemon.replay_workflow(user.clone(), workflow_id).await?;
     Ok(Redirect::to(&task_link(&task.task_id, user.as_deref())))
 }
 
@@ -858,10 +898,8 @@ async fn delete_workflow(
     Form(form): Form<ActionForm>,
 ) -> Result<Redirect, AppError> {
     let user = normalize_user(form.user.clone());
-    state
-        .daemon
-        .delete_workflow(user.clone(), workflow_id)
-        .await?;
+    let daemon = state.daemon().await;
+    daemon.delete_workflow(user.clone(), workflow_id).await?;
     Ok(Redirect::to(&dashboard_link(user.as_deref(), false)))
 }
 
@@ -872,8 +910,8 @@ async fn save_workflow_schedule(
 ) -> Result<Redirect, AppError> {
     let user = normalize_user(form.user.clone());
     let cron = schedule_cron(&form)?;
-    state
-        .daemon
+    let daemon = state.daemon().await;
+    daemon
         .upsert_workflow_schedule(
             user.clone(),
             normalize_user(form.schedule_id.clone()),
@@ -891,14 +929,14 @@ async fn toggle_schedule(
     Form(form): Form<ActionForm>,
 ) -> Result<Redirect, AppError> {
     let user = normalize_user(form.user.clone());
-    let catalog = state.daemon.automation_catalog(user.clone()).await?;
+    let daemon = state.daemon().await;
+    let catalog = daemon.automation_catalog(user.clone()).await?;
     let schedule = catalog
         .schedules
         .into_iter()
         .find(|schedule| schedule.schedule_id == schedule_id)
         .ok_or_else(|| anyhow!("schedule '{schedule_id}' not found"))?;
-    state
-        .daemon
+    daemon
         .set_schedule_enabled(
             user.clone(),
             schedule.schedule_id.clone(),
@@ -919,16 +957,14 @@ async fn delete_schedule(
     Form(form): Form<ActionForm>,
 ) -> Result<Redirect, AppError> {
     let user = normalize_user(form.user.clone());
-    let catalog = state.daemon.automation_catalog(user.clone()).await?;
+    let daemon = state.daemon().await;
+    let catalog = daemon.automation_catalog(user.clone()).await?;
     let schedule = catalog
         .schedules
         .into_iter()
         .find(|schedule| schedule.schedule_id == schedule_id)
         .ok_or_else(|| anyhow!("schedule '{schedule_id}' not found"))?;
-    state
-        .daemon
-        .delete_schedule(user.clone(), schedule_id)
-        .await?;
+    daemon.delete_schedule(user.clone(), schedule_id).await?;
     let destination = if schedule.target_type == "workflow" {
         workflow_link(&schedule.target_id, user.as_deref())
     } else {

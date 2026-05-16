@@ -42,45 +42,41 @@ Current first-party integrations and assumptions:
 
    For LM Studio, start LM Studio locally and load at least one chat-capable model before setup.
 
-3. Initialize BeaverKi.
-
-   ```bash
-   make setup
-   ```
-
-   `setup init` now lets you choose OpenAI or LM Studio, and for LM Studio it can discover and prompt for the model IDs to use for planning, execution, summarization, and safety review.
-
-4. Start the daemon.
-
-   ```bash
-   make daemon-start
-   ```
-
-   If `BEAVERKI_MASTER_PASSPHRASE` is not set, BeaverKi will prompt for it.
-
-5. Optionally start the local web UI.
+3. Start the local web UI.
 
    ```bash
    make web-ui
    ```
 
-   By default it listens on `http://127.0.0.1:7676`.
+   On a fresh install, the loopback-only web UI opens a browser setup wizard at `http://127.0.0.1:7676`. The wizard uses platform-default paths unless you open the advanced path fields, writes the same config files as `setup init`, creates the first owner, starts the daemon, and then hands off to the normal dashboard.
+
+   For terminal or headless setup, you can still run:
+
+   ```bash
+   make setup
+   ```
+
+   `setup init` lets you choose OpenAI or LM Studio, and for LM Studio it can discover and prompt for the model IDs to use for planning, execution, summarization, and safety review.
+
+4. Use the local web UI.
+
+   On later runs, `make web-ui` opens the configured local dashboard. By default it listens on `http://127.0.0.1:7676` and opens your system browser. Use `cargo run -p beaverki-web -- --no-open-browser` when you want to start it without opening a browser window.
    Use the Settings link in the web UI to review or change the active provider, base URL, and model roles. The settings form fetches model suggestions through the daemon when the provider supports discovery, but still lets you type a custom model name. Restart the daemon after saving provider changes.
 
-6. Run a first task.
+5. Run a first task.
 
    ```bash
    make run-task OBJECTIVE="Summarize the repository status and list the docs folder."
    ```
 
-7. Inspect the task and pending approvals.
+6. Inspect the task and pending approvals.
 
    ```bash
    make show-task TASK_ID=<task-id>
    make approval-list
    ```
 
-8. Stop the daemon when finished.
+7. Stop the daemon when finished.
 
    ```bash
    make daemon-stop
