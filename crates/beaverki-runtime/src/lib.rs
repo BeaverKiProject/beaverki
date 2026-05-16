@@ -6577,26 +6577,41 @@ end"#,
         let (_tempdir, runtime) = test_runtime_with_discord_token(
             vec![
                 ModelTurnResponse {
-                    output_items: vec![json!({
-                        "type": "function_call",
-                        "call_id": "call_1",
-                        "name": "household_schedule_message",
-                        "arguments": "{\"delivery_id\":null,\"recipient\":\"Casey\",\"message\":\"Buy kiwis.\",\"deliver_at\":\"2099-01-01T09:00:00Z\",\"cron_expr\":null,\"window_start_at\":null,\"window_end_at\":null,\"enabled\":true}"
-                    })],
-                    tool_calls: vec![beaverki_models::ModelToolCall {
-                        call_id: "call_1".to_owned(),
-                        name: "household_schedule_message".to_owned(),
-                        arguments: json!({
-                            "delivery_id": Value::Null,
-                            "recipient": "Casey",
-                            "message": "Buy kiwis.",
-                            "deliver_at": "2099-01-01T09:00:00Z",
-                            "cron_expr": Value::Null,
-                            "window_start_at": Value::Null,
-                            "window_end_at": Value::Null,
-                            "enabled": true
+                    output_items: vec![
+                        json!({
+                            "type": "function_call",
+                            "call_id": "call_current_datetime",
+                            "name": "current_datetime",
+                            "arguments": "{}"
                         }),
-                    }],
+                        json!({
+                            "type": "function_call",
+                            "call_id": "call_1",
+                            "name": "household_schedule_message",
+                            "arguments": "{\"delivery_id\":null,\"recipient\":\"Casey\",\"message\":\"Buy kiwis.\",\"deliver_at\":\"2099-01-01T09:00:00Z\",\"cron_expr\":null,\"window_start_at\":null,\"window_end_at\":null,\"enabled\":true}"
+                        }),
+                    ],
+                    tool_calls: vec![
+                        beaverki_models::ModelToolCall {
+                            call_id: "call_current_datetime".to_owned(),
+                            name: "current_datetime".to_owned(),
+                            arguments: json!({}),
+                        },
+                        beaverki_models::ModelToolCall {
+                            call_id: "call_1".to_owned(),
+                            name: "household_schedule_message".to_owned(),
+                            arguments: json!({
+                                "delivery_id": Value::Null,
+                                "recipient": "Casey",
+                                "message": "Buy kiwis.",
+                                "deliver_at": "2099-01-01T09:00:00Z",
+                                "cron_expr": Value::Null,
+                                "window_start_at": Value::Null,
+                                "window_end_at": Value::Null,
+                                "enabled": true
+                            }),
+                        },
+                    ],
                     output_text: String::new(),
                     usage: None,
                 },
@@ -6726,26 +6741,41 @@ end"#,
         let (_tempdir, runtime) = test_runtime_with_discord_token(
             vec![
                 ModelTurnResponse {
-                    output_items: vec![json!({
-                        "type": "function_call",
-                        "call_id": "call_1",
-                        "name": "household_schedule_message",
-                        "arguments": "{\"delivery_id\":null,\"recipient\":\"Alex\",\"message\":\"Take vitamins.\",\"deliver_at\":\"2099-01-01T09:00:00Z\",\"cron_expr\":null,\"window_start_at\":null,\"window_end_at\":null,\"enabled\":true}"
-                    })],
-                    tool_calls: vec![beaverki_models::ModelToolCall {
-                        call_id: "call_1".to_owned(),
-                        name: "household_schedule_message".to_owned(),
-                        arguments: json!({
-                            "delivery_id": Value::Null,
-                            "recipient": "Alex",
-                            "message": "Take vitamins.",
-                            "deliver_at": "2099-01-01T09:00:00Z",
-                            "cron_expr": Value::Null,
-                            "window_start_at": Value::Null,
-                            "window_end_at": Value::Null,
-                            "enabled": true
+                    output_items: vec![
+                        json!({
+                            "type": "function_call",
+                            "call_id": "call_current_datetime",
+                            "name": "current_datetime",
+                            "arguments": "{}"
                         }),
-                    }],
+                        json!({
+                            "type": "function_call",
+                            "call_id": "call_1",
+                            "name": "household_schedule_message",
+                            "arguments": "{\"delivery_id\":null,\"recipient\":\"Alex\",\"message\":\"Take vitamins.\",\"deliver_at\":\"2099-01-01T09:00:00Z\",\"cron_expr\":null,\"window_start_at\":null,\"window_end_at\":null,\"enabled\":true}"
+                        }),
+                    ],
+                    tool_calls: vec![
+                        beaverki_models::ModelToolCall {
+                            call_id: "call_current_datetime".to_owned(),
+                            name: "current_datetime".to_owned(),
+                            arguments: json!({}),
+                        },
+                        beaverki_models::ModelToolCall {
+                            call_id: "call_1".to_owned(),
+                            name: "household_schedule_message".to_owned(),
+                            arguments: json!({
+                                "delivery_id": Value::Null,
+                                "recipient": "Alex",
+                                "message": "Take vitamins.",
+                                "deliver_at": "2099-01-01T09:00:00Z",
+                                "cron_expr": Value::Null,
+                                "window_start_at": Value::Null,
+                                "window_end_at": Value::Null,
+                                "enabled": true
+                            }),
+                        },
+                    ],
                     output_text: String::new(),
                     usage: None,
                 },
