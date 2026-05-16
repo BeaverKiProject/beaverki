@@ -6,12 +6,18 @@ use std::path::{Path, PathBuf};
 use age::Decryptor;
 use age::Encryptor;
 use age::secrecy::SecretString;
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use directories::BaseDirs;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 const CURRENT_CONFIG_VERSION: u32 = 1;
+pub const DEFAULT_OPENAI_PLANNER_MODEL: &str = "gpt-5.4";
+pub const DEFAULT_OPENAI_EXECUTOR_MODEL: &str = "gpt-5.4-mini";
+pub const DEFAULT_OPENAI_SUMMARIZER_MODEL: &str = "gpt-5.4-mini";
+pub const DEFAULT_OPENAI_SAFETY_REVIEW_MODEL: &str = "gpt-5.4-mini";
+pub const DEFAULT_LM_STUDIO_BASE_URL: &str = "http://127.0.0.1:1234";
+pub const DEFAULT_LM_STUDIO_MODEL: &str = "local-model";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeConfig {
@@ -261,6 +267,106 @@ pub struct ProviderModels {
     pub summarizer: String,
     #[serde(default = "default_safety_review_model")]
     pub safety_review: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SetupProviderKind {
+    #[default]
+    OpenAi,
+    LmStudio,
+}
+
+impl SetupProviderKind {
+    pub fn parse(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "openai" => Ok(Self::OpenAi),
+            "lm_studio" | "lm-studio" | "lmstudio" => Ok(Self::LmStudio),
+            other => bail!(
+                "unsupported provider '{}'; use 'openai' or 'lm_studio'",
+                other
+            ),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::OpenAi => "openai",
+            Self::LmStudio => "lm_studio",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::OpenAi => "OpenAI",
+            Self::LmStudio => "LM Studio",
+        }
+    }
+
+    pub fn provider_id(self) -> &'static str {
+        match self {
+            Self::OpenAi => "openai_main",
+            Self::LmStudio => "lm_studio_local",
+        }
+    }
+}
+
+pub fn default_openai_provider(
+    planner_model: impl Into<String>,
+    executor_model: impl Into<String>,
+    summarizer_model: impl Into<String>,
+    safety_review_model: impl Into<String>,
+) -> ProviderEntry {
+    ProviderEntry {
+        provider_id: SetupProviderKind::OpenAi.provider_id().to_owned(),
+        kind: "openai".to_owned(),
+        base_url: None,
+        auth: ProviderAuth {
+            mode: "api_token".to_owned(),
+            secret_ref: Some("secret://local/openai_main_api_token".to_owned()),
+        },
+        models: ProviderModels {
+            planner: planner_model.into(),
+            executor: executor_model.into(),
+            summarizer: summarizer_model.into(),
+            safety_review: safety_review_model.into(),
+        },
+        capabilities: ProviderCapabilities::default(),
+    }
+}
+
+pub fn default_lm_studio_provider(
+    base_url: impl Into<String>,
+    planner_model: impl Into<String>,
+    executor_model: impl Into<String>,
+    summarizer_model: impl Into<String>,
+    safety_review_model: impl Into<String>,
+    tool_calling: bool,
+) -> Result<ProviderEntry> {
+    Ok(ProviderEntry {
+        provider_id: SetupProviderKind::LmStudio.provider_id().to_owned(),
+        kind: "lm_studio".to_owned(),
+        base_url: Some(normalize_provider_base_url(&base_url.into())?),
+        auth: ProviderAuth {
+            mode: "none".to_owned(),
+            secret_ref: None,
+        },
+        models: ProviderModels {
+            planner: planner_model.into(),
+            executor: executor_model.into(),
+            summarizer: summarizer_model.into(),
+            safety_review: safety_review_model.into(),
+        },
+        capabilities: ProviderCapabilities { tool_calling },
+    })
+}
+
+pub fn normalize_provider_base_url(value: &str) -> Result<String> {
+    let trimmed = value.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        bail!("provider base URL cannot be empty");
+    }
+    Ok(trimmed.to_owned())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -940,6 +1046,10 @@ pub fn default_app_paths() -> Result<AppPaths> {
         secret_dir,
         database_path,
     })
+}
+
+pub fn default_workspace_root() -> Result<PathBuf> {
+    std::env::current_dir().context("failed to determine current working directory")
 }
 
 #[cfg(test)]

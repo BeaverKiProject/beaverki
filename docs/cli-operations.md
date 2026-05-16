@@ -92,7 +92,15 @@ Verify that an OpenAI credential works before writing config:
 cargo run -p beaverki-cli -- setup verify-openai
 ```
 
-Initialize a new BeaverKi installation:
+The default first-run path is the local browser setup wizard:
+
+```bash
+make web-ui
+```
+
+On a fresh config directory, `beaverki-web` binds to loopback, opens the system browser, and serves an onboarding wizard before the daemon-backed dashboard is available. The wizard uses platform-default paths unless you open the advanced path fields, stores only non-secret draft progress, writes the same config files as `setup init`, creates the first owner, starts the daemon, and redirects to the normal UI.
+
+For terminal or headless setup, initialize a new BeaverKi installation with:
 
 ```bash
 cargo run -p beaverki-cli -- setup init
@@ -153,10 +161,9 @@ The runtime reads the master passphrase from `BEAVERKI_MASTER_PASSPHRASE` when a
 
 ## Local Web UI
 
-Start the BeaverKi daemon first, then launch the local web UI in a separate terminal:
+Launch the local web UI:
 
 ```bash
-make daemon-start
 make web-ui
 ```
 
@@ -166,7 +173,9 @@ Or run the web UI directly:
 cargo run -p beaverki-web -- --config-dir /path/to/config
 ```
 
-By default the UI listens on `127.0.0.1:7676`.
+By default the UI listens on `127.0.0.1:7676` and opens the system browser. Pass `--no-open-browser` to serve the UI without opening a browser window.
+
+If the selected config directory has not been initialized, the web UI serves the first-run setup wizard. If it is already configured, the normal dashboard requires the BeaverKi daemon to be reachable; start it with `make daemon-start` or `cargo run -p beaverki-cli -- daemon start` when it is not already running.
 
 Use the Settings page in the local UI when you need to change the active model provider, adjust an LM Studio base URL, or update planner, executor, summarizer, and safety-review model IDs. The settings form asks the daemon to fetch model suggestions from the selected provider when discovery is supported, while still allowing custom model names. Saving provider changes updates `providers.yaml`; restart the daemon afterward so new tasks use the new runtime configuration.
 

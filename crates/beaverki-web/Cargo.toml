@@ -10,13 +10,18 @@ axum.workspace = true
 beaverki-config = { path = "../beaverki-config" }
 beaverki-core = { path = "../beaverki-core" }
 beaverki-db = { path = "../beaverki-db" }
+beaverki-models = { path = "../beaverki-models" }
 beaverki-runtime = { path = "../beaverki-runtime" }
 chrono.workspace = true
 clap.workspace = true
 maud.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+serde_yaml.workspace = true
 tokio.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true
