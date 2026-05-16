@@ -103,7 +103,7 @@ When the Notion integration is enabled, BeaverKi exposes these built-in tools to
 
 - `notion_search`: search pages or data sources shared with the integration
 - `notion_fetch`: fetch a page or data source by Notion URL or ID
-- `notion_create_page`: create a page under a parent page or data source, or under the configured default parent when no parent is supplied
+- `notion_create_page`: create a page under a parent page or data source, or under the configured default parent when no parent is supplied; data source parents can include structured `properties_json` and optional Notion templates
 - `notion_update_page`: update properties on an existing page using the page's current schema
 - `notion_append_block_children`: append Markdown-like content blocks to an existing page or block
 - `notion_delete_block`: delete page content blocks by ID or URL after reading the current page content; duplicate, missing, or already-deleted block IDs are skipped idempotently
@@ -126,10 +126,30 @@ Those skill tools are Lua wrappers over the Rust-side Notion capability boundary
 Practical examples for the new write tools:
 
 - update a household page status or due date without creating a new entry
+- create a database-backed task with explicit status, date, checkbox, relation, and tag properties
 - append fresh shopping items or meeting notes to an existing shared page
 - fetch the current page content, delete obsolete blocks by IDs returned from that latest read, then append rewritten content
 - use the generic API request wrapper for newer endpoints such as enhanced markdown page content, views, file uploads, page move/trash, block updates, data source queries, and comment update/delete
 - leave review feedback or a follow-up note as a page or block comment
+
+### Creating Pages In Data Sources
+
+For `parent_kind = "data_source"`, `notion_create_page` accepts `properties_json`, a JSON object keyed by Notion property name. BeaverKi fetches the data source schema first and normalizes the provided values before sending the create request. If the data source title property is omitted, BeaverKi fills it from the required `title` field.
+
+Supported property inputs:
+
+- `title` and `rich_text`: string, rich text array, or `null` for rich text only
+- `select` and `status`: string, `null`, or object with `name` or `id`
+- `multi_select`: array of strings or objects with `name` or `id`
+- `checkbox`: boolean
+- `number`: number or `null`
+- `date`: date string, Notion date object, or `null`
+- `relation` and `people`: array of IDs, Notion URLs, or objects with `id`
+- `url`, `email`, and `phone_number`: string or `null`
+
+Unsupported or non-editable property types such as formula and rollup are rejected with a schema-specific error before page creation.
+
+Template options are controlled with `template_type`: `none`, `default`, or `template_id`. Use `template_ref` for an explicit template ID or URL, and `template_timezone` when Notion should evaluate date-related template content in a specific IANA timezone. Notion templates cannot be combined with `content` blocks in the same create request.
 
 ## 5. Troubleshooting
 
@@ -143,8 +163,8 @@ Practical examples for the new write tools:
 - This first cut uses the Notion REST API only.
 - Hosted Notion MCP is not wired into BeaverKi yet.
 - `notion_create_page` can create content under a parent page directly.
+- `notion_create_page` can create pages under data sources with a practical subset of structured property types and optional Notion templates.
 - `notion_update_page` normalizes a practical subset of editable property types based on the target page's existing schema.
 - `notion_append_block_children` uses the same Markdown-like block conversion as `notion_create_page`.
 - `notion_create_comment` currently targets page-level or block-level comments.
-- For data source parents, BeaverKi only auto-populates the title property it can infer from the schema.
-- Advanced property mapping for custom data sources is still follow-up work.
+- Full support for every Notion property type is still follow-up work.
