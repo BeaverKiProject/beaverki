@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, anyhow, bail};
 use beaverki_agent::{
-    AgentMemoryMode, AgentRequest, AgentResult, FilesystemLuaToolInspection, PrimaryAgentRunner,
-    inspect_filesystem_lua_tools,
+    AgentMemoryMode, AgentRequest, AgentResult, BehaviorPromptLayer, FilesystemLuaToolInspection,
+    PrimaryAgentRunner, inspect_filesystem_lua_tools,
 };
 use beaverki_automation as automation;
 use beaverki_config::{
@@ -26,6 +26,7 @@ use beaverki_policy::{
 use beaverki_tools::{ToolContext, builtin_registry, validate_json_value_against_schema};
 use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::info;
@@ -74,6 +75,8 @@ use self::workflow::{
 
 const WORKFLOW_RUN_TASK_KIND: &str = "workflow_run";
 const WORKFLOW_AGENT_STAGE_TASK_KIND: &str = "workflow_agent_stage";
+const INSTANCE_BEHAVIOR_SOUL_PATH: &str = "behavior/SOUL.md";
+const INSTANCE_BEHAVIOR_CHARACTER_PATH: &str = "behavior/CHARACTER.md";
 
 #[derive(Debug, Clone)]
 pub struct InstalledSkillReport {
@@ -2852,6 +2855,7 @@ impl Runtime {
                         task_context: Some(child_context),
                         visible_scopes: Vec::new(),
                         memory_mode: AgentMemoryMode::TaskSliceOnly,
+                        behavior_layers: self.load_behavior_layers_for_user(&task.owner_user_id)?,
                         approved_shell_commands: Vec::new(),
                         approved_automation_actions: Vec::new(),
                     };
@@ -3897,6 +3901,7 @@ impl Runtime {
             task_context,
             visible_scopes,
             memory_mode: AgentMemoryMode::ScopedRetrieval,
+            behavior_layers: self.load_behavior_layers_for_user(&user.user_id)?,
             approved_shell_commands: Vec::new(),
             approved_automation_actions: Vec::new(),
         })
@@ -3960,9 +3965,75 @@ impl Runtime {
             task_context: task.context_summary.clone(),
             visible_scopes,
             memory_mode,
+            behavior_layers: self.load_behavior_layers_for_user(owner_user_id)?,
             approved_shell_commands,
             approved_automation_actions,
         })
+    }
+
+    fn load_behavior_layers_for_user(&self, user_id: &str) -> Result<Vec<BehaviorPromptLayer>> {
+        let mut layers = Vec::new();
+        if let Some(layer) = self.load_instance_behavior_layer()? {
+            layers.push(layer);
+        }
+
+        let user_file = behavior_user_file_name(user_id)?;
+        let relative_path = PathBuf::from("behavior").join("users").join(user_file);
+        if let Some(layer) = self.load_optional_behavior_file(
+            format!("Per-user behavior: {}", relative_path.display()),
+            &self.config.runtime.workspace_root.join(&relative_path),
+        )? {
+            layers.push(layer);
+        }
+
+        Ok(layers)
+    }
+
+    fn load_instance_behavior_layer(&self) -> Result<Option<BehaviorPromptLayer>> {
+        let soul_path = self
+            .config
+            .runtime
+            .workspace_root
+            .join(INSTANCE_BEHAVIOR_SOUL_PATH);
+        if soul_path
+            .try_exists()
+            .with_context(|| format!("failed to inspect {}", soul_path.display()))?
+        {
+            return self.load_optional_behavior_file(
+                format!("Instance behavior: {INSTANCE_BEHAVIOR_SOUL_PATH}"),
+                &soul_path,
+            );
+        }
+
+        self.load_optional_behavior_file(
+            format!("Instance behavior: {INSTANCE_BEHAVIOR_CHARACTER_PATH}"),
+            &self
+                .config
+                .runtime
+                .workspace_root
+                .join(INSTANCE_BEHAVIOR_CHARACTER_PATH),
+        )
+    }
+
+    fn load_optional_behavior_file(
+        &self,
+        label: String,
+        path: &Path,
+    ) -> Result<Option<BehaviorPromptLayer>> {
+        if !path
+            .try_exists()
+            .with_context(|| format!("failed to inspect {}", path.display()))?
+        {
+            return Ok(None);
+        }
+
+        let content = fs::read_to_string(path)
+            .with_context(|| format!("failed to read behavior file {}", path.display()))?;
+        if content.trim().is_empty() {
+            return Ok(None);
+        }
+
+        Ok(Some(BehaviorPromptLayer { label, content }))
     }
 
     async fn validate_workflow_stage_references(
@@ -4322,6 +4393,20 @@ fn format_token_count(value: u64) -> String {
     }
 }
 
+fn behavior_user_file_name(user_id: &str) -> Result<String> {
+    if user_id.is_empty()
+        || !user_id
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+    {
+        bail!(
+            "user id '{}' cannot be used as a behavior filename; only ASCII letters, digits, '_' and '-' are supported",
+            user_id
+        );
+    }
+    Ok(format!("{user_id}.md"))
+}
+
 fn relative_time_text(timestamp: &str) -> String {
     let parsed =
         DateTime::parse_from_rfc3339(timestamp).map(|timestamp| timestamp.with_timezone(&Utc));
@@ -4571,6 +4656,118 @@ mod tests {
         )
         .expect("runtime");
         (tempdir, runtime)
+    }
+
+    async fn prepare_test_request(runtime: &Runtime, user: &UserRow) -> AgentRequest {
+        runtime
+            .prepare_cli_task_request(
+                user,
+                &format!("cli:{}", user.user_id),
+                "Hello",
+                MemoryScope::Private,
+            )
+            .await
+            .expect("prepare request")
+            .0
+    }
+
+    #[tokio::test]
+    async fn behavior_layers_skip_missing_optional_files() {
+        let (_tempdir, runtime) = test_runtime(vec![]).await;
+        let request = prepare_test_request(&runtime, &runtime.default_user).await;
+
+        assert!(request.behavior_layers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn behavior_layers_include_instance_file() {
+        let (_tempdir, runtime) = test_runtime(vec![]).await;
+        let behavior_dir = runtime.config.runtime.workspace_root.join("behavior");
+        std::fs::create_dir_all(&behavior_dir).expect("behavior dir");
+        std::fs::write(
+            behavior_dir.join("SOUL.md"),
+            "# Household Style\nUse crisp, practical household language.",
+        )
+        .expect("write soul");
+
+        let request = prepare_test_request(&runtime, &runtime.default_user).await;
+
+        assert_eq!(request.behavior_layers.len(), 1);
+        assert_eq!(
+            request.behavior_layers[0].label,
+            "Instance behavior: behavior/SOUL.md"
+        );
+        assert!(
+            request.behavior_layers[0]
+                .content
+                .contains("Use crisp, practical household language.")
+        );
+    }
+
+    #[tokio::test]
+    async fn behavior_layers_include_per_user_file() {
+        let (_tempdir, runtime) = test_runtime(vec![]).await;
+        let user_dir = runtime
+            .config
+            .runtime
+            .workspace_root
+            .join("behavior")
+            .join("users");
+        std::fs::create_dir_all(&user_dir).expect("user behavior dir");
+        std::fs::write(
+            user_dir.join("user_alex.md"),
+            "# Alex Style\nUse direct, concise answers.",
+        )
+        .expect("write user behavior");
+
+        let request = prepare_test_request(&runtime, &runtime.default_user).await;
+
+        assert_eq!(request.behavior_layers.len(), 1);
+        assert_eq!(
+            request.behavior_layers[0].label,
+            "Per-user behavior: behavior/users/user_alex.md"
+        );
+        assert!(
+            request.behavior_layers[0]
+                .content
+                .contains("Use direct, concise answers.")
+        );
+    }
+
+    #[tokio::test]
+    async fn behavior_layers_include_child_style_user_file() {
+        let (_tempdir, runtime) = test_runtime(vec![]).await;
+        let child = runtime
+            .create_user("Casey", &[String::from("child")])
+            .await
+            .expect("create child");
+        let child_user = runtime
+            .db
+            .fetch_user(&child.user_id)
+            .await
+            .expect("fetch child")
+            .expect("child user");
+        let user_dir = runtime
+            .config
+            .runtime
+            .workspace_root
+            .join("behavior")
+            .join("users");
+        std::fs::create_dir_all(&user_dir).expect("user behavior dir");
+        std::fs::write(
+            user_dir.join(format!("{}.md", child_user.user_id)),
+            "# Casey Style\nUse simpler language and a more playful tone.",
+        )
+        .expect("write child behavior");
+
+        let request = prepare_test_request(&runtime, &child_user).await;
+
+        assert_eq!(request.behavior_layers.len(), 1);
+        assert!(
+            request.behavior_layers[0]
+                .content
+                .contains("Use simpler language and a more playful tone.")
+        );
     }
 
     async fn set_session_timestamps(

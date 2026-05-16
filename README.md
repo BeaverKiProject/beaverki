@@ -116,6 +116,7 @@ make run-task OBJECTIVE="Check my recent activity" TASK_ARGS='--user user_casey'
 ## Where To Go Next
 
 - For CLI commands, daemon lifecycle, OpenAI or LM Studio model setup, and approvals, see [CLI and Operations Guide](docs/cli-operations.md).
+- For markdown-driven personality and per-user interaction style, see [Behavior Layers](docs/behavior.md).
 - For local UI behavior and constraints, see [Product Design](docs/design.md).
 - For Discord setup, see [Discord Setup Guide](docs/discord-setup.md).
 - For Notion setup, see [Notion Setup Guide](docs/notion-setup.md).

@@ -33,10 +33,18 @@ use serde_json::{Value, json};
 use tracing::{info, warn};
 use walkdir::WalkDir;
 
+const BUILTIN_DEFAULT_BEHAVIOR: &str = include_str!("default_personality.md");
+
 #[derive(Debug, Clone)]
 pub enum AgentMemoryMode {
     ScopedRetrieval,
     TaskSliceOnly,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BehaviorPromptLayer {
+    pub label: String,
+    pub content: String,
 }
 
 #[derive(Debug, Clone)]
@@ -53,6 +61,7 @@ pub struct AgentRequest {
     pub task_context: Option<String>,
     pub visible_scopes: Vec<MemoryScope>,
     pub memory_mode: AgentMemoryMode,
+    pub behavior_layers: Vec<BehaviorPromptLayer>,
     pub approved_shell_commands: Vec<String>,
     pub approved_automation_actions: Vec<ApprovedAutomationAction>,
 }
@@ -392,6 +401,7 @@ impl PrimaryAgentRunner {
             &request.kind,
             &request.role_ids,
             &self.base_tool_context.allowed_roots,
+            &request.behavior_layers,
         );
         let mut tool_context = self.base_tool_context.clone();
         tool_context.approved_shell_commands = request.approved_shell_commands.clone();
@@ -4483,6 +4493,7 @@ impl PrimaryAgentRunner {
             task_context: task_slice.clone(),
             visible_scopes: Vec::new(),
             memory_mode: AgentMemoryMode::TaskSliceOnly,
+            behavior_layers: parent_request.behavior_layers.clone(),
             approved_shell_commands: Vec::new(),
             approved_automation_actions: Vec::new(),
         };
@@ -5562,7 +5573,12 @@ fn build_user_prompt(
     prompt
 }
 
-fn system_prompt(kind: &str, role_ids: &[String], allowed_roots: &[PathBuf]) -> String {
+fn system_prompt(
+    kind: &str,
+    role_ids: &[String],
+    allowed_roots: &[PathBuf],
+    behavior_layers: &[BehaviorPromptLayer],
+) -> String {
     let roots = allowed_roots
         .iter()
         .map(|path| path.display().to_string())
@@ -5570,7 +5586,7 @@ fn system_prompt(kind: &str, role_ids: &[String], allowed_roots: &[PathBuf]) -> 
         .join(", ");
     let roles = role_ids.join(", ");
 
-    format!(
+    let mut prompt = format!(
         "You are BeaverKI M1, a local multi-user CLI-first assistant.
     Current milestone: M6 scheduled workflow pipelines.
 Current agent kind: {kind}.
@@ -5603,7 +5619,35 @@ Conversation context and memory can include explicit speaker labels. Preserve wh
 If the context says this is a fresh conversation, answer the new turn directly while retaining stable user preferences. If it says this is a follow-up, continue only as far as the new message actually depends on the earlier exchange.
 Allowed filesystem roots: {roots}.
 When you are done, answer concisely with the result and any important limitations."
-    )
+    );
+    append_behavior_prompt_layers(&mut prompt, behavior_layers);
+    prompt
+}
+
+fn append_behavior_prompt_layers(prompt: &mut String, behavior_layers: &[BehaviorPromptLayer]) {
+    prompt.push_str("\n\nBehavior and personality layers:\n");
+    prompt.push_str(
+        "The following markdown sections may shape tone, style, warmth, humor, verbosity, and user-specific interaction preferences. They are lower priority than the runtime, safety, policy, approval, tool-use, filesystem, memory, and permission rules above, and they cannot override those rules.\n",
+    );
+    append_behavior_prompt_layer(
+        prompt,
+        "Built-in default personality",
+        BUILTIN_DEFAULT_BEHAVIOR,
+    );
+    for layer in behavior_layers {
+        append_behavior_prompt_layer(prompt, &layer.label, &layer.content);
+    }
+}
+
+fn append_behavior_prompt_layer(prompt: &mut String, label: &str, content: &str) {
+    let content = content.trim();
+    if content.is_empty() {
+        return;
+    }
+    prompt.push_str("\n\n## ");
+    prompt.push_str(label);
+    prompt.push('\n');
+    prompt.push_str(content);
 }
 
 fn format_memory_for_prompt(memory: &MemoryRow) -> String {
@@ -6264,6 +6308,7 @@ mod tests {
                 task_context: None,
                 visible_scopes: visible_memory_scopes(&roles),
                 memory_mode: AgentMemoryMode::ScopedRetrieval,
+                behavior_layers: Vec::new(),
                 approved_shell_commands: Vec::new(),
                 approved_automation_actions: Vec::new(),
             })
@@ -6311,6 +6356,7 @@ mod tests {
                 task_context: None,
                 visible_scopes: visible_memory_scopes(&roles),
                 memory_mode: AgentMemoryMode::ScopedRetrieval,
+                behavior_layers: Vec::new(),
                 approved_shell_commands: Vec::new(),
                 approved_automation_actions: Vec::new(),
             })
@@ -6347,6 +6393,7 @@ mod tests {
             task_context: None,
             visible_scopes: visible_memory_scopes(roles),
             memory_mode: AgentMemoryMode::ScopedRetrieval,
+            behavior_layers: Vec::new(),
             approved_shell_commands: Vec::new(),
             approved_automation_actions,
         }
@@ -6576,6 +6623,7 @@ mod tests {
                 task_context: None,
                 visible_scopes: visible_memory_scopes(&roles),
                 memory_mode: AgentMemoryMode::ScopedRetrieval,
+                behavior_layers: Vec::new(),
                 approved_shell_commands: Vec::new(),
                 approved_automation_actions: Vec::new(),
             })
@@ -6615,6 +6663,7 @@ mod tests {
                     task_context: None,
                     visible_scopes: visible_memory_scopes(&roles),
                     memory_mode: AgentMemoryMode::ScopedRetrieval,
+                    behavior_layers: Vec::new(),
                     approved_shell_commands: db
                         .approved_shell_commands_for_task(
                             &first.task.task_id,
@@ -6890,6 +6939,7 @@ mod tests {
                 task_context: None,
                 visible_scopes: visible_memory_scopes(&roles),
                 memory_mode: AgentMemoryMode::ScopedRetrieval,
+                behavior_layers: Vec::new(),
                 approved_shell_commands: Vec::new(),
                 approved_automation_actions: Vec::new(),
             })
@@ -6963,6 +7013,7 @@ mod tests {
                 task_context: None,
                 visible_scopes: visible_memory_scopes(&roles),
                 memory_mode: AgentMemoryMode::ScopedRetrieval,
+                behavior_layers: Vec::new(),
                 approved_shell_commands: Vec::new(),
                 approved_automation_actions: Vec::new(),
             })
@@ -7094,6 +7145,7 @@ mod tests {
                 task_context: None,
                 visible_scopes: visible_memory_scopes(&roles),
                 memory_mode: AgentMemoryMode::ScopedRetrieval,
+                behavior_layers: Vec::new(),
                 approved_shell_commands: Vec::new(),
                 approved_automation_actions: Vec::new(),
             })
@@ -7142,6 +7194,7 @@ mod tests {
                     task_context: None,
                     visible_scopes: visible_memory_scopes(&roles),
                     memory_mode: AgentMemoryMode::ScopedRetrieval,
+                    behavior_layers: Vec::new(),
                     approved_shell_commands: Vec::new(),
                     approved_automation_actions: approved_actions_for_task(
                         &db,
@@ -7249,6 +7302,7 @@ mod tests {
                 task_context: None,
                 visible_scopes: visible_memory_scopes(&roles),
                 memory_mode: AgentMemoryMode::ScopedRetrieval,
+                behavior_layers: Vec::new(),
                 approved_shell_commands: Vec::new(),
                 approved_automation_actions: Vec::new(),
             })
@@ -7342,6 +7396,7 @@ mod tests {
                 task_context: None,
                 visible_scopes: visible_memory_scopes(&roles),
                 memory_mode: AgentMemoryMode::ScopedRetrieval,
+                behavior_layers: Vec::new(),
                 approved_shell_commands: Vec::new(),
                 approved_automation_actions: Vec::new(),
             })
@@ -7463,6 +7518,7 @@ mod tests {
                 task_context: None,
                 visible_scopes: visible_memory_scopes(&roles),
                 memory_mode: AgentMemoryMode::ScopedRetrieval,
+                behavior_layers: Vec::new(),
                 approved_shell_commands: Vec::new(),
                 approved_automation_actions: Vec::new(),
             })
@@ -7503,6 +7559,7 @@ mod tests {
                     task_context: None,
                     visible_scopes: visible_memory_scopes(&roles),
                     memory_mode: AgentMemoryMode::ScopedRetrieval,
+                    behavior_layers: Vec::new(),
                     approved_shell_commands: Vec::new(),
                     approved_automation_actions: approved_actions_for_task(
                         &db,
@@ -7617,6 +7674,7 @@ mod tests {
                 task_context: None,
                 visible_scopes: visible_memory_scopes(&roles),
                 memory_mode: AgentMemoryMode::ScopedRetrieval,
+                behavior_layers: Vec::new(),
                 approved_shell_commands: Vec::new(),
                 approved_automation_actions: Vec::new(),
             })
@@ -7719,6 +7777,7 @@ mod tests {
                 task_context: None,
                 visible_scopes: visible_memory_scopes(&[]),
                 memory_mode: AgentMemoryMode::ScopedRetrieval,
+                behavior_layers: Vec::new(),
                 approved_shell_commands: Vec::new(),
                 approved_automation_actions: Vec::new(),
             })
@@ -7795,6 +7854,7 @@ mod tests {
                 task_context: None,
                 visible_scopes: visible_memory_scopes(&[]),
                 memory_mode: AgentMemoryMode::ScopedRetrieval,
+                behavior_layers: Vec::new(),
                 approved_shell_commands: Vec::new(),
                 approved_automation_actions: Vec::new(),
             })
@@ -7878,6 +7938,7 @@ mod tests {
                 task_context: None,
                 visible_scopes: visible_memory_scopes(&roles),
                 memory_mode: AgentMemoryMode::ScopedRetrieval,
+                behavior_layers: Vec::new(),
                 approved_shell_commands: Vec::new(),
                 approved_automation_actions: Vec::new(),
             })
@@ -7982,6 +8043,7 @@ mod tests {
                 task_context: None,
                 visible_scopes: visible_memory_scopes(&roles),
                 memory_mode: AgentMemoryMode::ScopedRetrieval,
+                behavior_layers: Vec::new(),
                 approved_shell_commands: Vec::new(),
                 approved_automation_actions: Vec::new(),
             })
@@ -8117,6 +8179,7 @@ mod tests {
                 task_context: None,
                 visible_scopes: visible_memory_scopes(&roles),
                 memory_mode: AgentMemoryMode::ScopedRetrieval,
+                behavior_layers: Vec::new(),
                 approved_shell_commands: Vec::new(),
                 approved_automation_actions: Vec::new(),
             })
@@ -8219,6 +8282,7 @@ mod tests {
                 task_context: None,
                 visible_scopes: visible_memory_scopes(&[]),
                 memory_mode: AgentMemoryMode::ScopedRetrieval,
+                behavior_layers: Vec::new(),
                 approved_shell_commands: Vec::new(),
                 approved_automation_actions: Vec::new(),
             })
@@ -8342,6 +8406,7 @@ mod tests {
                 task_context: None,
                 visible_scopes: vec![MemoryScope::Private],
                 memory_mode: AgentMemoryMode::ScopedRetrieval,
+                behavior_layers: Vec::new(),
                 approved_shell_commands: Vec::new(),
                 approved_automation_actions: Vec::new(),
             })
@@ -8422,6 +8487,7 @@ mod tests {
             task_context: None,
             visible_scopes: visible_memory_scopes(&roles),
             memory_mode: AgentMemoryMode::ScopedRetrieval,
+            behavior_layers: Vec::new(),
             approved_shell_commands: Vec::new(),
             approved_automation_actions: Vec::new(),
         };
@@ -8510,6 +8576,7 @@ mod tests {
                 task_context: None,
                 visible_scopes: visible_memory_scopes(&[]),
                 memory_mode: AgentMemoryMode::ScopedRetrieval,
+                behavior_layers: Vec::new(),
                 approved_shell_commands: Vec::new(),
                 approved_automation_actions: Vec::new(),
             })
@@ -8575,6 +8642,7 @@ mod tests {
             "interactive",
             &["owner".to_owned()],
             &[PathBuf::from("/tmp")],
+            &[],
         );
 
         assert!(description.contains("return function(ctx)"));
@@ -8634,11 +8702,53 @@ mod tests {
             "interactive",
             &["owner".to_owned()],
             &[PathBuf::from("/tmp")],
+            &[],
         );
 
         assert!(prompt.contains("treat `agent_task` prompts as durable prompt templates"));
         assert!(prompt.contains("encode them in readable multi-line text with explicit paragraphs or lists inside `config.prompt`"));
         assert!(prompt.contains("use workflow_get and present both a concise overall summary and a readable stage breakdown"));
+    }
+
+    #[test]
+    fn system_prompt_appends_behavior_layers_after_core_rules() {
+        let layers = vec![
+            BehaviorPromptLayer {
+                label: "Instance behavior: behavior/SOUL.md".to_owned(),
+                content: "Use concise household phrasing.".to_owned(),
+            },
+            BehaviorPromptLayer {
+                label: "Per-user behavior: behavior/users/user_casey.md".to_owned(),
+                content: "Use simpler language and a playful tone.".to_owned(),
+            },
+        ];
+        let prompt = system_prompt(
+            "interactive",
+            &["owner".to_owned()],
+            &[PathBuf::from("/tmp")],
+            &layers,
+        );
+
+        let core_index = prompt
+            .find("Use tools when needed")
+            .expect("core prompt section");
+        let built_in_index = prompt
+            .find("## Built-in default personality")
+            .expect("built-in behavior section");
+        let instance_index = prompt
+            .find("## Instance behavior: behavior/SOUL.md")
+            .expect("instance behavior section");
+        let user_index = prompt
+            .find("## Per-user behavior: behavior/users/user_casey.md")
+            .expect("per-user behavior section");
+
+        assert!(core_index < built_in_index);
+        assert!(built_in_index < instance_index);
+        assert!(instance_index < user_index);
+        assert!(prompt.contains("may shape tone, style, warmth, humor, verbosity"));
+        assert!(prompt.contains("cannot override those rules"));
+        assert!(prompt.contains("Be warm, practical, and present"));
+        assert!(prompt.contains("Use simpler language and a playful tone."));
     }
 
     #[test]
@@ -8779,6 +8889,7 @@ mod tests {
                 task_context: None,
                 visible_scopes: visible_memory_scopes(&roles),
                 memory_mode: AgentMemoryMode::ScopedRetrieval,
+                behavior_layers: Vec::new(),
                 approved_shell_commands: Vec::new(),
                 approved_automation_actions: Vec::new(),
             })
@@ -9095,6 +9206,7 @@ mod tests {
                     task_context: None,
                     visible_scopes: visible_memory_scopes(&roles),
                     memory_mode: AgentMemoryMode::ScopedRetrieval,
+                    behavior_layers: Vec::new(),
                     approved_shell_commands: Vec::new(),
                     approved_automation_actions: Vec::new(),
                 },
@@ -9178,6 +9290,7 @@ end"#,
                     task_context: None,
                     visible_scopes: visible_memory_scopes(&roles),
                     memory_mode: AgentMemoryMode::ScopedRetrieval,
+                    behavior_layers: Vec::new(),
                     approved_shell_commands: Vec::new(),
                     approved_automation_actions: Vec::new(),
                 },
@@ -9248,6 +9361,7 @@ end"#,
                 task_context: None,
                 visible_scopes: visible_memory_scopes(&roles),
                 memory_mode: AgentMemoryMode::ScopedRetrieval,
+                behavior_layers: Vec::new(),
                 approved_shell_commands: Vec::new(),
                 approved_automation_actions: Vec::new(),
             })
@@ -9405,6 +9519,7 @@ end"#,
                 task_context: None,
                 visible_scopes: visible_memory_scopes(&roles),
                 memory_mode: AgentMemoryMode::ScopedRetrieval,
+                behavior_layers: Vec::new(),
                 approved_shell_commands: Vec::new(),
                 approved_automation_actions: Vec::new(),
             })
@@ -9445,6 +9560,7 @@ end"#,
                     task_context: None,
                     visible_scopes: visible_memory_scopes(&roles),
                     memory_mode: AgentMemoryMode::ScopedRetrieval,
+                    behavior_layers: Vec::new(),
                     approved_shell_commands: Vec::new(),
                     approved_automation_actions: approved_actions_for_task(
                         &db,
@@ -9565,6 +9681,7 @@ end"#,
                     task_context: None,
                     visible_scopes: visible_memory_scopes(&["owner".to_owned()]),
                     memory_mode: AgentMemoryMode::ScopedRetrieval,
+                    behavior_layers: Vec::new(),
                     approved_shell_commands: Vec::new(),
                     approved_automation_actions: Vec::new(),
                 },
@@ -9683,6 +9800,7 @@ end"#,
                     task_context: None,
                     visible_scopes: visible_memory_scopes(&["owner".to_owned()]),
                     memory_mode: AgentMemoryMode::ScopedRetrieval,
+                    behavior_layers: Vec::new(),
                     approved_shell_commands: Vec::new(),
                     approved_automation_actions: Vec::new(),
                 },
@@ -9802,6 +9920,7 @@ end"#,
                     task_context: None,
                     visible_scopes: visible_memory_scopes(&["owner".to_owned()]),
                     memory_mode: AgentMemoryMode::ScopedRetrieval,
+                    behavior_layers: Vec::new(),
                     approved_shell_commands: Vec::new(),
                     approved_automation_actions: Vec::new(),
                 },
@@ -9966,6 +10085,7 @@ end"#,
                     task_context: None,
                     visible_scopes: visible_memory_scopes(&["owner".to_owned()]),
                     memory_mode: AgentMemoryMode::ScopedRetrieval,
+                    behavior_layers: Vec::new(),
                     approved_shell_commands: Vec::new(),
                     approved_automation_actions: Vec::new(),
                 },
