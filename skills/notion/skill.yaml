@@ -52,6 +52,11 @@ tools:
     description: >
       Create a new Notion page under a parent page or data source.
       If parent_kind and parent_ref are null or empty, BeaverKi uses the configured Notion default parent.
+      For data source parents, properties_json can provide explicit structured properties as a JSON object keyed by Notion property name.
+      Supported property values include title/rich_text strings or arrays, select/status strings or name/id objects,
+      multi-select arrays, checkbox booleans, numbers, date strings or objects, relation/people ID arrays,
+      and url/email/phone strings. Unsupported or mismatched schema properties fail before page creation.
+      Set template_type to default or template_id to apply a Notion template. Template creation cannot be combined with content blocks.
       The content field accepts Markdown-like syntax converted into native Notion blocks.
       Block types: headings (# / ## / ###), bullet lists (- or *), numbered lists (1. 2. …),
       to-do items (- [ ] / - [x]), blockquotes (>), fenced code blocks (```lang … ```),
@@ -85,7 +90,21 @@ tools:
             Inline: **bold**, *italic*, `code`, ~~strikethrough~~, ***bold italic***,
             [link text](url), {color:text} (colors: gray, red, blue, green, yellow, orange,
             pink, purple, brown, default, or any with _background suffix).
-      required: [parent_kind, parent_ref, title, content]
+        properties_json:
+          type: [string, "null"]
+          description: >
+            JSON object keyed by Notion property name for data_source parents.
+            Values are normalized against the data source schema.
+        template_type:
+          type: [string, "null"]
+          enum: [none, default, template_id, null]
+        template_ref:
+          type: [string, "null"]
+          description: Notion template ID or URL when template_type is template_id.
+        template_timezone:
+          type: [string, "null"]
+          description: Optional IANA timezone for Notion template evaluation.
+      required: [parent_kind, parent_ref, title, content, properties_json, template_type, template_ref, template_timezone]
       additionalProperties: false
     output_schema:
       type: object

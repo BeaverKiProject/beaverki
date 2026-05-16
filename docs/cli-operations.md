@@ -437,6 +437,8 @@ Once enabled, the agent can use:
 - built-in tools: `notion_search`, `notion_fetch`, `notion_create_page`, `notion_update_page`, `notion_append_block_children`, `notion_delete_block`, `notion_create_comment`, `notion_api_request`
 - packaged skill wrappers from `skills/notion`: `notion_workspace_search`, `notion_read_entry`, `notion_capture_note`, `notion_update_entry`, `notion_append_content`, `notion_delete_blocks`, `notion_raw_api_request`, `notion_comment`
 
+For data source parents, `notion_create_page` accepts `properties_json`, a JSON object keyed by Notion property name. Supported create-time property values include title/rich text, select/status, multi-select, checkbox, number, date, relation/people, and url/email/phone fields. Set `template_type` to `default` or `template_id` to apply a Notion template; template creation cannot be combined with inline `content` blocks.
+
 ## Lua Automation And Schedules
 
 Create and inspect a Lua script:

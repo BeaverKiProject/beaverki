@@ -252,7 +252,7 @@ impl Tool for NotionCreatePageTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "notion_create_page".to_owned(),
-            description: "Create a Notion page under a parent page or data source using the configured Notion integration. If parent_kind and parent_ref are null or empty, BeaverKi uses the configured Notion default parent. For data sources, BeaverKi fills the title property automatically when it can infer it from the schema.".to_owned(),
+            description: "Create a Notion page under a parent page or data source using the configured Notion integration. If parent_kind and parent_ref are null or empty, BeaverKi uses the configured Notion default parent. For data sources, BeaverKi can normalize explicit properties_json against the schema and fills the title property automatically when omitted.".to_owned(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -262,9 +262,28 @@ impl Tool for NotionCreatePageTool {
                     },
                     "parent_ref": { "type": ["string", "null"] },
                     "title": { "type": "string" },
-                    "content": { "type": ["string", "null"] }
+                    "content": { "type": ["string", "null"] },
+                    "properties_json": {
+                        "type": ["string", "null"],
+                        "description": "JSON object keyed by Notion property name. Supported for data_source parents."
+                    },
+                    "template_type": {
+                        "type": ["string", "null"],
+                        "enum": ["none", "default", "template_id", null]
+                    },
+                    "template_ref": { "type": ["string", "null"] },
+                    "template_timezone": { "type": ["string", "null"] }
                 },
-                "required": ["parent_kind", "parent_ref", "title", "content"],
+                "required": [
+                    "parent_kind",
+                    "parent_ref",
+                    "title",
+                    "content",
+                    "properties_json",
+                    "template_type",
+                    "template_ref",
+                    "template_timezone"
+                ],
                 "additionalProperties": false
             }),
         }
@@ -297,6 +316,31 @@ impl Tool for NotionCreatePageTool {
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|value| !value.is_empty());
+        let raw_properties = notion_create_properties_input(input.get("properties_json"))
+            .map_err(ToolError::Failed)?;
+        let template = notion_create_template(
+            input
+                .get("template_type")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty()),
+            input
+                .get("template_ref")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty()),
+            input
+                .get("template_timezone")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty()),
+        )
+        .map_err(ToolError::Failed)?;
+        if template.is_some() && content.is_some() {
+            return Err(ToolError::Failed(anyhow!(
+                "notion_create_page cannot combine content with a Notion template"
+            )));
+        }
 
         let (parent_kind, parent_ref) =
             notion_create_parent(parent_kind, parent_ref, context).map_err(ToolError::Failed)?;
@@ -316,6 +360,11 @@ impl Tool for NotionCreatePageTool {
                         "title": notion_text_segments(title)
                     }
                 });
+                if raw_properties.is_some() {
+                    return Err(ToolError::Failed(anyhow!(
+                        "notion_create_page properties_json is only supported for data_source parents"
+                    )));
+                }
             }
             "data_source" => {
                 let data_source = notion_request_json(
@@ -332,18 +381,18 @@ impl Tool for NotionCreatePageTool {
                             "Notion data source '{parent_ref}' has no title property"
                         ))
                     })?;
-                let mut properties = Map::new();
-                properties.insert(
-                    title_property.clone(),
-                    json!({
-                        "title": notion_text_segments(title)
-                    }),
-                );
+                let properties = notion_create_data_source_properties(
+                    data_source.get("properties"),
+                    raw_properties.as_ref(),
+                    &title_property,
+                    title,
+                )
+                .map_err(ToolError::Failed)?;
                 body["parent"] = json!({
                     "type": "data_source_id",
                     "data_source_id": parent_id
                 });
-                body["properties"] = Value::Object(properties);
+                body["properties"] = properties;
             }
             other => {
                 return Err(ToolError::Failed(anyhow!(
@@ -357,6 +406,9 @@ impl Tool for NotionCreatePageTool {
             if !children.is_empty() {
                 body["children"] = Value::Array(children);
             }
+        }
+        if let Some(template) = template {
+            body["template"] = template;
         }
 
         let created = notion_request_json(Method::POST, "pages", Some(body), &config)
@@ -847,6 +899,114 @@ fn notion_update_properties_payload(
         );
     }
     Ok(Value::Object(normalized))
+}
+
+fn notion_create_properties_input(value: Option<&Value>) -> Result<Option<Map<String, Value>>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let raw = value
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let decoded = serde_json::from_str::<Value>(raw).map_err(|error| {
+        anyhow!("notion_create_page properties_json must be valid JSON: {error}")
+    })?;
+    let object = decoded.as_object().cloned().ok_or_else(|| {
+        anyhow!("notion_create_page properties_json must decode to a JSON object")
+    })?;
+    if object.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(object))
+}
+
+fn notion_create_data_source_properties(
+    data_source_properties: Option<&Value>,
+    explicit_properties: Option<&Map<String, Value>>,
+    title_property: &str,
+    title: &str,
+) -> Result<Value> {
+    let schema = data_source_properties
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow!("Notion data source response is missing properties"))?;
+    let mut normalized = match explicit_properties {
+        Some(properties) => {
+            notion_update_properties_payload(Some(&Value::Object(schema.clone())), properties)?
+                .as_object()
+                .cloned()
+                .ok_or_else(|| anyhow!("normalized Notion properties payload was not an object"))?
+        }
+        None => Map::new(),
+    };
+    if !normalized.contains_key(title_property) {
+        let title_schema = schema.get(title_property).ok_or_else(|| {
+            anyhow!(
+                "Notion data source title property '{}' was not found in schema",
+                title_property
+            )
+        })?;
+        normalized.insert(
+            title_property.to_owned(),
+            normalize_page_property_update(
+                title_property,
+                title_schema,
+                &Value::String(title.to_owned()),
+            )?,
+        );
+    }
+    Ok(Value::Object(normalized))
+}
+
+fn notion_create_template(
+    template_type: Option<&str>,
+    template_ref: Option<&str>,
+    template_timezone: Option<&str>,
+) -> Result<Option<Value>> {
+    let template_type = template_type.unwrap_or("none");
+    match template_type {
+        "none" => {
+            if template_ref.is_some() || template_timezone.is_some() {
+                bail!(
+                    "notion_create_page template_ref and template_timezone require template_type 'default' or 'template_id'"
+                );
+            }
+            Ok(None)
+        }
+        "default" => {
+            if template_ref.is_some() {
+                bail!("notion_create_page template_ref requires template_type 'template_id'");
+            }
+            let mut template = Map::new();
+            template.insert("type".to_owned(), json!("default"));
+            if let Some(timezone) = template_timezone {
+                template.insert("timezone".to_owned(), json!(timezone));
+            }
+            Ok(Some(Value::Object(template)))
+        }
+        "template_id" => {
+            let reference = template_ref.ok_or_else(|| {
+                anyhow!("notion_create_page template_type 'template_id' requires template_ref")
+            })?;
+            let mut template = Map::new();
+            template.insert("type".to_owned(), json!("template_id"));
+            template.insert(
+                "template_id".to_owned(),
+                json!(notion_id_from_ref(reference)?),
+            );
+            if let Some(timezone) = template_timezone {
+                template.insert("timezone".to_owned(), json!(timezone));
+            }
+            Ok(Some(Value::Object(template)))
+        }
+        other => bail!("unsupported notion_create_page template_type '{other}'"),
+    }
 }
 
 fn notion_property_names(properties: &Map<String, Value>) -> String {
@@ -2207,6 +2367,183 @@ mod tests {
 
         assert!(error.to_string().contains("Missing"));
         assert!(error.to_string().contains("Title"));
+    }
+
+    #[test]
+    fn normalizes_create_properties_for_data_source_schema() {
+        let schema = json!({
+            "Title": { "id": "title", "type": "title", "title": {} },
+            "Notes": { "id": "notes", "type": "rich_text", "rich_text": {} },
+            "Priority": { "id": "priority", "type": "select", "select": {} },
+            "Tags": { "id": "tags", "type": "multi_select", "multi_select": {} },
+            "Done": { "id": "done", "type": "checkbox", "checkbox": {} },
+            "Estimate": { "id": "estimate", "type": "number", "number": {} },
+            "Due": { "id": "due", "type": "date", "date": {} },
+            "Related": { "id": "related", "type": "relation", "relation": {} },
+            "Status": { "id": "status", "type": "status", "status": {} }
+        });
+        let properties = json!({
+            "Notes": "Buy enough for the week",
+            "Priority": "High",
+            "Tags": ["shopping", "errands"],
+            "Done": false,
+            "Estimate": 2,
+            "Due": "2026-04-22",
+            "Related": ["be633bf1dfa0436db259571129a590e5"],
+            "Status": "Next"
+        });
+
+        let payload = notion_create_data_source_properties(
+            Some(&schema),
+            properties.as_object(),
+            "Title",
+            "Pick up groceries",
+        )
+        .expect("payload");
+
+        assert_eq!(
+            payload,
+            json!({
+                "Title": { "title": notion_rich_text_segments("Pick up groceries") },
+                "Notes": { "rich_text": notion_rich_text_segments("Buy enough for the week") },
+                "Priority": { "select": { "name": "High" } },
+                "Tags": {
+                    "multi_select": [
+                        { "name": "shopping" },
+                        { "name": "errands" }
+                    ]
+                },
+                "Done": { "checkbox": false },
+                "Estimate": { "number": 2 },
+                "Due": { "date": { "start": "2026-04-22" } },
+                "Related": {
+                    "relation": [
+                        { "id": "be633bf1-dfa0-436d-b259-571129a590e5" }
+                    ]
+                },
+                "Status": { "status": { "name": "Next" } }
+            })
+        );
+    }
+
+    #[test]
+    fn explicit_create_title_property_overrides_auto_title() {
+        let schema = json!({
+            "Title": { "id": "title", "type": "title", "title": {} }
+        });
+        let properties = json!({
+            "Title": "Explicit title"
+        });
+
+        let payload = notion_create_data_source_properties(
+            Some(&schema),
+            properties.as_object(),
+            "Title",
+            "Fallback title",
+        )
+        .expect("payload");
+
+        assert_eq!(
+            payload,
+            json!({
+                "Title": { "title": notion_rich_text_segments("Explicit title") }
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_create_property_with_schema_names() {
+        let schema = json!({
+            "Title": { "id": "title", "type": "title", "title": {} }
+        });
+        let properties = json!({
+            "Missing": "value"
+        });
+
+        let error = notion_create_data_source_properties(
+            Some(&schema),
+            properties.as_object(),
+            "Title",
+            "Title",
+        )
+        .expect_err("should reject unknown property");
+
+        assert!(error.to_string().contains("Missing"));
+        assert!(error.to_string().contains("Title"));
+    }
+
+    #[test]
+    fn rejects_unsupported_create_property_type() {
+        let schema = json!({
+            "Title": { "id": "title", "type": "title", "title": {} },
+            "Rollup": { "id": "rollup", "type": "rollup", "rollup": {} }
+        });
+        let properties = json!({
+            "Rollup": "value"
+        });
+
+        let error = notion_create_data_source_properties(
+            Some(&schema),
+            properties.as_object(),
+            "Title",
+            "Title",
+        )
+        .expect_err("should reject unsupported property");
+
+        assert!(error.to_string().contains("Rollup"));
+        assert!(error.to_string().contains("rollup"));
+    }
+
+    #[test]
+    fn parses_create_properties_json() {
+        let properties = notion_create_properties_input(Some(&json!(
+            r#"{"Title":"Household Inbox","Done":true}"#
+        )))
+        .expect("properties")
+        .expect("non-empty properties");
+
+        assert_eq!(properties["Title"], json!("Household Inbox"));
+        assert_eq!(properties["Done"], json!(true));
+        assert!(
+            notion_create_properties_input(Some(&Value::Null))
+                .expect("null properties")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn builds_create_page_template_payloads() {
+        assert_eq!(
+            notion_create_template(Some("default"), None, Some("Europe/Vienna")).expect("template"),
+            Some(json!({
+                "type": "default",
+                "timezone": "Europe/Vienna"
+            }))
+        );
+        assert_eq!(
+            notion_create_template(
+                Some("template_id"),
+                Some("https://www.notion.so/Template-be633bf1dfa0436db259571129a590e5"),
+                None
+            )
+            .expect("template"),
+            Some(json!({
+                "type": "template_id",
+                "template_id": "be633bf1-dfa0-436d-b259-571129a590e5"
+            }))
+        );
+        assert!(
+            notion_create_template(Some("none"), None, None)
+                .expect("none")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_create_page_template_combinations() {
+        assert!(notion_create_template(Some("template_id"), None, None).is_err());
+        assert!(notion_create_template(Some("default"), Some("template-id"), None).is_err());
+        assert!(notion_create_template(Some("none"), None, Some("Europe/Vienna")).is_err());
     }
 
     #[test]
